@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>SpicyChat Inspector</title>
+  <link rel="stylesheet" href="ui.css">
+</head>
+<body class="inspector">
+  <header class="topbar">
+    <div>
+      <h1>SpicyChat Inspector <small id="version">v0.1.0</small></h1>
+      <p>Network · State · Performance · DOM · Errors · Signals</p>
+    </div>
+    <div class="actions">
+      <a class="buttonLink" href="changelog.html" target="_blank" rel="noopener noreferrer">Changelog</a>
+      <button id="refresh">Refresh</button>
+      <button id="export" class="primary">Export sanitized JSON.gz</button>
+      <button id="clear" class="danger">Clear</button>
+    </div>
+  </header>
+
+  <section id="overview" class="overview"></section>
+
+  <section class="filters">
+    <input id="search" placeholder="Search URL, field, value, model, token, sfw…">
+    <select id="typeFilter">
+      <option value="">All types</option>
+      <option>network</option><option>performance</option><option>error</option>
+      <option>websocket</option><option>state</option><option>storage</option><option>dom</option><option>qol</option><option>lifecycle</option>
+    </select>
+    <label><input id="interestingOnly" type="checkbox"> Interesting only</label>
+    <span id="count" class="muted"></span>
+  </section>
+
+  <main>
+    <div id="events" class="events"></div>
+    <aside id="detail" class="detail"><div class="empty">Select an event to inspect it.</div></aside>
+  </main>
+  <script src="inspector.js"></script>
+</body>
+</html>

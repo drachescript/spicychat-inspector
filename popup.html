@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>SpicyChat Inspector</title>
+  <link rel="stylesheet" href="ui.css">
+</head>
+<body class="popup">
+  <header>
+    <div>
+      <h1>SpicyChat Inspector <small id="version">v0.1.0</small></h1>
+      <p>Private diagnostics lab</p>
+    </div>
+    <span id="recBadge" class="badge">…</span>
+  </header>
+
+  <label class="toggleRow">
+    <span>Recording</span>
+    <input id="recording" type="checkbox">
+  </label>
+
+  <section class="options" aria-labelledby="captureOptionsHeading">
+    <h2 id="captureOptionsHeading">Capture options</h2>
+    <label class="toggleRow compact"><span>DOM changes</span><input id="captureDom" type="checkbox"></label>
+    <label class="toggleRow compact"><span>Performance metrics</span><input id="capturePerformance" type="checkbox"></label>
+    <label class="toggleRow compact"><span>Page errors</span><input id="captureErrors" type="checkbox"></label>
+    <label class="toggleRow compact"><span>Detailed QoL internals <small>(troubleshooting only)</small></span><input id="captureQolInternals" type="checkbox"></label>
+    <p class="markerHelp">Off by default. Normal recording stays focused on performance, errors, network, lifecycle, and adaptive lightweight DOM pressure. Enable only when specifically debugging QoL internals.</p>
+    <button id="snapshotHtml" class="wide">Snapshot HTML now</button>
+  </section>
+
+  <button id="openInspector" class="primary wide">Open Inspector</button>
+  <a class="buttonLink changelogLink" href="changelog.html" target="_blank" rel="noopener noreferrer">View changelog</a>
+  <nav class="popupLinks" aria-label="Project links">
+    <a class="buttonLink" href="https://spicychatqol.drache.uk/" target="_blank" rel="noopener noreferrer">QoL website</a>
+    <a class="buttonLink" href="https://spicychatqol.drache.uk/discord" target="_blank" rel="noopener noreferrer">Join Discord</a>
+  </nav>
+  <div id="status" class="status"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

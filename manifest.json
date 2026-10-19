@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "SpicyChat Inspector",
+  "version": "0.1.0",
+  "description": "Privacy-safe SpicyChat diagnostics for performance, network requests, errors, chat rendering, and QoL extension activity.",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "unlimitedStorage",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "https://spicychat.ai/*",
+    "https://*.spicychat.ai/*",
+    "https://*.recombee.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "SpicyChat Inspector",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://spicychat.ai/*",
+        "https://*.spicychat.ai/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "bridge.js"
+      ],
+      "matches": [
+        "https://spicychat.ai/*",
+        "https://*.spicychat.ai/*"
+      ]
+    }
+  ]
+}
