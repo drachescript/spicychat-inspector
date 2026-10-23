@@ -1,6 +1,15 @@
 (() => {
   const INSPECTOR_VERSION = (() => { try { return chrome.runtime.getManifest().version || 'unknown'; } catch (_) { return 'unknown'; } })();
   const PAGE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  // Firefox Android supports recording, but browser Long Task/LoAF APIs may be missing.
+  // Keep collection bounded even when a busy chat generates thousands of mutations/traces.
+  const IS_FIREFOX_ANDROID = /Android/i.test(navigator.userAgent) && /(?:Firefox|Fennec)/i.test(navigator.userAgent);
+  const MOBILE_TRACE_EVENTS_PER_SECOND = 18;
+  const MOBILE_TRACE_BATCH_LIMIT = 48;
+  let mobileTraceSecond = 0;
+  let mobileTraceAccepted = 0;
+  let mobileTraceDropped = 0;
+  let mobileTraceReportedAt = Date.now();
   function initialPageRole() {
     try {
       const u = new URL(location.href);
@@ -201,7 +210,11 @@
   let resourceEntriesSinceClear = 0;
   let resourceTimingProactiveClears = 0;
 
+  const PRIVATE_IDENTIFIER_KEY_RE = /^(?:x)?(?:guestuserid|guestid|userid|visitorid|deviceid|clientid|anonymousid|anonid|installationid|installid|fingerprintid)$/;
+  function isPrivateIdentifierKey(k) { return PRIVATE_IDENTIFIER_KEY_RE.test(String(k || '').replace(/[-_]/g, '').toLowerCase()); }
+  const PRIVATE_IDENTIFIER_VALUE_RE = /((?:[\"']?(?:x[-_])?(?:guest[-_]?user[-_]?id|guest[-_]?id|user[-_]?id|visitor[-_]?id|device[-_]?id|client[-_]?id|anon(?:ymous)?[-_]?id|install(?:ation)?[-_]?id|fingerprint[-_]?id)[\"']?)\s*[:=]\s*[\"']?)([A-Za-z0-9._~+/=-]+)/gi;
   const SECRET_KEY_RE = /(authorization|cookie|set-cookie|password|passwd|secret|access[_-]?token|refresh[_-]?token|id[_-]?token|session|jwt|csrf|xsrf|api[_-]?key|client[_-]?secret|p?_?psid)/i;
+  function isSecretKey(k) { return SECRET_KEY_RE.test(k) || isPrivateIdentifierKey(k); }
   const JWT_RE = /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/g;
   const BEARER_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]{10,}/gi;
   const PSID_VALUE_RE = /\b(psid)([:=])([A-Za-z0-9_-]{8,})/gi;
@@ -209,7 +222,7 @@
 
   function redactString(s) {
     if (typeof s !== 'string') return s;
-    return s.replace(JWT_RE, '[REDACTED_JWT]').replace(BEARER_RE, 'Bearer [REDACTED]').replace(URLENC_SECRET_RE, (m, p, k) => `${p}${k}=[REDACTED]`).replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`);
+    return s.replace(JWT_RE, '[REDACTED_JWT]').replace(BEARER_RE, 'Bearer [REDACTED]').replace(URLENC_SECRET_RE, (m, p, k) => `${p}${k}=[REDACTED]`).replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`).replace(PRIVATE_IDENTIFIER_VALUE_RE, (m, prefix) => `${prefix}[REDACTED]`);
   }
 
   function isSpicyChatCoreHost(hostname) {
@@ -230,7 +243,7 @@
     if (Array.isArray(value)) return value.slice(0, 600).map(v => sanitize(v, depth + 1));
     if (typeof value === 'object') {
       const out = {};
-      for (const [k, v] of Object.entries(value).slice(0, 1200)) out[k] = SECRET_KEY_RE.test(k) ? '[REDACTED]' : sanitize(v, depth + 1);
+      for (const [k, v] of Object.entries(value).slice(0, 1200)) out[k] = isSecretKey(k) ? '[REDACTED]' : sanitize(v, depth + 1);
       return out;
     }
     return String(value);
@@ -259,7 +272,7 @@
     if (typeof value === 'object') {
       const out = {};
       for (const [k, v] of Object.entries(value).slice(0, 400)) {
-        if (SECRET_KEY_RE.test(k)) out[k] = '[REDACTED]';
+        if (isSecretKey(k)) out[k] = '[REDACTED]';
         else if (QOL_PRIVATE_FIELD_RE.test(k)) out[k] = privateTraceSummary(v);
         else out[k] = sanitizeQolTrace(v, depth + 1);
       }
@@ -899,10 +912,12 @@
       setTimeout(() => samplePagePressure('page-show'), 250);
     });
     window.addEventListener('pagehide', e => {
+      finalizeAbandonedGenerationWindows('page-hidden-before-dom-check');
       emit({ type: 'lifecycle', subtype: 'page-hide', persisted: !!e.persisted, interaction: interactionState() });
       flushTransientAggregates('pagehide');
     });
     document.addEventListener('freeze', () => {
+      finalizeAbandonedGenerationWindows('page-frozen-before-dom-check');
       emit({ type: 'lifecycle', subtype: 'page-freeze', interaction: interactionState() });
       flushTransientAggregates('freeze');
     });
@@ -937,7 +952,7 @@
   function makeDomStats() {
     return {
       totalMutations: 0, detailedChanges: 0, qolRelated: 0, qolOwned: 0, noOp: 0,
-      formattingSwapsCoalesced: 0,
+      formattingSwapsCoalesced: 0, mobileSkippedMutationRecords: 0, mobileChildListOnly: IS_FIREFOX_ANDROID,
       messageNodesAdded: 0, messageNodesRemoved: 0, observerCallbacks: 0,
       inspectorObserverMs: 0, inspectorObserverWallMs: 0,
       observerTimingContaminatedCallbacks: 0, observerTimingContaminatedWallMs: 0,
@@ -954,6 +969,7 @@
   function isChatsRoute() { return /^\/chats(?:\/|$)/.test(location.pathname); }
   function domFastModeReason(mutations) {
     const count = mutations?.length || 0;
+    if (IS_FIREFOX_ANDROID) return 'firefox-android-lightweight';
     if (isLargeDomPressure()) return 'large-dom-pressure';
     if (Date.now() < domSlowObserverUntil) return 'recent-slow-observer';
     if (count >= LARGE_MUTATION_BATCH_THRESHOLD) return 'large-mutation-batch';
@@ -963,6 +979,7 @@
   }
   function domDetailSampleCap() {
     if (Date.now() < selfThrottleUntil) return 0;
+    if (IS_FIREFOX_ANDROID) return 1;
     if (Date.now() < domFastModeUntil) return 2;
     if (currentHighDetailDomMode()) return isLargeDomPressure() ? 8 : DOM_DETAIL_SAMPLE_CAP;
     return isLargeDomPressure() ? 2 : 4;
@@ -1138,6 +1155,20 @@
     try { return /\/chat$/.test(new URL(event.finalUrl || event.requestedUrl || event.url || '', location.href).pathname); } catch (_) { return false; }
   }
 
+  function finalizeAbandonedGenerationWindows(reason) {
+    if (!pendingGenerationRenders.size) return;
+    for (const pending of pendingGenerationRenders.values()) {
+      emit({type:'performance',subtype:'generation-dom-match-result',
+        relatedRequestId:pending.requestId,generationResponseTs:pending.responseTs,
+        status:pending.firstMessageDomTs?'signal-observed':pending.replyPresentAtResponse?'reply-already-present':'not-checked',
+        reason,hasReplyId:!!pending.replyId,
+        exactReplyPresentAtResponse:!!pending.replyPresentAtResponse,
+        postResponseMessageMutationCount:pending.postMessageMutations||0,
+        coverageLimited:true,signalConfidence:pending.matchedReplyId?'high':(pending.replyPresentAtResponse?'high':'unverified')});
+    }
+    pendingGenerationRenders.clear();
+  }
+
   function scheduleGenerationFollowup(delayMs, reason, meta) {
     const scheduledAt = Date.now();
 
@@ -1157,17 +1188,17 @@
         const pending=pendingGenerationRenders.get(activeMeta.relatedRequestId);
         if (pending) {
           const pre=recentMessageDomChanges.filter(x=>x.ts>=pending.responseTs-1500 && x.ts<pending.responseTs && x.route===pending.route);
-          const reason=pending.firstMessageDomTs ? 'post-response-mutation-observed'
+          const reason=pending.route!==location.pathname ? 'route-changed-before-dom-check' : pending.firstMessageDomTs ? 'post-response-mutation-observed'
             : pending.replyPresentAtResponse ? 'exact-reply-present-at-response'
             : pre.length ? 'possible-dom-mounted-before-network-response'
             : pending.replyId ? 'exact-reply-not-observed'
             : 'reply-id-unavailable-and-no-message-mutation';
           emit({type:'performance',subtype:'generation-dom-match-result',relatedRequestId:pending.requestId,
-            generationResponseTs:pending.responseTs, status:pending.firstMessageDomTs?'signal-observed':pending.replyPresentAtResponse?'reply-already-present':'unmatched',
+            generationResponseTs:pending.responseTs, status:pending.firstMessageDomTs?'signal-observed':pending.replyPresentAtResponse?'reply-already-present':(pending.route!==location.pathname || latenessMs>GENERATION_FOLLOWUP_MAX_LATENESS_MS?'not-checked':'unmatched'),
             reason, hasReplyId:!!pending.replyId, exactReplyPresentAtResponse:!!pending.replyPresentAtResponse,
             priorDomMutationCount:pre.length, postResponseMessageMutationCount:pending.postMessageMutations || 0,
             mountedMessagesAtResponse:pending.mountedMessagesAtResponse,
-            lateCheck:latenessMs>GENERATION_FOLLOWUP_MAX_LATENESS_MS,
+            lateCheck:latenessMs>GENERATION_FOLLOWUP_MAX_LATENESS_MS, coverageLimited:document.hidden || latenessMs>GENERATION_FOLLOWUP_MAX_LATENESS_MS,
             signalConfidence:pending.firstMessageDomTs?(pending.matchedReplyId?'high':'low'):(pending.replyPresentAtResponse?'high':'unverified')});
         }
         pendingGenerationRenders.delete(activeMeta.relatedRequestId);
@@ -1183,7 +1214,19 @@
       if (existing) {
         existing.count++;
         if (delayMs === GENERATION_RENDER_WINDOW_MS && existing.latestMeta?.relatedRequestId && existing.latestMeta.relatedRequestId !== meta?.relatedRequestId) {
-          pendingGenerationRenders.delete(existing.latestMeta.relatedRequestId);
+          const replacedId = existing.latestMeta.relatedRequestId;
+          const old = pendingGenerationRenders.get(replacedId);
+          if (old) {
+            emit({type:'performance', subtype:'generation-dom-match-result',
+              relatedRequestId:replacedId, generationResponseTs:old.responseTs,
+              status:old.firstMessageDomTs?'signal-observed':old.replyPresentAtResponse?'reply-already-present':'not-checked',
+              reason:'hidden-tab-followup-coalesced', hasReplyId:!!old.replyId,
+              exactReplyPresentAtResponse:!!old.replyPresentAtResponse,
+              postResponseMessageMutationCount:old.postMessageMutations||0,
+              signalConfidence:old.firstMessageDomTs?(old.matchedReplyId?'high':'low'):(old.replyPresentAtResponse?'high':'unverified'),
+              coverageLimited:true, hiddenAtResponse:true });
+            pendingGenerationRenders.delete(replacedId);
+          }
         }
         existing.latestMeta = meta;
         return;
@@ -1592,9 +1635,13 @@
         }
         const highDetail = currentHighDetailDomMode();
         const useFastCapture = !!fastReason || !highDetail || mutations.length > 80 || Date.now() < selfThrottleUntil;
-        const fastBudget = { messageDescendantScans: highDetail ? 12 : 8, qolAncestorScans: highDetail ? 16 : 6 };
+        const fastBudget = { messageDescendantScans: IS_FIREFOX_ANDROID ? 2 : (highDetail ? 12 : 8), qolAncestorScans: IS_FIREFOX_ANDROID ? 2 : (highDetail ? 16 : 6) };
         let formattingSwaps = 0;
-        for (const m of mutations) {
+        // Under excessive mobile mutation bursts, avoid long Inspector callbacks.
+        // Explicitly report unsampled records; never claim complete DOM coverage.
+        const mobileLimit = IS_FIREFOX_ANDROID ? 120 : mutations.length;
+        if (mutations.length > mobileLimit) domStats.mobileSkippedMutationRecords += mutations.length - mobileLimit;
+        for (const m of (mutations.length > mobileLimit ? mutations.slice(0, mobileLimit) : mutations)) {
           if (isKnownDialogueFormattingSwap(m)) {
             formattingSwaps++;
             continue;
@@ -1664,10 +1711,11 @@
       // Lite diagnostics: track structural churn and a compact set of state/class
       // changes. Avoid character-data and Inspector/QoL ownership attributes so the
       // observer measures page pressure without becoming part of that pressure.
-      domObserver.observe(document.documentElement, {
-        subtree: true, childList: true, attributes: true,
-        attributeFilter: ['class','id','hidden','disabled','aria-hidden','aria-disabled','aria-expanded','aria-pressed','data-state','data-status','data-testid']
-      });
+      const observerOptions = IS_FIREFOX_ANDROID
+        ? { subtree: true, childList: true }
+        : { subtree: true, childList: true, attributes: true,
+            attributeFilter: ['class','id','hidden','disabled','aria-hidden','aria-disabled','aria-expanded','aria-pressed','data-state','data-status','data-testid'] };
+      domObserver.observe(document.documentElement, observerOptions);
     };
     if (document.documentElement) begin(); else document.addEventListener('DOMContentLoaded', begin, { once: true });
   }
@@ -1679,6 +1727,8 @@
     const stats = {
       totalMutations: domStats.totalMutations,
       formattingSwapsCoalesced: domStats.formattingSwapsCoalesced,
+      mobileSkippedMutationRecords: domStats.mobileSkippedMutationRecords,
+      mobileChildListOnly: domStats.mobileChildListOnly,
       formattingSwapNoOpCountUnknown: domStats.formattingSwapsCoalesced,
       detailedChanges: domQueue.length,
       summarizedChanges: Math.max(0, domStats.totalMutations - domQueue.length),
@@ -1833,7 +1883,10 @@
       traceSessionId: data.traceSessionId || payload?.traceSessionId || null,
       traceProtocol: data.protocol || payload?.protocol || null
     };
-    return candidates.slice(0, 1000).map((raw, index) => {
+    // Cap normalization cost before creating/sanitizing hundreds of trace objects.
+    const limit = IS_FIREFOX_ANDROID ? MOBILE_TRACE_BATCH_LIMIT : 1000;
+    if (IS_FIREFOX_ANDROID && candidates.length > limit) mobileTraceDropped += candidates.length - limit;
+    return candidates.slice(0, limit).map((raw, index) => {
       const child = raw && typeof raw === 'object' ? raw : { type: 'trace-value', value: raw };
       const childData = {
         source: data.source,
@@ -2051,9 +2104,34 @@
     if (!looksLikeQolTelemetry(data)) return;
     try {
       const events=expandQolTelemetry(data, transport);
-      for (const event of events) trackQolTelemetry(event);
-      const traceCount=events.filter(e=>Number.isFinite(e.traceSeq) || Number.isFinite(e.traceBatchSize) || /^(operation-start|operation-end|operation-profile|scheduler|storage|worker)/.test(e.subtype||'')).length;
-      const handshakes=events.filter(e=>/handshake|hello|presence|ready|initialized/.test(e.subtype||'')).length;
+      const accepted = [];
+      const now = Date.now();
+      if (IS_FIREFOX_ANDROID && now - mobileTraceSecond >= 1000) {
+        mobileTraceSecond = now;
+        mobileTraceAccepted = 0;
+      }
+      for (const event of events) {
+        // Keep only a bounded sample of high-frequency trace data on mobile.
+        // Privacy rules and the detailed-tracing setting still apply unchanged.
+        if (IS_FIREFOX_ANDROID && mobileTraceAccepted >= MOBILE_TRACE_EVENTS_PER_SECOND &&
+            !/^(handshake|hello|presence|error|operation-failed)/.test(event.subtype || '')) {
+          mobileTraceDropped++;
+          continue;
+        }
+        if (IS_FIREFOX_ANDROID) mobileTraceAccepted++;
+        accepted.push(event);
+        trackQolTelemetry(event);
+      }
+      if (IS_FIREFOX_ANDROID && now - mobileTraceReportedAt >= 10000 && mobileTraceDropped) {
+        emit({ type: 'performance', subtype: 'mobile-trace-sampling',
+          droppedEvents: mobileTraceDropped, batchLimit: MOBILE_TRACE_BATCH_LIMIT,
+          maxEventsPerSecond: MOBILE_TRACE_EVENTS_PER_SECOND,
+          coverage: 'sampled', reason: 'Firefox Android trace budget; missing sequences here are deliberate sampling, not proven QoL delivery failures.' });
+        mobileTraceDropped = 0;
+        mobileTraceReportedAt = now;
+      }
+      const traceCount=accepted.filter(e=>Number.isFinite(e.traceSeq) || Number.isFinite(e.traceBatchSize) || /^(operation-start|operation-end|operation-profile|scheduler|storage|worker)/.test(e.subtype||'')).length;
+      const handshakes=accepted.filter(e=>/handshake|hello|presence|ready|initialized/.test(e.subtype||'')).length;
       qolHandshakeResponses+=handshakes;
       const previouslyReceived=qolTracesSeen;
       qolTracesSeen+=traceCount;
@@ -2063,6 +2141,9 @@
   }
   function effectiveQolTraceLevel() {
     if (!qolInternalsEnabled()) return 'off';
+    // Android requests normal (not deep) from QoL to avoid generating enormous
+    // telemetry streams on a device already handling a busy chat.
+    if (IS_FIREFOX_ANDROID) return 'normal';
     const level = String(settings?.qolTraceLevel || 'deep').toLowerCase();
     return ['normal','deep'].includes(level) ? level : 'deep';
   }
@@ -2260,6 +2341,15 @@
     stopPerformanceObservers();
     if (!settings?.capturePerformance || !window.PerformanceObserver) return;
     configureResourceTimingBuffer();
+    if (IS_FIREFOX_ANDROID) {
+      const supported = PerformanceObserver.supportedEntryTypes || [];
+      emit({type:'performance',subtype:'mobile-browser-capabilities',
+        longTaskSupported:supported.includes('longtask'),
+        longAnimationFrameSupported:supported.includes('long-animation-frame'),
+        eventTimingSupported:supported.includes('event'),
+        domCapture:'child-list-only', qosTraceSampling:true,
+        note:'Unsupported browser timing APIs cannot be interpreted as zero long tasks.'});
+    }
     try {
       const resourceObserver = new PerformanceObserver(list => {
         for (const e of list.getEntries()) {
@@ -2476,7 +2566,7 @@
       setTimeout(() => announceInspectorToQol('startup-retry'), 1000);
       setTimeout(() => { announceInspectorToQol('startup-settled'); requestQolMetrics('startup-settled'); }, 3000);
     }
-    emit({ type: 'lifecycle', subtype: 'page-start', title: document.title, href: redactString(location.href), userAgent: navigator.userAgent, wasDiscarded: !!document.wasDiscarded, interaction: interactionState(), inspectorVersion: INSPECTOR_VERSION, qolIdentity: passiveQolIdentity(), captureProfile: isQolWorkerPage() ? 'qol-worker-lite' : 'adaptive-lite' });
+    emit({ type: 'lifecycle', subtype: 'page-start', title: document.title, href: redactString(location.href), userAgent: navigator.userAgent, wasDiscarded: !!document.wasDiscarded, interaction: interactionState(), inspectorVersion: INSPECTOR_VERSION, qolIdentity: passiveQolIdentity(), captureProfile: isQolWorkerPage() ? 'qol-worker-lite' : IS_FIREFOX_ANDROID ? 'firefox-android-lightweight' : 'adaptive-lite' });
     if (isQolWorkerPage()) emit({ type: 'performance', subtype: 'worker-capture-profile', workerRole: PAGE_ROLE, domObserver: false, resourceTiming: 'aggregated-with-outliers', interaction: interactionState() });
     emit({ type: 'lifecycle', subtype: 'network-connectivity', connectivity: connectionState(), interaction: interactionState() });
     setTimeout(() => captureLightweightStateSnapshot('page-start', false, false).catch(() => {}), 1200);

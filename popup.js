@@ -12,7 +12,7 @@ async function refresh() {
 for (const key of ['recording','captureDom','capturePerformance','captureErrors','captureQolInternals']) {
   $('#'+key)?.addEventListener('change', async e => {
     const patch = { [key]: e.target.checked };
-    if (key === 'captureQolInternals') patch.qolTraceLevel = e.target.checked ? 'deep' : 'off';
+    if (key === 'captureQolInternals') patch.qolTraceLevel = e.target.checked ? (/Android/i.test(navigator.userAgent) ? 'normal' : 'deep') : 'off';
     await msg({ type: 'SCI_SET_SETTINGS', patch });
     await refresh();
   });

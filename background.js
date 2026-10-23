@@ -10,6 +10,8 @@ const DOM_TEXT_PRIVACY_MIGRATION_KEY = 'sci_dom_text_privacy_migrated_0034';
 // Rerun the network migration once for older Rulebook API payloads. Existing
 // migration keys cannot be reused after adding endpoint privacy coverage.
 const NETWORK_PRIVACY_MIGRATION_KEY = 'sci_network_privacy_migrated_0037_rulebooks';
+const REQUEST_IDENTIFIER_PRIVACY_MIGRATION_KEY = 'sci_request_identifier_privacy_migrated_0100';
+const NATIVE_MEMORY_PRIVACY_MIGRATION_KEY = 'sci_native_memory_privacy_migrated_0101';
 
 const DEFAULT_SETTINGS = {
   recording: true,
@@ -26,8 +28,11 @@ const DEFAULT_SETTINGS = {
   maxEvents: 100000
 };
 
+const PRIVATE_IDENTIFIER_KEY_RE = /^(?:x)?(?:guestuserid|guestid|userid|visitorid|deviceid|clientid|anonymousid|anonid|installationid|installid|fingerprintid)$/;
+function isPrivateIdentifierKey(k) { return PRIVATE_IDENTIFIER_KEY_RE.test(String(k || '').replace(/[-_]/g, '').toLowerCase()); }
+const PRIVATE_IDENTIFIER_VALUE_RE = /((?:[\"']?(?:x[-_])?(?:guest[-_]?user[-_]?id|guest[-_]?id|user[-_]?id|visitor[-_]?id|device[-_]?id|client[-_]?id|anon(?:ymous)?[-_]?id|install(?:ation)?[-_]?id|fingerprint[-_]?id)[\"']?)\s*[:=]\s*[\"']?)([A-Za-z0-9._~+/=-]+)/gi;
 const SECRET_KEY_RE = /(authorization|cookie|set-cookie|password|passwd|secret|access[_-]?token|refresh[_-]?token|id[_-]?token|session|jwt|csrf|xsrf|api[_-]?key|client[_-]?secret|p?_?psid)/i;
-function isSecretKey(k) { return k !== 'authInvalidToken' && SECRET_KEY_RE.test(k); }
+function isSecretKey(k) { return k !== 'authInvalidToken' && (SECRET_KEY_RE.test(k) || isPrivateIdentifierKey(k)); }
 const JWT_RE = /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/g;
 const BEARER_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]{10,}/gi;
 const PSID_VALUE_RE = /\b(psid)([:=])([A-Za-z0-9_-]{8,})/gi;
@@ -186,11 +191,81 @@ if (chrome.webRequest?.onBeforeRequest) {
   }, ratingFilter);
 }
 
+
+// Native Dislike is NOT proved by a successful Recombee POST. A separate
+// SpicyChat `characterRating` event must be confirmed. Keep this low volume:
+// observe only /event, persist only allowlisted rating fields + HTTP outcome.
+const nativeCharacterEventRequests = new Map();
+function nativeEventIsEndpoint(url) {
+  try { const u = new URL(url); return u.hostname === 'prod.nd-api.com' && u.pathname === '/event'; }
+  catch (_) { return false; }
+}
+function decodedNativeCharacterEvent(details) {
+  try {
+    let body = null;
+    const raw = details.requestBody?.raw;
+    if (Array.isArray(raw) && raw.length) {
+      const pieces = raw.filter(x => x?.bytes).map(x => new Uint8Array(x.bytes));
+      const total = pieces.reduce((n,x) => n + x.length, 0);
+      if (total && total <= 8192) {
+        const all = new Uint8Array(total); let offset = 0;
+        for (const piece of pieces) { all.set(piece, offset); offset += piece.length; }
+        body = JSON.parse(new TextDecoder().decode(all));
+      }
+    }
+    if (!body && details.requestBody?.formData) {
+      const f = details.requestBody.formData;
+      body = { event_name:f.event_name?.[0], character_id:f.character_id?.[0], rating:f.rating?.[0] };
+    }
+    if (body?.event_name !== 'characterRating') return null;
+    const botId = String(body.character_id || '').toLowerCase();
+    // Non-ID payloads are not exported, even if an endpoint was matched.
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(botId)) return { eventName:'characterRating', botId:null, rating:null };
+    const rating = Number(body.rating);
+    return { eventName:'characterRating', botId, rating:Number.isFinite(rating) ? rating : null };
+  } catch (_) { return null; }
+}
+function recordNativeCharacterEventOutcome(details, error = null) {
+  const prior = nativeCharacterEventRequests.get(details.requestId);
+  nativeCharacterEventRequests.delete(details.requestId);
+  if (!prior?.event) return;
+  const now = Date.now();
+  addEvent({
+    type:'network', subtype:'browser-character-rating-response',
+    requestId:`native-event-${details.requestId}`, browserRequestId:details.requestId,
+    browserObserver:true, requestCombined:true, method:'POST',
+    requestedUrl:'https://prod.nd-api.com/event', finalUrl:'https://prod.nd-api.com/event',
+    eventName:'characterRating', botId:prior.event.botId, rating:prior.event.rating,
+    status:error ? 0 : Number(details.statusCode || 0),
+    durationMs:Math.max(0, now-prior.startedAt),
+    error:error ? String(error).slice(0,120) : null,
+    attribution:ratingAttribution(details.initiator || prior.initiator, details.tabId),
+    pageRole:Number.isInteger(details.tabId) ? (tabPageRoles.get(details.tabId)?.role || null) : null,
+    tabId:Number.isInteger(details.tabId) && details.tabId >= 0 ? details.tabId : null,
+    ts:now, pageId:'browser-webrequest'
+  }).catch(() => {});
+}
+if (chrome.webRequest?.onBeforeRequest) {
+  const nativeEventFilter = { urls:['https://prod.nd-api.com/event*'] };
+  chrome.webRequest.onBeforeRequest.addListener(details => {
+    if (details.method !== 'POST' || !nativeEventIsEndpoint(details.url)) return;
+    const event = decodedNativeCharacterEvent(details);
+    if (!event) return;  // Other native events are outside the diagnostic scope.
+    nativeCharacterEventRequests.set(details.requestId,{event,startedAt:Date.now(),initiator:details.initiator || null});
+  }, nativeEventFilter, ['requestBody']);
+  chrome.webRequest.onCompleted.addListener(details => {
+    if (nativeEventIsEndpoint(details.url)) recordNativeCharacterEventOutcome(details);
+  }, nativeEventFilter);
+  chrome.webRequest.onErrorOccurred.addListener(details => {
+    if (nativeEventIsEndpoint(details.url)) recordNativeCharacterEventOutcome(details, details.error || 'request-failed');
+  }, nativeEventFilter);
+}
+
 const SIGNAL_KEY_RE = /^(is_nsfw|isNsfwEnabled|moderation_status|moderationStatus|aicq_manual_review_required|inference_model|inferenceModel|engine|provider|max_new_tokens|temperature|top_p|top_k|context|context_length|tokens|model)$/i;
 
 function redactString(s) {
   if (typeof s !== 'string') return s;
-  return s.replace(JWT_RE, '[REDACTED_JWT]').replace(BEARER_RE, 'Bearer [REDACTED]').replace(URLENC_SECRET_RE, (m, p, k) => `${p}${k}=[REDACTED]`).replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`);
+  return s.replace(JWT_RE, '[REDACTED_JWT]').replace(BEARER_RE, 'Bearer [REDACTED]').replace(URLENC_SECRET_RE, (m, p, k) => `${p}${k}=[REDACTED]`).replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`).replace(PRIVATE_IDENTIFIER_VALUE_RE, (m, prefix) => `${prefix}[REDACTED]`);
 }
 
 
@@ -327,6 +402,12 @@ function isLorebookApiUrl(url) {
   } catch (_) {
     return /(?:^|\/)lorebooks(?:[/?#]|$)/i.test(String(url));
   }
+}
+// Native conversation Memories are private even when returned by a normal GET.
+function isNativeMemoryApiUrl(url) {
+  if (!isCoreDiagnosticHost(url)) return false;
+  const path = networkPathname(url);
+  return /(?:^|\/)memories?(?:\/|$)/i.test(path);
 }
 function isRulebookApiUrl(url) {
   // Do not confuse the frontend /my-creations/rulebooks route with API data.
@@ -580,6 +661,7 @@ function scrubGenericNetworkPrivateFields(value, depth = 0) {
 const PRIVATE_RECORD_PASSTHROUGH = new Set([
   'id','character_id','creator_user_id','conversation_id','user_persona_id',
   'last_message_id','prev_id','next_id','application_id','request_id',
+  'memory_type','is_pinned',
   'createdAt','updatedAt','created_at','updated_at','deletedAt',
   'type','visibility','language','role','status','state','model',
   'is_nsfw','avatar_is_nsfw','aicq_manual_review_required',
@@ -633,12 +715,19 @@ function sanitizePrivateApiBody(value, kind) {
   return sanitizePrivateRecord(parsed.value, kind);
 }
 
+function sanitizeNativeMemoryBody(value) {
+  // Allowlisted structure, not a text-field blacklist: new server fields must
+  // not accidentally become public. The common authoring scrub retains IDs,
+  // dates, booleans, the memory type and redacted content length/fingerprint.
+  return sanitizePrivateApiBody(value, 'native-memory');
+}
 function sanitizeNetworkBodyByEndpoint(value, { url, role, status }) {
   if (value == null) return value;
   const path = networkPathname(url);
   // Rulebooks contain authored instructions in combined_rules, definition,
   // meter labels, conditions, descriptions, and future beta-specific fields.
   // An allowlist-based recursive scrub prevents new fields leaking silently.
+  if (isNativeMemoryApiUrl(url)) return sanitizeNativeMemoryBody(value);
   if (isRulebookApiUrl(url)) return sanitizePrivateApiBody(value, 'rulebook');
   if (role === 'response' && Number(status) >= 400) return sanitizeErrorPayload(value);
   if (/(?:^|\/)chat\/?$/i.test(path)) return role === 'request' ? sanitizeChatRequestPayload(value) : sanitizeChatResponsePayload(value);
@@ -673,6 +762,11 @@ function applyNetworkPayloadPrivacy(event) {
     const before = next.body;
     const after = sanitizeNetworkBodyByEndpoint(before, { url, role, status: next.status });
     if (after !== before) { next.body = after; changed = true; }
+  }
+  if (isNativeMemoryApiUrl(url)) {
+    // Legacy extracted signals might contain private payload fragments.
+    if (Array.isArray(next.signals) && next.signals.length) { next.signals = []; changed = true; }
+    next.memoryPrivacy = { redacted: true, policy: 'native-memory-metadata-only' };
   }
   if (isRulebookApiUrl(url)) {
     next.rulebookPrivacy = { redacted: true, policy: 'authored-text-metadata-only' };
@@ -724,6 +818,7 @@ function enrichEvent(event) {
   let safe = sanitizeDeep(event);
   safe = applyStateSnapshotPrivacy(safe).event;
   safe = applyNetworkPayloadPrivacy(safe).event;
+  safe = applyNetworkIdentifierPrivacy(safe).event;
   const signals = extractSignals(safe);
   if (signals.length) safe.signals = signals;
   if (safe.type === 'network') {
@@ -883,7 +978,7 @@ async function getEvents(limit = 2000) {
     req.onsuccess = () => {
       const cursor = req.result;
       if (!cursor || out.length >= limit) return;
-      out.push(cursor.value); cursor.continue();
+      out.push(applyNetworkIdentifierPrivacy(applyNetworkPayloadPrivacy(cursor.value).event).event); cursor.continue();
     };
     tx.oncomplete = () => resolve(out.reverse());
     tx.onerror = () => reject(tx.error);
@@ -1031,6 +1126,105 @@ async function migrateExistingDomTextPrivacy() {
 }
 
 
+// Scrub persistent user/device identifiers from existing stored network records.
+// This is a separate, one-time migration: older network migrations may have
+// completed before SpicyChat introduced x-guest-userid in request headers.
+function applyNetworkIdentifierPrivacy(event) {
+  if (!event || event.type !== 'network') return { event, changed: false };
+  let changed = false;
+  const visit = (value, depth = 0) => {
+    if (depth > 16 || value == null) return value;
+    if (typeof value === 'string') {
+      const next = redactString(value);
+      if (next !== value) changed = true;
+      return next;
+    }
+    if (typeof value !== 'object') return value;
+    if (Array.isArray(value)) {
+      let next = null;
+      for (let i = 0; i < value.length; i++) {
+        const item = visit(value[i], depth + 1);
+        if (item !== value[i]) { if (!next) next = value.slice(); next[i] = item; }
+      }
+      return next || value;
+    }
+    let next = null;
+    for (const [key, item] of Object.entries(value)) {
+      const cleaned = isPrivateIdentifierKey(key) ? '[REDACTED]' : visit(item, depth + 1);
+      if (cleaned !== item) { if (!next) next = { ...value }; next[key] = cleaned; changed = true; }
+    }
+    return next || value;
+  };
+  const safe = visit(event);
+  return { event: safe, changed };
+}
+
+async function migrateExistingRequestIdentifierPrivacy() {
+  const state = await chrome.storage.local.get(REQUEST_IDENTIFIER_PRIVACY_MIGRATION_KEY);
+  if (state[REQUEST_IDENTIFIER_PRIVACY_MIGRATION_KEY]) return;
+  const db = await openDb();
+  let scanned = 0, updated = 0;
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    const store = tx.objectStore(STORE);
+    const indexed = store.indexNames.contains('type');
+    const source = indexed ? store.index('type') : store;
+    const req = indexed ? source.openCursor(IDBKeyRange.only('network')) : source.openCursor();
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) return;
+      const raw = cursor.value;
+      if (!indexed && raw?.type !== 'network') { cursor.continue(); return; }
+      scanned++;
+      const applied = applyNetworkIdentifierPrivacy(raw);
+      if (applied.changed) {
+        applied.event.id = raw.id;
+        cursor.update(applied.event);
+        updated++;
+      }
+      cursor.continue();
+    };
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+  await chrome.storage.local.set({ [REQUEST_IDENTIFIER_PRIVACY_MIGRATION_KEY]: { completedAt: Date.now(), scanned, updated } });
+}
+
+// Independent migration; do not reuse the previous network migration key.
+// This runs on stored network rows in chunks using IndexedDB cursors and leaves
+// original IDs, HTTP status and timing fields intact.
+async function migrateExistingNativeMemoryPrivacy() {
+  const state = await chrome.storage.local.get(NATIVE_MEMORY_PRIVACY_MIGRATION_KEY);
+  if (state[NATIVE_MEMORY_PRIVACY_MIGRATION_KEY]) return;
+  const db = await openDb();
+  let scanned = 0, updated = 0;
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    const store = tx.objectStore(STORE);
+    const indexed = store.indexNames.contains('type');
+    const source = indexed ? store.index('type') : store;
+    const req = indexed ? source.openCursor(IDBKeyRange.only('network')) : source.openCursor();
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) return;
+      const raw = cursor.value;
+      if (raw?.type === 'network' && isNativeMemoryApiUrl(lorebookUrlFromEvent(raw))) {
+        scanned++;
+        const applied = applyNetworkPayloadPrivacy(raw);
+        if (applied.changed || !raw.memoryPrivacy?.redacted) {
+          applied.event.id = raw.id;
+          cursor.update(applied.event);
+          updated++;
+        }
+      }
+      cursor.continue();
+    };
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+  await chrome.storage.local.set({ [NATIVE_MEMORY_PRIVACY_MIGRATION_KEY]: { completedAt: Date.now(), scanned, updated } });
+}
+
 async function migrateExistingNetworkPrivacy() {
   const state = await chrome.storage.local.get(NETWORK_PRIVACY_MIGRATION_KEY);
   if (state[NETWORK_PRIVACY_MIGRATION_KEY]) return;
@@ -1139,12 +1333,12 @@ async function migrateSettingsFor004() {
   }
 }
 
-chrome.runtime.onInstalled.addListener(() => { migrateExistingEvents().catch(() => {}); migrateExistingLorebookPrivacy().catch(() => {}); migrateExistingStateSnapshotPrivacy().catch(() => {}); migrateExistingDomTextPrivacy().catch(() => {}); migrateExistingNetworkPrivacy().catch(() => {}); migrateSettingsFor004().catch(() => {}); });
+chrome.runtime.onInstalled.addListener(() => { migrateExistingEvents().catch(() => {}); migrateExistingLorebookPrivacy().catch(() => {}); migrateExistingStateSnapshotPrivacy().catch(() => {}); migrateExistingDomTextPrivacy().catch(() => {}); migrateExistingNetworkPrivacy().catch(() => {}); migrateExistingRequestIdentifierPrivacy().catch(() => {}); migrateExistingNativeMemoryPrivacy().catch(() => {}); migrateSettingsFor004().catch(() => {}); });
 migrateExistingEvents().catch(() => {});
 migrateExistingLorebookPrivacy().catch(() => {});
 migrateExistingStateSnapshotPrivacy().catch(() => {});
 migrateExistingDomTextPrivacy().catch(() => {});
-migrateExistingNetworkPrivacy().catch(() => {});
+migrateExistingNetworkPrivacy().catch(() => {}); migrateExistingRequestIdentifierPrivacy().catch(() => {}); migrateExistingNativeMemoryPrivacy().catch(() => {});
 migrateSettingsFor004().catch(() => {});
 
 

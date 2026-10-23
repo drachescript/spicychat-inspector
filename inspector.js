@@ -1,11 +1,14 @@
 const $ = s => document.querySelector(s);
 let allEvents = [], filtered = [], selectedId = null, storedTotal = 0;
 const INTEREST_RE = /(sfw|nsfw|safe|safety|moder|filter|restrict|flag|feature|experiment|model|engine|provider|token|context|prompt|memory|lore|generation|temperature|preset|queue|rate|limit|image|warning|blocked|error|slow|performance)/i;
+const PRIVATE_IDENTIFIER_KEY_RE = /^(?:x)?(?:guestuserid|guestid|userid|visitorid|deviceid|clientid|anonymousid|anonid|installationid|installid|fingerprintid)$/;
+function isPrivateIdentifierKey(k) { return PRIVATE_IDENTIFIER_KEY_RE.test(String(k || '').replace(/[-_]/g, '').toLowerCase()); }
+const PRIVATE_IDENTIFIER_VALUE_RE = /((?:[\"']?(?:x[-_])?(?:guest[-_]?user[-_]?id|guest[-_]?id|user[-_]?id|visitor[-_]?id|device[-_]?id|client[-_]?id|anon(?:ymous)?[-_]?id|install(?:ation)?[-_]?id|fingerprint[-_]?id)[\"']?)\s*[:=]\s*[\"']?)([A-Za-z0-9._~+/=-]+)/gi;
 const SECRET_KEY_RE = /(authorization|cookie|set-cookie|password|passwd|secret|access[_-]?token|refresh[_-]?token|id[_-]?token|session|jwt|csrf|xsrf|api[_-]?key|client[_-]?secret|p?_?psid)/i;
-function isSecretKey(k) { return k !== 'authInvalidToken' && SECRET_KEY_RE.test(k); }
+function isSecretKey(k) { return k !== 'authInvalidToken' && (SECRET_KEY_RE.test(k) || isPrivateIdentifierKey(k)); }
 const PSID_VALUE_RE = /\b(psid)([:=])([A-Za-z0-9_-]{8,})/gi;
 const SECRET_VALUE_RE = /(Bearer\s+[A-Za-z0-9._~+/=-]{10,}|\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b|(^|[?&])(refresh_token|access_token|id_token|token|password|client_secret|session|jwt|api_key|apikey|frontend_sign|p?_?psid)=([^&#]*))/gi;
-function redactExportString(value) { return String(value ?? '').replace(SECRET_VALUE_RE, '[REDACTED]').replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`); }
+function redactExportString(value) { return String(value ?? '').replace(SECRET_VALUE_RE, '[REDACTED]').replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`).replace(PRIVATE_IDENTIFIER_VALUE_RE, (m, prefix) => `${prefix}[REDACTED]`); }
 
 async function msg(data) { const res = await chrome.runtime.sendMessage(data); if (!res?.ok) throw new Error(res?.error || 'Request failed'); return res; }
 function esc(v) { return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -179,6 +182,66 @@ function rangeForSorted(items, startTs, endTs) {
 function isChatSuccessResponse(e) {
   return e?.type === 'network' && /response$/.test(e.subtype || '') && String(e.method || '').toUpperCase() === 'POST' && e.status >= 200 && e.status < 300 && /(^|\/)chat$/.test(endpointLabel(e));
 }
+
+function buildNativeCharacterRatingDiagnostics(events) {
+  const rows = events.filter(e => e.type === 'network' && e.subtype === 'browser-character-rating-response' && e.browserObserver === true);
+  const unique = new Set(rows.map(x=>x.botId).filter(Boolean));
+  const statusCodes = {};
+  for (const e of rows) { const code=String(e.status ?? 'unknown'); statusCodes[code]=(statusCodes[code]||0)+1; }
+  const timing = rows.map(e=>Number(e.durationMs)).filter(Number.isFinite);
+  const resourceOnly = events.filter(e => e.type==='performance' && e.subtype==='resource' && /prod\.nd-api\.com\/event(?:$|\?)/i.test(String(e.name || ''))).length;
+  return {
+    confirmedByBrowserObserver:rows.length, successes:rows.filter(e=>e.status>=200&&e.status<300).length,
+    failures:rows.filter(e=>e.status===0||e.status>=400).length,
+    uniqueBotIds:unique.size, statusCodes, resourceTimingObservations:resourceOnly,
+    // A Resource Timing entry alone is NOT proof of HTTP 200.
+    unverifiedResourceOnly:rows.length===0 ? resourceOnly : 0,
+    averageMs:timing.length ? Math.round(timing.reduce((a,b)=>a+b,0)/timing.length*10)/10 : null
+  };
+}
+function buildApiEndpointInventory(events) {
+  const routes = new Map();
+  // Only response outcomes; request events would double-count transactions.
+  for (const e of events) {
+    if (e.type !== 'network' || !(/response$/.test(e.subtype||'') || e.requestCombined===true)) continue;
+    const method=String(e.method || 'GET').toUpperCase();
+    if (!/^(GET|POST|PATCH|PUT|DELETE|OPTIONS)$/.test(method)) continue;
+    let url; try { url=new URL(endpointUrl(e)); } catch (_) { continue; }
+    if (!/\b(spicychat\.ai|nd-api\.com|recombee\.com)$/.test(url.hostname)) continue;
+    // Variable path IDs are replaced; query strings/values are never retained.
+    const safeSegments = new Set(['api','v1','v2','v3','cms','banners','queue','app','applications','spicychat','event','events','memories','conversations','characters','character','chatbots','chatbot','users','user','my','public','private','search','clone','suggest_tags','lorebooks','rulebooks','attachments','attach','edit','entries','import','export','tags','multi_search','ratings','bookmarks','chat','chats','messages','history','images','upload','create','update','delete','list','profile','creator','creators','favorites','favorite','following','blocked','recommendations','settings','statistics','stats','oauth2','token','sort','suggestions','page']);
+    const path='/' + url.pathname.split('/').filter(Boolean).slice(0,10).map(seg=>safeSegments.has(seg.toLowerCase()) ? seg.toLowerCase() : ':value').join('/');
+    const label=`${url.hostname}${path}`.slice(0,180);
+    const key=`${method} ${label}`;
+    const x=routes.get(key)||{method,endpoint:label,count:0,statuses:{},errors:0,timingSamples:0,totalMs:0,maxMs:0,firstTs:eventTs(e),lastTs:eventTs(e)};
+    x.count++; const code=String(e.status??'unknown'); x.statuses[code]=(x.statuses[code]||0)+1;
+    if(e.status===0||e.status>=400) x.errors++;
+    if(Number.isFinite(Number(e.durationMs))){ const ms=Number(e.durationMs);x.timingSamples++;x.totalMs+=ms;x.maxMs=Math.max(x.maxMs,ms); }
+    x.lastTs=Math.max(x.lastTs,eventTs(e)); routes.set(key,x);
+  }
+  const top=[...routes.values()].sort((a,b)=>b.count-a.count).slice(0,40).map(x=>({
+    method:x.method,endpoint:x.endpoint,count:x.count,statuses:x.statuses,errors:x.errors,
+    avgMs:x.timingSamples?Math.round(x.totalMs/x.timingSamples*10)/10:null,
+    maxMs:Math.round(x.maxMs*10)/10,firstTs:x.firstTs,lastTs:x.lastTs
+  }));
+  return {uniqueRoutes:routes.size,top,privateBodiesStored:false,queryValuesStored:false};
+}
+function buildMessageRemountPressure(events) {
+  let added=0,removed=0,qolRelated=0,qolOwned=0,batches=0;
+  const pages=new Map();
+  for(const e of events){
+    if(e.type!=='dom'||e.subtype!=='mutation-batch') continue;
+    const a=Number(e.stats?.messageNodesAdded||0), r=Number(e.stats?.messageNodesRemoved||0);
+    if(!a&&!r)continue;
+    added+=a;removed+=r;qolRelated+=Number(e.stats?.qolRelated||0);qolOwned+=Number(e.stats?.qolOwned||0);batches++;
+    const page=pages.get(e.pageId)||{pageId:e.pageId,pageUrl:e.pageUrl||e.url||null,added:0,removed:0,batches:0};
+    page.added+=a;page.removed+=r;page.batches++;pages.set(e.pageId,page);
+  }
+  return {added,removed,batches,pairedReplacementsUpperBound:Math.min(added,removed),qolRelatedMutations:qolRelated,qolOwnedMutations:qolOwned,
+    attribution:'message-node churn; paired counts are an upper bound, not confirmed native or QoL remounts',
+    topPages:[...pages.values()].sort((a,b)=>(b.added+b.removed)-(a.added+a.removed)).slice(0,8)};
+}
+
 function buildGenerationRenderDiagnostics(events, windowMs = 8000) {
   const byPage = new Map();
   for (const e of events) {
@@ -233,7 +296,7 @@ function buildGenerationRenderDiagnostics(events, windowMs = 8000) {
       domMatchReason:domMatchResult?.reason || (renderSignal?'signal-without-final-check':'not-recorded'),
       domMatchHasReplyId:domMatchResult?.hasReplyId === true,
       domMatchPriorMutations:domMatchResult?.priorDomMutationCount || 0,
-      domMatchLateCheck:domMatchResult?.lateCheck === true,
+      domMatchLateCheck:domMatchResult?.lateCheck === true, domMatchCoverageLimited:domMatchResult?.coverageLimited === true,
       responseDomSignalConfidence:renderSignal?.signalConfidence || null,
       // Confirmed reply timing requires an exact generated reply ID node.
       // A growing/reconstructed message list is not proof of reply rendering.
@@ -905,7 +968,7 @@ function compactVersionProjection(e) {
   if (e.type === 'performance' && e.subtype === 'worker-resource-summary') return { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, pageRole:e.pageRole||null, workerRole:e.workerRole, endpointGroup:e.endpointGroup, initiatorType:e.initiatorType, requests:e.requests||0, totalDurationMs:e.totalDurationMs||0, avgDurationMs:e.avgDurationMs||0, medianDurationMs:e.medianDurationMs||0, p95DurationMs:e.p95DurationMs||0, maxDurationMs:e.maxDurationMs||0, over500ms:e.over500ms||0, over1000ms:e.over1000ms||0, totalTransferSize:e.totalTransferSize||0, firstAt:e.firstAt, lastAt:e.lastAt };
   if (e.type === 'performance' && e.subtype === 'resource-timing-maintenance') return { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, configuredSize:e.configuredSize, threshold:e.threshold, proactiveClears:e.proactiveClears||0 };
   if (e.type === 'performance' && e.subtype === 'worker-capture-profile') return { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, pageRole:e.pageRole||null, workerRole:e.workerRole, domObserver:e.domObserver, resourceTiming:e.resourceTiming };
-  if (e.type === 'performance' && e.subtype === 'generation-dom-match-result') return {type:e.type,subtype:e.subtype,ts:e.ts,pageId:e.pageId,relatedRequestId:e.relatedRequestId,generationResponseTs:e.generationResponseTs,status:e.status,reason:e.reason,hasReplyId:e.hasReplyId===true,exactReplyPresentAtResponse:e.exactReplyPresentAtResponse===true,priorDomMutationCount:e.priorDomMutationCount||0,postResponseMessageMutationCount:e.postResponseMessageMutationCount||0,lateCheck:e.lateCheck===true,signalConfidence:e.signalConfidence};
+  if (e.type === 'performance' && e.subtype === 'generation-dom-match-result') return {type:e.type,subtype:e.subtype,ts:e.ts,pageId:e.pageId,relatedRequestId:e.relatedRequestId,generationResponseTs:e.generationResponseTs,status:e.status,reason:e.reason,hasReplyId:e.hasReplyId===true,exactReplyPresentAtResponse:e.exactReplyPresentAtResponse===true,priorDomMutationCount:e.priorDomMutationCount||0,postResponseMessageMutationCount:e.postResponseMessageMutationCount||0,lateCheck:e.lateCheck===true,coverageLimited:e.coverageLimited===true,signalConfidence:e.signalConfidence};
   if (e.type === 'performance' && e.subtype === 'scroll-performance-window') return {type:e.type,subtype:e.subtype,ts:e.ts,pageId:e.pageId,pageUrl:e.pageUrl||e.url,scrollBurstId:e.scrollBurstId,trigger:e.trigger,durationMs:e.durationMs,scrollEvents:e.scrollEvents,sampledFrames:e.sampledFrames,framesOver50Ms:e.framesOver50Ms,framesOver100Ms:e.framesOver100Ms,worstFrameGapMs:e.worstFrameGapMs,estimatedMissedFrames:e.estimatedMissedFrames,nearbyLongTasks:e.nearbyLongTasks,nearbyLongTaskMs:e.nearbyLongTaskMs,attribution:e.attribution};
   if (e.type === 'performance' && e.subtype === 'slow-input-event') return {type:e.type,subtype:e.subtype,ts:e.ts,pageId:e.pageId,pageUrl:e.pageUrl||e.url,eventKind:e.eventKind,durationMs:e.durationMs,inputDelayMs:e.inputDelayMs,processingMs:e.processingMs,entryStartTs:e.entryStartTs,attribution:e.attribution};
   if (e.type === 'performance' && (e.subtype === 'qol-trace-link-status' || e.subtype === 'qol-trace-capture-config')) return {type:e.type,subtype:e.subtype,ts:e.ts,pageId:e.pageId,status:e.status,enabled:e.enabled,traceLevel:e.traceLevel,handshakes:e.handshakes,received:e.received,lastTraceAgeMs:e.lastTraceAgeMs,handshakeResponses:e.handshakeResponses,qolIdentity:e.qolIdentity,reason:e.reason};
@@ -923,7 +986,7 @@ function compactVersionProjection(e) {
     firstAt:e.firstAt, lastAt:e.lastAt, recording:e.recording
   });
   if (e.type === 'network' && (/(?:request|response|error|incomplete)$/.test(e.subtype || '') || e.requestCombined === true)) {
-    const out = decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, responseReceivedAt:e.responseReceivedAt, requestStartedAt:e.requestStartedAt, requestCombined:e.requestCombined===true, requestId:e.requestId, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, pageUrl:e.pageUrl, url:e.url, finalUrl:e.finalUrl, requestedUrl:e.requestedUrl, method:e.method, status:e.status, durationMs:e.durationMs||0, responseChars:e.responseChars||0, contentLength:e.contentLength||0, responseFingerprint:e.responseFingerprint, requestFingerprint:e.requestFingerprint, errorCode:e.errorCode, authInvalidToken:e.authInvalidToken===true, statusZeroHint:e.statusZeroHint, browserObserver:e.browserObserver===true, initiator:e.initiator, networkMeta:e.networkMeta, signals:(e.signals||[]).slice(0,30) });
+    const out = decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, responseReceivedAt:e.responseReceivedAt, requestStartedAt:e.requestStartedAt, requestCombined:e.requestCombined===true, requestId:e.requestId, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, pageUrl:e.pageUrl, url:e.url, finalUrl:e.finalUrl, requestedUrl:e.requestedUrl, method:e.method, status:e.status, durationMs:e.durationMs||0, responseChars:e.responseChars||0, contentLength:e.contentLength||0, responseFingerprint:e.responseFingerprint, requestFingerprint:e.requestFingerprint, errorCode:e.errorCode, authInvalidToken:e.authInvalidToken===true, statusZeroHint:e.statusZeroHint, browserObserver:e.browserObserver===true, eventName:e.subtype==='browser-character-rating-response'?e.eventName:undefined, botId:e.subtype==='browser-character-rating-response'?e.botId:undefined, rating:e.subtype==='browser-character-rating-response'?e.rating:undefined, initiator:e.initiator, networkMeta:e.networkMeta, signals:(e.signals||[]).slice(0,30) });
     const label = endpointLabel(e);
     const reqBody = requestBodyOf(e);
     if (/(?:^|\/)chat$/.test(label) && reqBody && typeof reqBody==='object') out.requestBody={ inference_model:reqBody.inference_model??null, inference_settings:reqBody.inference_settings||null, conversation_id:reqBody.conversation_id??null, character_id:reqBody.character_id??null, alt_message_id:reqBody.alt_message_id??null, continue_chat:reqBody.continue_chat??null };
@@ -956,7 +1019,7 @@ async function scanFullCaptureVersionSummary(db, total, button) {
     tx.onerror = () => reject(tx.error);
   });
   const summary = buildSummary(projected);
-  return { eventCount: total, firstTs, lastTs, durationMs: firstTs != null && lastTs != null ? Math.max(0,lastTs-firstTs) : 0, ...buildVersionDiagnostics(projected), quickDislike: summary.quickDislike, recommendationFeedback: summary.recommendationFeedback, diagnosticConsistencyWarnings: summary.diagnosticConsistencyWarnings, listingRefill: buildListingRefillDiagnostics(projected), captureHealth: summary.captureHealth, scrollAndInput: summary.scrollAndInput, longTaskAttribution: summary.longTaskAttribution, generationRender: buildGenerationRenderDiagnostics(projected), recentPerformance: buildRecentPerformanceComparison(projected), pageHotspots: buildPageInstanceHotspots(projected), pagePressureGrowth: buildPagePressureGrowthDiagnostics(projected), autoLagSpikes: projected.filter(e=>e.type==='performance'&&e.subtype==='auto-lag-spike').length, summary };
+  return { eventCount: total, firstTs, lastTs, durationMs: firstTs != null && lastTs != null ? Math.max(0,lastTs-firstTs) : 0, ...buildVersionDiagnostics(projected), quickDislike: summary.quickDislike, recommendationFeedback: summary.recommendationFeedback, nativeCharacterRating:summary.nativeCharacterRating, apiEndpointInventory:summary.apiEndpointInventory, messageRemountPressure:summary.messageRemountPressure, diagnosticConsistencyWarnings: summary.diagnosticConsistencyWarnings, listingRefill: buildListingRefillDiagnostics(projected), captureHealth: summary.captureHealth, scrollAndInput: summary.scrollAndInput, longTaskAttribution: summary.longTaskAttribution, generationRender: buildGenerationRenderDiagnostics(projected), recentPerformance: buildRecentPerformanceComparison(projected), pageHotspots: buildPageInstanceHotspots(projected), pagePressureGrowth: buildPagePressureGrowthDiagnostics(projected), autoLagSpikes: projected.filter(e=>e.type==='performance'&&e.subtype==='auto-lag-spike').length, summary };
 }
 
 
@@ -1755,6 +1818,9 @@ function buildSummary(events) {
   const authRefreshRaces = buildAuthRefreshRaceDiagnostics(events, invalidToken401);
   const pageRoleIndex = buildPageRoleIndex(events);
   const recommendationFeedback = buildRecommendationFeedbackDiagnostics(events, pageRoleIndex);
+  const nativeCharacterRating = buildNativeCharacterRatingDiagnostics(events);
+  const apiEndpointInventory = buildApiEndpointInventory(events);
+  const messageRemountPressure = buildMessageRemountPressure(events);
 
   const statusZeroLikelyNavigation = netResponses.filter(e => e.status === 0 && /navigation|hidden|abort|unload/i.test(e.statusZeroHint || '')).length;
 
@@ -2079,6 +2145,9 @@ function buildSummary(events) {
     invalidTokenAttribution,
     authRefreshRaces,
     recommendationFeedback,
+    nativeCharacterRating,
+    apiEndpointInventory,
+    messageRemountPressure,
     counterDriver,
     qolTrace,
     dailyMessageLimits: {
@@ -2134,8 +2203,21 @@ function renderOverview() {
     ['NSFW true signals', s.nsfwSignals.true], ['NSFW false signals', s.nsfwSignals.false]
   ];
   if (s.qolTelemetry.count) chips.push(['QoL internals', s.qolTelemetry.count]);
+  if (s.nativeCharacterRating?.confirmedByBrowserObserver) chips.push(['Native Dislike events', `${s.nativeCharacterRating.successes}/${s.nativeCharacterRating.confirmedByBrowserObserver} HTTP 2xx`]);
   if (s.qolTrace?.operations?.count) chips.push(['QoL trace ops', s.qolTrace.operations.count]);
   const extra = [];
+  if (s.nativeCharacterRating) {
+    const x=s.nativeCharacterRating;
+    extra.push(`<div><strong>Native characterRating:</strong> ${x.confirmedByBrowserObserver} browser-observed event response(s) · ${x.successes} HTTP 2xx · ${x.failures} error(s) · ${x.uniqueBotIds} bot ID(s). ${!x.confirmedByBrowserObserver && x.resourceTimingObservations ? `Resource Timing saw ${x.resourceTimingObservations} request(s), but their HTTP outcomes were not captured.` : ''} <em>This is separate from the Recombee negative rating; it is not evidence of QoL's saved-history state.</em></div>`);
+  }
+  if (s.apiEndpointInventory?.top?.length) {
+    const a=s.apiEndpointInventory;
+    extra.push(`<div><strong>Privacy-safe API inventory:</strong> ${a.uniqueRoutes} normalized method/endpoint combination(s). Most frequent: ${a.top.slice(0,5).map(x=>`${esc(x.method)} ${esc(x.endpoint)} (${x.count})`).join(' · ')}. No query-string values or response text are copied into this inventory.</div>`);
+  }
+  if (s.messageRemountPressure?.batches) {
+    const m=s.messageRemountPressure;
+    extra.push(`<div><strong>Message-node churn:</strong> ${m.added} added / ${m.removed} removed across ${m.batches} DOM batches. These are message-container changes, not confirmed QoL-caused remounts.</div>`);
+  }
   if (s.models.length) extra.push(`<div><strong>Models/engines seen:</strong> ${s.models.map(esc).join(', ')}</div>`);
   if (s.dailyMessageLimits?.count) extra.push(`<div><strong>Known SpicyChat daily-message limit:</strong> ${s.dailyMessageLimits.count} SC-001-5201 response(s). <em>Shown separately from generic Errors because this is an expected product limit, not a network failure.</em></div>`);
   if (s.counterDriver?.logicalEvents) {
@@ -2300,7 +2382,7 @@ async function select(id) {
   when.textContent = new Date(e.ts).toLocaleString();
   head.append(title, when);
   const pre = document.createElement('pre');
-  appendHighlightedJson(pre, e);
+  appendHighlightedJson(pre, sanitizeEventForExport(e));
   detail.append(head, pre);
   render();
 }
@@ -2641,6 +2723,11 @@ function sanitizeErrorForExport(value){
 }
 function exportNetworkPath(url){try{return new URL(String(url)).pathname||'';}catch(_){return String(url||'');}}
 function exportIsCoreHost(url){try{const h=new URL(String(url)).hostname.toLowerCase();return h==='spicychat.ai'||h.endsWith('.spicychat.ai')||h==='nd-api.com'||h.endsWith('.nd-api.com');}catch(_){return false;}}
+function isNativeMemoryApiExportUrl(url) {
+  if (!exportIsCoreHost(url)) return false;
+  const path = exportNetworkPath(url);
+  return /(?:^|\/)memories(?:\/|$)/i.test(path) && /(?:^|\/)(?:v\d+\/)?conversations\//i.test(path);
+}
 function isRulebookApiExportUrl(url){return /^\/(?:api\/)?(?:v\d+\/)?rulebooks?(?:\/|$)/i.test(exportNetworkPath(url))&&exportIsCoreHost(url);}
 const EXPORT_GENERIC_NETWORK_PRIVATE_KEY_RE=/(?:email|e[_-]?mail|phone|highlights|persona(?:text|description)|full[_-]?text|raw[_-]?body)/i;
 function scrubGenericNetworkPrivateFieldsForExport(value,depth=0){
@@ -2659,6 +2746,7 @@ function scrubGenericNetworkPrivateFieldsForExport(value,depth=0){
 const EXPORT_PRIVATE_RECORD_PASSTHROUGH = new Set([
   'id','character_id','creator_user_id','conversation_id','user_persona_id',
   'last_message_id','prev_id','next_id','application_id','request_id',
+  'memory_type','is_pinned',
   'createdAt','updatedAt','created_at','updated_at','deletedAt',
   'type','visibility','language','role','status','state','model',
   'is_nsfw','avatar_is_nsfw','aicq_manual_review_required',
@@ -2713,6 +2801,7 @@ function sanitizePrivateApiBodyForExport(value, kind) {
 function sanitizeNetworkPayloadForExport(value,{url,role,status}){
   if(value==null)return value;
   const path=exportNetworkPath(url);
+  if(isNativeMemoryApiExportUrl(url))return sanitizePrivateApiBodyForExport(value,'native-memory');
   if(isRulebookApiExportUrl(url))return sanitizePrivateApiBodyForExport(value,'rulebook');
   if(role==='response'&&Number(status)>=400)return sanitizeErrorForExport(value);
   if(/(?:^|\/)chat\/?$/i.test(path))return role==='request'?sanitizeChatRequestForExport(value):sanitizeChatResponseForExport(value);
@@ -2737,6 +2826,13 @@ function applyNetworkExportPrivacy(event){
       if(body&&typeof body==='object')safe[field]=redactLorebookExportPayload(body,0,{contentFields:0,keywordFields:0}).value;
     }
     safe.lorebookPrivacy={...(safe.lorebookPrivacy||{}),redacted:true,policy:'metadata-structure-only'};
+    return safe;
+  }
+  if(isNativeMemoryApiExportUrl(url)) {
+    if(safe.requestBody!=null)safe.requestBody=sanitizePrivateApiBodyForExport(safe.requestBody,'native-memory');
+    if(safe.body!=null)safe.body=sanitizePrivateApiBodyForExport(safe.body,'native-memory');
+    if(Array.isArray(safe.signals))safe.signals=[];
+    safe.memoryPrivacy={redacted:true,policy:'native-memory-metadata-only'};
     return safe;
   }
   if(isRulebookApiExportUrl(url)) {
@@ -2784,9 +2880,9 @@ async function exportJson() {
     const meta = {
       exportedAt: new Date().toISOString(), extension: 'SpicyChat Inspector', version,
       storedEvents: total,
-      note: 'Defense-in-depth sanitization is applied at capture/storage and again during export. Sensitive network payloads are metadata-only by default: chat text/history, persona text, account/profile fields, character-authoring text, Rulebook instructions/descriptions/labels, image uploads, third-party payloads, and Lorebook entry content/keywords are redacted while diagnostic counts/IDs/status/model fields and fingerprints are retained where useful. Confirmed first-message render timing excludes unverified DOM signals. Export reads IndexedDB directly and uses gzip when supported. DOM batches retain aggregate counts but only a compact representative sample. Attribution is evidence-based.',
+      note: 'Defense-in-depth sanitization is applied at capture/storage and again during export. Sensitive network payloads are metadata-only by default: chat text/history, persona text, account/profile fields, character-authoring text, Rulebook instructions/descriptions/labels, image uploads, third-party payloads, Lorebook entry content/keywords and native Memory text are redacted while diagnostic counts/IDs/status/model fields and fingerprints are retained where useful. Confirmed first-message render timing excludes unverified DOM signals. Export reads IndexedDB directly and uses gzip when supported. DOM batches retain aggregate counts but only a compact representative sample. Attribution is evidence-based.',
       summaryScope: 'full capture compact projection', loadedSampleEvents: allEvents.length,
-      networkPrivacyPolicy: { chatText:'redacted', conversationHistory:'metadata-only', personaText:'metadata-only', accountProfile:'metadata-only', characterAuthoringText:'metadata-only', rulebookAuthoredText:'metadata-only', lorebookEntryContent:'redacted', lorebookEntryKeywords:'redacted', imageUploads:'metadata-only', thirdPartyBodies:'metadata-only', retainedDiagnostics:['IDs where useful','status/error codes','model/inference settings','NSFW flags','timestamps','lengths/counts','fnv1a32 fingerprints'] },
+      networkPrivacyPolicy: { chatText:'redacted', conversationHistory:'metadata-only', personaText:'metadata-only', accountProfile:'metadata-only', characterAuthoringText:'metadata-only', rulebookAuthoredText:'metadata-only', lorebookEntryContent:'redacted', lorebookEntryKeywords:'redacted', nativeMemoryContent:'redacted', imageUploads:'metadata-only', thirdPartyBodies:'metadata-only', retainedDiagnostics:['IDs where useful','status/error codes','model/inference settings','NSFW flags','timestamps','lengths/counts','fnv1a32 fingerprints'] },
       lorebookPrivacyPolicy: { entryContent: 'redacted', entryKeywords: 'redacted', retainedDiagnostics: ['IDs','names','versions','timestamps','lengths/counts','fnv1a32 fingerprints'], scope: 'SpicyChat /lorebooks API request/response bodies' },
       summary: fullCaptureVersions.summary,
       diagnosticConsistencyWarnings: fullCaptureVersions.summary?.diagnosticConsistencyWarnings || [],

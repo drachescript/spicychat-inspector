@@ -73,3 +73,26 @@ small { font-size: 10px; color: #858997; font-weight: 500; }
 .popup .changelogLink { margin-top: 9px; }
 .popupLinks { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 8px; }
 .popupLinks .buttonLink { min-width: 0; text-align: center; white-space: nowrap; }
+
+
+/* Firefox for Android: action popup may open as a full browser tab. */
+@media (max-width: 700px) {
+  .popup { width: 100%; max-width: 100vw; padding: 14px; }
+  .popup header { gap: 8px; }
+  .popupLinks .buttonLink { white-space: normal; min-height: 42px; }
+  .inspector .topbar { position: static; align-items: flex-start; flex-wrap: wrap; gap: 9px; padding: 12px; }
+  .inspector .actions { width: 100%; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+  .inspector .actions > * { min-width: 0; padding: 9px 6px; font-size: 12px; }
+  .inspector .overview { padding: 9px 12px; overflow-wrap: anywhere; }
+  .inspector .filters { display: flex; flex-wrap: wrap; gap: 7px; padding: 10px 12px; }
+  .inspector .filters input[type="text"], .inspector .filters input:not([type]) {
+    min-width: 0; width: 100%; flex: 1 1 100%;
+  }
+  .inspector .filters .muted { margin-left: 0; }
+  .inspector main { display: flex; flex-direction: column; height: auto; min-height: 65vh; }
+  .inspector .events { flex: none; max-height: 46vh; min-height: 185px; border-right: 0; border-bottom: 1px solid #343641; }
+  .inspector .detail { flex: 1 1 auto; min-height: 35vh; max-height: 65vh; }
+  .inspector .event { grid-template-columns: 70px 77px minmax(0, 1fr); gap: 6px; padding: 9px 7px; }
+  .inspector pre { padding: 10px; font-size: 11px; }
+  .inspector .detailHead { top: 0; }
+}

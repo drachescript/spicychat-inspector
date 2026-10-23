@@ -1,3 +1,15 @@
+## 0.1.1
+- Improved Firefox for Android support with reduced-overhead DOM capture and bounded normal-level QoL trace sampling.
+- Added mobile capture-coverage and browser timing-capability information so unsupported measurements are not shown as zero lag.
+- Improved Inspector popup and recording viewer layouts for narrow Android screens.
+- Added browser-level HTTP outcome tracking for SpicyChat's native `characterRating` events, separate from recommendation ratings, without saving event bodies or credentials.
+- Improved generation DOM-check coverage reporting when hidden tabs coalesce followups, timers run late, or a conversation route changes.
+- Added privacy-safe method/endpoint inventory with response status and latency summaries, without query values or response text.
+- Added message-node addition/removal pressure summaries to help investigate long-chat rerenders without adding a new DOM observer.
+- Redacted native SpicyChat Memory text from network diagnostics and exports, retaining Memory IDs, types, pinned status, timestamps, lengths and fingerprints.
+- Added automatic privacy cleanup for previously stored Memory responses.
+- Redacted persistent user and device identifiers from recorded request headers and older diagnostics.
+
 ## 0.1.0
 - Improved QoL diagnostics to distinguish tracing being disabled, no connection response, a handshake only, and actual detailed operation traces. Added targeted trace requests when investigating lag spikes.
 - Improved chat generation timing checks, including early-rendered replies, delayed checks and clearer explanations when a reply cannot be matched.

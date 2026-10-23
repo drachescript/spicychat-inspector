@@ -11,7 +11,11 @@
   let lastPageHideAt = 0;
   const storageBursts = new Map();
 
+  const PRIVATE_IDENTIFIER_KEY_RE = /^(?:x)?(?:guestuserid|guestid|userid|visitorid|deviceid|clientid|anonymousid|anonid|installationid|installid|fingerprintid)$/;
+  function isPrivateIdentifierKey(k) { return PRIVATE_IDENTIFIER_KEY_RE.test(String(k || '').replace(/[-_]/g, '').toLowerCase()); }
+  const PRIVATE_IDENTIFIER_VALUE_RE = /((?:[\"']?(?:x[-_])?(?:guest[-_]?user[-_]?id|guest[-_]?id|user[-_]?id|visitor[-_]?id|device[-_]?id|client[-_]?id|anon(?:ymous)?[-_]?id|install(?:ation)?[-_]?id|fingerprint[-_]?id)[\"']?)\s*[:=]\s*[\"']?)([A-Za-z0-9._~+/=-]+)/gi;
   const SECRET_KEY_RE = /(authorization|cookie|set-cookie|password|passwd|secret|access[_-]?token|refresh[_-]?token|id[_-]?token|session|jwt|csrf|xsrf|api[_-]?key|client[_-]?secret|p?_?psid)/i;
+  function isSecretKey(k) { return SECRET_KEY_RE.test(k) || isPrivateIdentifierKey(k); }
   const INTEREST_RE = /(sfw|nsfw|safe|safety|moder|filter|restrict|flag|feature|experiment|model|engine|provider|token|context|prompt|memory|lore|generation|temperature|top[_-]?[pk]|preset|queue|rate|limit|image|error|warning|status)/i;
   const JWT_RE = /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/g;
   const BEARER_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]{10,}/gi;
@@ -26,14 +30,15 @@
       .replace(BEARER_RE, 'Bearer [REDACTED]')
       .replace(URLENC_SECRET_RE, (m, prefix, key) => `${prefix}${key}=[REDACTED]`)
       .replace(QUERY_SECRET_RE, (m, prefix, key) => `${prefix}${key}=[REDACTED]`)
-      .replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`);
+      .replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`)
+      .replace(PRIVATE_IDENTIFIER_VALUE_RE, (m, prefix) => `${prefix}[REDACTED]`);
   }
 
   function redactUrl(url) {
     try {
       const u = new URL(String(url), location.href);
       for (const key of [...u.searchParams.keys()]) {
-        if (SECRET_KEY_RE.test(key) || /(^|_)(token|key|secret|password|session)(_|$)/i.test(key)) u.searchParams.set(key, '[REDACTED]');
+        if (isSecretKey(key) || /(^|_)(token|key|secret|password|session)(_|$)/i.test(key)) u.searchParams.set(key, '[REDACTED]');
       }
       return u.href;
     } catch (_) {
@@ -65,7 +70,7 @@
         if (count++ > 700) { out.__truncated__ = true; break; }
         let v;
         try { v = value[key]; } catch (_) { continue; }
-        out[key] = SECRET_KEY_RE.test(key) ? '[REDACTED]' : sanitize(v, depth + 1, seen);
+        out[key] = isSecretKey(key) ? '[REDACTED]' : sanitize(v, depth + 1, seen);
       }
       return out;
     }
@@ -82,7 +87,7 @@
     for (const [key, val] of Object.entries(value)) {
       if (out.length >= 250) break;
       const p = `${path}.${key}`;
-      if (INTEREST_RE.test(key) && !SECRET_KEY_RE.test(key)) {
+      if (INTEREST_RE.test(key) && !isSecretKey(key)) {
         if (val == null || ['string','number','boolean'].includes(typeof val)) out.push({ path: p, value: sanitize(val) });
         else if (Array.isArray(val) && val.length <= 20) out.push({ path: p, value: sanitize(val) });
       }
@@ -91,15 +96,62 @@
     return out;
   }
 
+  function isNativeMemoryUrl(url) {
+    try {
+      const u = new URL(String(url || ''), location.href);
+      if (!(u.hostname === 'nd-api.com' || u.hostname.endsWith('.nd-api.com') || u.hostname === 'spicychat.ai' || u.hostname.endsWith('.spicychat.ai'))) return false;
+      return /(?:^|\/)memories?(?:\/|$)/i.test(u.pathname);
+    } catch (_) { return false; }
+  }
+  function nativeMemoryMeta(value) {
+    let text = '';
+    try { text = typeof value === 'string' ? value : JSON.stringify(value); }
+    catch (_) { text = String(value ?? ''); }
+    return { redacted: true, kind: 'native-memory-content', chars: text.length, fingerprint: fingerprintText(value) };
+  }
+  const MEMORY_SAFE_FIELDS = new Set(['id', 'conversation_id', 'memory_type', 'type', 'is_pinned', 'createdAt', 'updatedAt', 'created_at', 'updated_at', 'deletedAt']);
+  function scrubNativeMemoryBody(value, depth = 0) {
+    if (depth > 14) return nativeMemoryMeta(value);
+    if (typeof value === 'string') {
+      try { value = JSON.parse(value); } catch (_) { return nativeMemoryMeta(value); }
+    }
+    if (value == null || typeof value === 'number' || typeof value === 'boolean') return value;
+    if (Array.isArray(value)) return value.slice(0, 1000).map(v => scrubNativeMemoryBody(v, depth + 1));
+    if (typeof value !== 'object') return nativeMemoryMeta(value);
+    // Recognize already-redacted snapshots and preserve their original meta.
+    if (value.redacted === true && Object.keys(value).every(k => ['redacted','kind','chars','fingerprint','count','keys'].includes(k))) return value;
+    const out = {};
+    for (const [key, item] of Object.entries(value).slice(0, 1200)) {
+      if (key === 'content' || key === 'text' || key === 'description' || key === 'summary') {
+        out[key] = item && typeof item === 'object' && item.redacted === true
+          ? scrubNativeMemoryBody(item, depth + 1) : nativeMemoryMeta(item);
+      } else if (MEMORY_SAFE_FIELDS.has(key)) {
+        out[key] = item == null || typeof item === 'boolean' || typeof item === 'number'
+          ? item : (typeof item === 'string' && item.length <= 180 ? redactString(item) : nativeMemoryMeta(item));
+      } else if (['data','memories','items','results'].includes(key) && item && typeof item === 'object') {
+        out[key] = scrubNativeMemoryBody(item, depth + 1);
+      } else if (key === '__duplicate_body__' && typeof item === 'boolean') out[key] = item;
+      else if (key === 'fingerprint' && typeof item === 'string' && /^fnv1a-/.test(item)) out[key] = item;
+      else out[key] = nativeMemoryMeta(item);
+    }
+    return out;
+  }
+  function scrubNativeMemoryEvent(event) {
+    if (event?.type !== 'network' || !isNativeMemoryUrl(event.finalUrl || event.requestedUrl || event.url)) return event;
+    const safe = { ...event };
+    for (const field of ['body','requestBody']) if (safe[field] != null) safe[field] = scrubNativeMemoryBody(safe[field]);
+    safe.memoryPrivacy = { redacted: true, policy: 'native-memory-metadata-only' };
+    return safe;
+  }
   function emit(event) {
-    window.postMessage({ source: SOURCE, pageId: PAGE_ID, event: sanitize({ ...event, ts: Date.now() }) }, '*');
+    window.postMessage({ source: SOURCE, pageId: PAGE_ID, event: sanitize(scrubNativeMemoryEvent({ ...event, ts: Date.now() })) }, '*');
   }
 
   function headersToObject(headers) {
     const out = {};
     try {
       new Headers(headers || {}).forEach((v, k) => {
-        out[k] = SECRET_KEY_RE.test(k) ? '[REDACTED]' : redactString(v);
+        out[k] = isSecretKey(k) ? '[REDACTED]' : redactString(v);
       });
     } catch (_) {}
     return out;
@@ -114,22 +166,25 @@
 
   function parseBodyText(text, contentType = '') {
     if (typeof text !== 'string') return text;
-    const safeText = redactString(text);
-    const trimmed = safeText.trim();
+    // Parse the original JSON before masking inline IDs: replacing a bare
+    // numeric userId inside JSON text would otherwise invalidate the JSON.
+    const trimmed = text.trim();
     if (!trimmed) return '';
     let parsed;
     if (/json|graphql/i.test(contentType) || trimmed.startsWith('{') || trimmed.startsWith('[')) {
       try { parsed = JSON.parse(trimmed); } catch (_) {}
     }
+    const safeParsed = parsed === undefined ? undefined : sanitize(parsed);
+    const safeText = redactString(text);
     if (safeText.length > MAX_BODY) {
       return {
         __truncated__: true,
         __originalChars__: safeText.length,
         __preview__: safeText.slice(0, PREVIEW_BODY),
-        __interesting__: parsed ? extractInteresting(parsed) : []
+        __interesting__: safeParsed ? extractInteresting(safeParsed) : []
       };
     }
-    return parsed ?? safeText;
+    return safeParsed ?? safeText;
   }
 
   function bodyFromInit(body) {
@@ -140,7 +195,7 @@
       if (/^[^=&\s]+=[^&]*(?:&[^=&\s]+=[^&]*)*$/.test(trimmed)) {
         try {
           const out = {};
-          for (const [k, v] of new URLSearchParams(trimmed)) out[k] = SECRET_KEY_RE.test(k) ? '[REDACTED]' : redactString(v);
+          for (const [k, v] of new URLSearchParams(trimmed)) out[k] = isSecretKey(k) ? '[REDACTED]' : redactString(v);
           return out;
         } catch (_) {}
       }
@@ -148,12 +203,12 @@
     }
     if (body instanceof URLSearchParams) {
       const out = {};
-      for (const [k, v] of body.entries()) out[k] = SECRET_KEY_RE.test(k) ? '[REDACTED]' : redactString(v);
+      for (const [k, v] of body.entries()) out[k] = isSecretKey(k) ? '[REDACTED]' : redactString(v);
       return out;
     }
     if (body instanceof FormData) {
       const out = {};
-      for (const [k, v] of body.entries()) out[k] = SECRET_KEY_RE.test(k) ? '[REDACTED]' : (typeof v === 'string' ? redactString(v) : `[File ${v?.name || ''}]`);
+      for (const [k, v] of body.entries()) out[k] = isSecretKey(k) ? '[REDACTED]' : (typeof v === 'string' ? redactString(v) : `[File ${v?.name || ''}]`);
       return out;
     }
     return `[${body?.constructor?.name || typeof body}]`;
@@ -266,7 +321,7 @@
       return nativeOpen.apply(this, arguments);
     };
     XHR.prototype.setRequestHeader = function(k, v) {
-      if (this.__sci) this.__sci.headers[k] = SECRET_KEY_RE.test(k) ? '[REDACTED]' : redactString(String(v));
+      if (this.__sci) this.__sci.headers[k] = isSecretKey(k) ? '[REDACTED]' : redactString(String(v));
       return nativeSetHeader.apply(this, arguments);
     };
     XHR.prototype.send = function(body) {
@@ -291,7 +346,7 @@
             if (i <= 0) return;
             const k = line.slice(0, i).trim();
             const v = line.slice(i + 1).trim();
-            responseHeaders[k] = SECRET_KEY_RE.test(k) ? '[REDACTED]' : redactString(v);
+            responseHeaders[k] = isSecretKey(k) ? '[REDACTED]' : redactString(v);
           });
           if (!this.responseType || this.responseType === 'text') {
             const text = this.responseText || '';
@@ -392,7 +447,7 @@
     const omitDraftValue = /^chatDraft:/i.test(key);
     emit({
       type: 'storage', subtype: `${label}-set`, key,
-      value: SECRET_KEY_RE.test(key) ? '[REDACTED]' : (omitDraftValue ? '[DRAFT_VALUE_OMITTED]' : redactString(String(value).slice(0, MAX_BODY))),
+      value: isSecretKey(key) ? '[REDACTED]' : (omitDraftValue ? '[DRAFT_VALUE_OMITTED]' : redactString(String(value).slice(0, MAX_BODY))),
       valueLength: String(value ?? '').length
     });
     storageBursts.set(id, { label, key, firstTs: now, lastTs: now, suppressed: 0, lastValueLength: String(value ?? '').length, timer: setTimeout(() => flushStorageBurst(id), 900) });
@@ -424,7 +479,7 @@
         const k = storage.key(i);
         if (!k) continue;
         const v = storage.getItem(k);
-        out[k] = SECRET_KEY_RE.test(k) ? '[REDACTED]' : parseBodyText(v || '');
+        out[k] = isSecretKey(k) ? '[REDACTED]' : parseBodyText(v || '');
       }
     } catch (err) { out.__error__ = String(err); }
     return out;
@@ -435,7 +490,7 @@
     let names = [];
     try { names = Object.getOwnPropertyNames(window); } catch (_) {}
     for (const name of names) {
-      if (!INTEREST_RE.test(name) || SECRET_KEY_RE.test(name)) continue;
+      if (!INTEREST_RE.test(name) || isSecretKey(name)) continue;
       try {
         const v = window[name];
         if (['string','number','boolean'].includes(typeof v) || (v && typeof v === 'object')) hits[name] = sanitize(v, 0, new WeakSet());

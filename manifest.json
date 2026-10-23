@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SpicyChat Inspector",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Privacy-safe SpicyChat diagnostics for performance, network requests, errors, chat rendering, and QoL extension activity.",
   "permissions": [
     "storage",
@@ -12,7 +12,8 @@
   "host_permissions": [
     "https://spicychat.ai/*",
     "https://*.spicychat.ai/*",
-    "https://*.recombee.com/*"
+    "https://*.recombee.com/*",
+    "https://prod.nd-api.com/*"
   ],
   "background": {
     "service_worker": "background.js"
