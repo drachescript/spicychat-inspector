@@ -12,6 +12,7 @@ const DOM_TEXT_PRIVACY_MIGRATION_KEY = 'sci_dom_text_privacy_migrated_0034';
 const NETWORK_PRIVACY_MIGRATION_KEY = 'sci_network_privacy_migrated_0037_rulebooks';
 const REQUEST_IDENTIFIER_PRIVACY_MIGRATION_KEY = 'sci_request_identifier_privacy_migrated_0100';
 const NATIVE_MEMORY_PRIVACY_MIGRATION_KEY = 'sci_native_memory_privacy_migrated_0101';
+const URL_PRIVACY_MIGRATION_KEY = 'sci_url_query_privacy_migrated_0122';
 
 const DEFAULT_SETTINGS = {
   recording: true,
@@ -31,7 +32,7 @@ const DEFAULT_SETTINGS = {
 const PRIVATE_IDENTIFIER_KEY_RE = /^(?:x)?(?:guestuserid|guestid|userid|visitorid|deviceid|clientid|anonymousid|anonid|installationid|installid|fingerprintid)$/;
 function isPrivateIdentifierKey(k) { return PRIVATE_IDENTIFIER_KEY_RE.test(String(k || '').replace(/[-_]/g, '').toLowerCase()); }
 const PRIVATE_IDENTIFIER_VALUE_RE = /((?:[\"']?(?:x[-_])?(?:guest[-_]?user[-_]?id|guest[-_]?id|user[-_]?id|visitor[-_]?id|device[-_]?id|client[-_]?id|anon(?:ymous)?[-_]?id|install(?:ation)?[-_]?id|fingerprint[-_]?id)[\"']?)\s*[:=]\s*[\"']?)([A-Za-z0-9._~+/=-]+)/gi;
-const SECRET_KEY_RE = /(authorization|cookie|set-cookie|password|passwd|secret|access[_-]?token|refresh[_-]?token|id[_-]?token|session|jwt|csrf|xsrf|api[_-]?key|client[_-]?secret|p?_?psid)/i;
+const SECRET_KEY_RE = /(authorization|cookie|set-cookie|password|passwd|secret|auth[_-]?token|access[_-]?token|refresh[_-]?token|id[_-]?token|session|jwt|csrf|xsrf|api[_-]?key|client[_-]?secret|p?_?psid)/i;
 function isSecretKey(k) { return k !== 'authInvalidToken' && (SECRET_KEY_RE.test(k) || isPrivateIdentifierKey(k)); }
 const JWT_RE = /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/g;
 const BEARER_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]{10,}/gi;
@@ -263,9 +264,54 @@ if (chrome.webRequest?.onBeforeRequest) {
 
 const SIGNAL_KEY_RE = /^(is_nsfw|isNsfwEnabled|moderation_status|moderationStatus|aicq_manual_review_required|inference_model|inferenceModel|engine|provider|max_new_tokens|temperature|top_p|top_k|context|context_length|tokens|model)$/i;
 
+
+// Query values and URL fragments can contain analytics IDs and page titles.
+// Keep only bounded parameter names and explicit non-sensitive worker flags.
+const INSPECTOR_SAFE_WORKER_QUERY = new Set([
+  'dsQolRecommendationWorker','dsQolBotStatusWorker','dsQuickDislike',
+  'dsQolLorebookClone','dsQolWorkerLight','dsListingRefill'
+]);
+function inspectorSafeUrl(value) {
+  const source = String(value || '');
+  if (!source || (!source.includes('?') && !source.includes('#') && !/^https?:\/\/[^/]+\/[^?#]*(?:[0-9a-f]{20,}|[0-9]{8,}|@)/i.test(source))) return source;
+  try {
+    const absolute = /^https?:\/\//i.test(source);
+    const url = new URL(source, 'https://spicychat.ai');
+    const query = [];
+    const seen = new Set();
+    for (const [name, originalValue] of url.searchParams) {
+      if (query.length >= 24) break;
+      const key = /^[a-z][a-z0-9_.-]{0,48}$/i.test(name) ? name : 'parameter';
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const safeValue = INSPECTOR_SAFE_WORKER_QUERY.has(key) && /^[01]$/.test(originalValue)
+        ? originalValue : '[REDACTED]';
+      query.push(`${key}=${safeValue}`);
+    }
+    let path = url.pathname;
+    if (absolute && !/(?:^|\.)(?:spicychat\.ai|nd-api\.com)$/i.test(url.hostname)) {
+      path = path.split('/').map(segment => /^(?:[0-9a-f]{20,}|[0-9]{8,}|[^/]+@[^/]+)$/i.test(segment) ? ':id' : segment).join('/');
+    }
+    const prefix = absolute ? url.origin + path : source.startsWith('?') ? '' : path;
+    return prefix + (query.length ? '?' + query.join('&') : url.search ? '?[REDACTED]' : '')
+      + (url.hash ? '#[REDACTED_FRAGMENT]' : '');
+  } catch (_) { return source.split(/[?#]/, 1)[0] + (source.includes('?') ? '?[REDACTED]' : '') + (source.includes('#') ? '#[REDACTED_FRAGMENT]' : ''); }
+}
+function inspectorRedactUrlsInText(value) {
+  if (typeof value !== 'string') return value;
+  // Trailing punctuation is not part of a URL in a diagnostic error message.
+  const safe = value.replace(/https?:\/\/[^\s<>'"\\]+/gi, raw => {
+    const match = /([),.;}]+)$/.exec(raw);
+    const suffix = match ? match[1] : '';
+    return inspectorSafeUrl(suffix ? raw.slice(0, -suffix.length) : raw) + suffix;
+  });
+  return /^[/?#]/.test(safe) && (safe.includes('?') || safe.includes('#'))
+    ? inspectorSafeUrl(safe) : safe;
+}
+
 function redactString(s) {
   if (typeof s !== 'string') return s;
-  return s.replace(JWT_RE, '[REDACTED_JWT]').replace(BEARER_RE, 'Bearer [REDACTED]').replace(URLENC_SECRET_RE, (m, p, k) => `${p}${k}=[REDACTED]`).replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`).replace(PRIVATE_IDENTIFIER_VALUE_RE, (m, prefix) => `${prefix}[REDACTED]`);
+  return inspectorRedactUrlsInText(s.replace(JWT_RE, '[REDACTED_JWT]').replace(BEARER_RE, 'Bearer [REDACTED]').replace(URLENC_SECRET_RE, (m, p, k) => `${p}${k}=[REDACTED]`).replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`).replace(PRIVATE_IDENTIFIER_VALUE_RE, (m, prefix) => `${prefix}[REDACTED]`));
 }
 
 
@@ -779,11 +825,11 @@ function applyNetworkPayloadPrivacy(event) {
   return { event: next, changed };
 }
 
-function sanitizeDeep(value, depth = 0, seen = new WeakSet()) {
+function sanitizeDeep(value, depth = 0, seen = new WeakSet(), parentKey = "") {
   if (depth > 10) return '[MAX_DEPTH]';
   if (value == null || ['number','boolean'].includes(typeof value)) return value;
   if (typeof value === 'string') return redactString(value);
-  if (Array.isArray(value)) return value.slice(0, 1000).map(v => sanitizeDeep(v, depth + 1, seen));
+  if (Array.isArray(value)) return value.slice(0, 1000).map(v => sanitizeDeep(v, depth + 1, seen, parentKey));
   if (typeof value === 'object') {
     if (seen.has(value)) return '[CIRCULAR]';
     seen.add(value);
@@ -791,7 +837,7 @@ function sanitizeDeep(value, depth = 0, seen = new WeakSet()) {
     let n = 0;
     for (const [k, v] of Object.entries(value)) {
       if (n++ > 1500) { out.__truncated__ = true; break; }
-      out[k] = isSecretKey(k) ? '[REDACTED]' : sanitizeDeep(v, depth + 1, seen);
+      out[k] = parentKey === 'pageStartupSessions' && k === 'sessions' && typeof v === 'number' ? v : isSecretKey(k) ? '[REDACTED]' : (/^(?:locationHash|urlHash|fragment)$/i.test(k) || (k==='hash' && typeof v==='string' && v.startsWith('#'))) ? '[REDACTED_FRAGMENT]' : /^(?:search|queryString)$/i.test(k) && typeof v === 'string' ? inspectorSafeUrl(v) : sanitizeDeep(v, depth + 1, seen, k);
     }
     return out;
   }
@@ -1190,6 +1236,95 @@ async function migrateExistingRequestIdentifierPrivacy() {
   await chrome.storage.local.set({ [REQUEST_IDENTIFIER_PRIVACY_MIGRATION_KEY]: { completedAt: Date.now(), scanned, updated } });
 }
 
+// Change only affected URL-bearing values. Unlike the bounded capture sanitizer,
+// the historical migration must not shorten unrelated arrays or body objects.
+function applyStoredUrlPrivacy(event) {
+  let changed = false;
+  const visit = (value, key = '', depth = 0) => {
+    if (depth > 22 || value == null) return value;
+    if (typeof value === 'string') {
+      const next = (/^(?:locationHash|urlHash|fragment)$/i.test(key) || (key==='hash' && value.startsWith('#'))) ? (value ? '[REDACTED_FRAGMENT]' : value)
+        : /^(?:search|queryString)$/i.test(key) ? inspectorSafeUrl(value)
+        : /https?:\/\//i.test(value) || (/^(?:url|href|referrer|referer|requestedUrl|finalUrl|responseUrl|pageUrl|location)$/i.test(key) && /[?#]/.test(value))
+          ? inspectorRedactUrlsInText(value) : value;
+      if (next !== value) changed = true;
+      return next;
+    }
+    if (typeof value !== 'object') return value;
+    if (Array.isArray(value)) {
+      let out = null;
+      for (let i = 0; i < value.length; i++) {
+        const next = visit(value[i], key, depth + 1);
+        if (next !== value[i]) { if (!out) out = value.slice(); out[i] = next; }
+      }
+      return out || value;
+    }
+    let out = null;
+    for (const [name, item] of Object.entries(value)) {
+      const next = visit(item, name, depth + 1);
+      if (next !== item) { if (!out) out = {...value}; out[name] = next; }
+    }
+    return out || value;
+  };
+  const safe = visit(event);
+  return { event: safe, changed };
+}
+let urlPrivacyMigrationPromise = null;
+
+// Apply the same privacy rule to historical lifecycle, error, network and
+// performance events, not only to newly recorded requests. Small transactions
+// yield between batches so a large old recording cannot hold a long DB write.
+async function migrateExistingUrlPrivacy() {
+  if (urlPrivacyMigrationPromise) return urlPrivacyMigrationPromise;
+  urlPrivacyMigrationPromise = runExistingUrlPrivacyMigration().finally(() => { urlPrivacyMigrationPromise = null; });
+  return urlPrivacyMigrationPromise;
+}
+async function runExistingUrlPrivacyMigration() {
+  const state = await chrome.storage.local.get(URL_PRIVACY_MIGRATION_KEY);
+  if (state[URL_PRIVACY_MIGRATION_KEY]?.completedAt) return;
+  const checkpoint = state[URL_PRIVACY_MIGRATION_KEY] || {};
+  const db = await openDb();
+  let lastId = checkpoint.lastId ?? null, scanned = Number(checkpoint.scanned || 0),
+    updated = Number(checkpoint.updated || 0), done = false, batches = 0;
+  while (!done) {
+    const batch = await new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      const store = tx.objectStore(STORE);
+      const range = lastId == null ? undefined : IDBKeyRange.lowerBound(lastId, true);
+      const req = store.openCursor(range);
+      let count = 0, nextId = lastId, changed = 0, exhausted = false;
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (!cursor) { exhausted = true; return; }
+        const raw = cursor.value;
+        nextId = cursor.primaryKey;
+        count++;
+        // Old query-bearing fields are sanitized recursively; body privacy
+        // remains owned by the existing endpoint-specific migration.
+        const result = applyStoredUrlPrivacy(raw);
+        if (result.changed) {
+          result.event.id = raw.id;
+          cursor.update(result.event);
+          changed++;
+        }
+        if (count < 200) cursor.continue();
+      };
+      tx.oncomplete = () => resolve({count, nextId, changed, exhausted});
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('URL privacy migration aborted'));
+    });
+    scanned += batch.count;
+    updated += batch.changed;
+    lastId = batch.nextId;
+    done = batch.exhausted || batch.count < 200;
+    if (!done && ++batches % 10 === 0) {
+      await chrome.storage.local.set({[URL_PRIVACY_MIGRATION_KEY]: {lastId, scanned, updated}});
+    }
+    if (!done) await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  await chrome.storage.local.set({[URL_PRIVACY_MIGRATION_KEY]: {completedAt:Date.now(), scanned, updated}});
+}
+
 // Independent migration; do not reuse the previous network migration key.
 // This runs on stored network rows in chunks using IndexedDB cursors and leaves
 // original IDs, HTTP status and timing fields intact.
@@ -1333,12 +1468,12 @@ async function migrateSettingsFor004() {
   }
 }
 
-chrome.runtime.onInstalled.addListener(() => { migrateExistingEvents().catch(() => {}); migrateExistingLorebookPrivacy().catch(() => {}); migrateExistingStateSnapshotPrivacy().catch(() => {}); migrateExistingDomTextPrivacy().catch(() => {}); migrateExistingNetworkPrivacy().catch(() => {}); migrateExistingRequestIdentifierPrivacy().catch(() => {}); migrateExistingNativeMemoryPrivacy().catch(() => {}); migrateSettingsFor004().catch(() => {}); });
+chrome.runtime.onInstalled.addListener(() => { migrateExistingEvents().catch(() => {}); migrateExistingLorebookPrivacy().catch(() => {}); migrateExistingStateSnapshotPrivacy().catch(() => {}); migrateExistingDomTextPrivacy().catch(() => {}); migrateExistingNetworkPrivacy().catch(() => {}); migrateExistingRequestIdentifierPrivacy().catch(() => {}); migrateExistingNativeMemoryPrivacy().catch(() => {}); migrateExistingUrlPrivacy().catch(() => {}); migrateSettingsFor004().catch(() => {}); });
 migrateExistingEvents().catch(() => {});
 migrateExistingLorebookPrivacy().catch(() => {});
 migrateExistingStateSnapshotPrivacy().catch(() => {});
 migrateExistingDomTextPrivacy().catch(() => {});
-migrateExistingNetworkPrivacy().catch(() => {}); migrateExistingRequestIdentifierPrivacy().catch(() => {}); migrateExistingNativeMemoryPrivacy().catch(() => {});
+migrateExistingNetworkPrivacy().catch(() => {}); migrateExistingRequestIdentifierPrivacy().catch(() => {}); migrateExistingNativeMemoryPrivacy().catch(() => {}); migrateExistingUrlPrivacy().catch(() => {});
 migrateSettingsFor004().catch(() => {});
 
 

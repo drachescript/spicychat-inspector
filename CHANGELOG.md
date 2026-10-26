@@ -1,3 +1,25 @@
+## 0.1.2
+- Updated Inspector diagnostics for QoL v0.2.62: native Memory Probe success, unchanged, baseline, cooldown and error outcomes now appear correctly when tracing is enabled.
+- Added optional message-bookmark star creation, repair, reuse and slow-pass summaries from existing QoL traces, without adding another page observer.
+- Preserved those new results in compact full-history exports and separated confirmed Memory Probe outcomes from attempted checks.
+- Fixed exported page-start session summaries being entirely redacted instead of preserving safe startup counts and timings.
+- Improved generation pressure sampling with a versioned cache, explicit reuse/skip reasons, and protection against reusing samples after changing chat routes.
+- Added per-page comparisons for startup blocking, chat generations, post-response Long Tasks, mounted messages, DOM activity and sampled heap use.
+- Clarified confirmed reply-node matches, already-present replies, tentative DOM signals and checks limited by delayed or missing observations.
+- Improved diagnostic visibility when background Memory Probe results are not observable through the existing QoL tracing connection; no Memory text or identifiers are collected.
+- Redacted URL query values, fragments and sensitive third-party path identifiers in new and older Inspector recordings, including raw event fields and exports. Preserved non-sensitive worker flags for attribution.
+- Reduced repeated full-DOM/resource scans during rapid chat generations by reusing recent measurements, with cached samples clearly labelled.
+- Clarified exact reply-node matches versus tentative DOM changes and replies already present at network observation; timing summaries no longer describe tentative signals as confirmed rendering latency.
+- Added a conservative feedback HTTP timeline linking Recombee ratings, nearby native `characterRating` events, preflight failures and worker-tab changes without guessing saved Dislike state.
+- Capped Inspector DOM sampling by callback time and record count, reporting skipped observations so long-chat captures remain lighter without claiming complete coverage.
+- Grouped page starts into browsing/worker/clone sessions and improved burst labels without treating intentional tabs as reload loops.
+- Expanded privacy-safe API reporting with notable endpoints and error hotspots, and flagged generation checks affected by reduced DOM sampling.
+- Fixed the Inspector popup collapsing into a narrow column in Brave/Chrome on desktop, while keeping Firefox Android responsive.
+- Added background Memory Probe observability reporting, distinguishing confirmed QoL diagnostic results from unobserved background activity. Memory text, IDs and authentication details are not included.
+- Added page-start and localStorage activity summaries to help investigate excessive reloads and storage writes.
+- Clarified generation rendering reports when replies were already present before the network response was observed, rather than treating these as failed renders.
+- Improved privacy-safe performance diagnostics while keeping regular recording lightweight.
+
 ## 0.1.1
 - Improved Firefox for Android support with reduced-overhead DOM capture and bounded normal-level QoL trace sampling.
 - Added mobile capture-coverage and browser timing-capability information so unsupported measurements are not shown as zero lag.

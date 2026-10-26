@@ -4,11 +4,61 @@ const INTEREST_RE = /(sfw|nsfw|safe|safety|moder|filter|restrict|flag|feature|ex
 const PRIVATE_IDENTIFIER_KEY_RE = /^(?:x)?(?:guestuserid|guestid|userid|visitorid|deviceid|clientid|anonymousid|anonid|installationid|installid|fingerprintid)$/;
 function isPrivateIdentifierKey(k) { return PRIVATE_IDENTIFIER_KEY_RE.test(String(k || '').replace(/[-_]/g, '').toLowerCase()); }
 const PRIVATE_IDENTIFIER_VALUE_RE = /((?:[\"']?(?:x[-_])?(?:guest[-_]?user[-_]?id|guest[-_]?id|user[-_]?id|visitor[-_]?id|device[-_]?id|client[-_]?id|anon(?:ymous)?[-_]?id|install(?:ation)?[-_]?id|fingerprint[-_]?id)[\"']?)\s*[:=]\s*[\"']?)([A-Za-z0-9._~+/=-]+)/gi;
-const SECRET_KEY_RE = /(authorization|cookie|set-cookie|password|passwd|secret|access[_-]?token|refresh[_-]?token|id[_-]?token|session|jwt|csrf|xsrf|api[_-]?key|client[_-]?secret|p?_?psid)/i;
-function isSecretKey(k) { return k !== 'authInvalidToken' && (SECRET_KEY_RE.test(k) || isPrivateIdentifierKey(k)); }
+const SECRET_KEY_RE = /(authorization|cookie|set-cookie|password|passwd|secret|auth[_-]?token|access[_-]?token|refresh[_-]?token|id[_-]?token|session|jwt|csrf|xsrf|api[_-]?key|client[_-]?secret|p?_?psid)/i;
+function isSecretKey(k) {
+  // These exact, Inspector-generated report fields contain only bounded counts,
+  // timestamps and route categories — not session IDs, credentials or cookies.
+  if (k === 'pageStartupSessions' || k === 'pageSessionComparison') return false;
+  return k !== 'authInvalidToken' && (SECRET_KEY_RE.test(k) || isPrivateIdentifierKey(k));
+}
 const PSID_VALUE_RE = /\b(psid)([:=])([A-Za-z0-9_-]{8,})/gi;
 const SECRET_VALUE_RE = /(Bearer\s+[A-Za-z0-9._~+/=-]{10,}|\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b|(^|[?&])(refresh_token|access_token|id_token|token|password|client_secret|session|jwt|api_key|apikey|frontend_sign|p?_?psid)=([^&#]*))/gi;
-function redactExportString(value) { return String(value ?? '').replace(SECRET_VALUE_RE, '[REDACTED]').replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`).replace(PRIVATE_IDENTIFIER_VALUE_RE, (m, prefix) => `${prefix}[REDACTED]`); }
+
+// Query values and URL fragments can contain analytics IDs and page titles.
+// Keep only bounded parameter names and explicit non-sensitive worker flags.
+const INSPECTOR_SAFE_WORKER_QUERY = new Set([
+  'dsQolRecommendationWorker','dsQolBotStatusWorker','dsQuickDislike',
+  'dsQolLorebookClone','dsQolWorkerLight','dsListingRefill'
+]);
+function inspectorSafeUrl(value) {
+  const source = String(value || '');
+  if (!source || (!source.includes('?') && !source.includes('#') && !/^https?:\/\/[^/]+\/[^?#]*(?:[0-9a-f]{20,}|[0-9]{8,}|@)/i.test(source))) return source;
+  try {
+    const absolute = /^https?:\/\//i.test(source);
+    const url = new URL(source, 'https://spicychat.ai');
+    const query = [];
+    const seen = new Set();
+    for (const [name, originalValue] of url.searchParams) {
+      if (query.length >= 24) break;
+      const key = /^[a-z][a-z0-9_.-]{0,48}$/i.test(name) ? name : 'parameter';
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const safeValue = INSPECTOR_SAFE_WORKER_QUERY.has(key) && /^[01]$/.test(originalValue)
+        ? originalValue : '[REDACTED]';
+      query.push(`${key}=${safeValue}`);
+    }
+    let path = url.pathname;
+    if (absolute && !/(?:^|\.)(?:spicychat\.ai|nd-api\.com)$/i.test(url.hostname)) {
+      path = path.split('/').map(segment => /^(?:[0-9a-f]{20,}|[0-9]{8,}|[^/]+@[^/]+)$/i.test(segment) ? ':id' : segment).join('/');
+    }
+    const prefix = absolute ? url.origin + path : source.startsWith('?') ? '' : path;
+    return prefix + (query.length ? '?' + query.join('&') : url.search ? '?[REDACTED]' : '')
+      + (url.hash ? '#[REDACTED_FRAGMENT]' : '');
+  } catch (_) { return source.split(/[?#]/, 1)[0] + (source.includes('?') ? '?[REDACTED]' : '') + (source.includes('#') ? '#[REDACTED_FRAGMENT]' : ''); }
+}
+function inspectorRedactUrlsInText(value) {
+  if (typeof value !== 'string') return value;
+  // Trailing punctuation is not part of a URL in a diagnostic error message.
+  const safe = value.replace(/https?:\/\/[^\s<>'"\\]+/gi, raw => {
+    const match = /([),.;}]+)$/.exec(raw);
+    const suffix = match ? match[1] : '';
+    return inspectorSafeUrl(suffix ? raw.slice(0, -suffix.length) : raw) + suffix;
+  });
+  return /^[/?#]/.test(safe) && (safe.includes('?') || safe.includes('#'))
+    ? inspectorSafeUrl(safe) : safe;
+}
+
+function redactExportString(value) { return inspectorRedactUrlsInText(String(value ?? '').replace(SECRET_VALUE_RE, '[REDACTED]').replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`).replace(PRIVATE_IDENTIFIER_VALUE_RE, (m, prefix) => `${prefix}[REDACTED]`)); }
 
 async function msg(data) { const res = await chrome.runtime.sendMessage(data); if (!res?.ok) throw new Error(res?.error || 'Request failed'); return res; }
 function esc(v) { return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -199,6 +249,104 @@ function buildNativeCharacterRatingDiagnostics(events) {
     averageMs:timing.length ? Math.round(timing.reduce((a,b)=>a+b,0)/timing.length*10)/10 : null
   };
 }
+// Correlate existing browser-observed negative ratings and native event responses.
+// This is a *timeline of observed HTTP activity*, not evidence of native UI
+// persistence, QoL completion history, or a guaranteed Dislike action.
+function buildFeedbackTransactionTimeline(events) {
+  const ratings = [], nativeEvents = [], preflights = [];
+  for (const e of events) {
+    if (e.type !== 'network' || e.browserObserver !== true) continue;
+    const ts = Number(e.requestStartedAt) || eventTs(e);
+    const status = Number(e.status ?? 0);
+    const tabId = Number.isInteger(e.tabId) ? e.tabId : null;
+    if (e.subtype === 'browser-rating-response') {
+      if (String(e.method || '').toUpperCase() === 'OPTIONS') {
+        preflights.push({ts, status, tabId});
+      } else if (String(e.method || '').toUpperCase() === 'POST') {
+        const id = String(e.requestBody?.itemId || '').toLowerCase();
+        if (/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(id))
+          ratings.push({id, ts, status, tabId});
+      }
+    } else if (e.subtype === 'browser-character-rating-response' && String(e.eventName || '') === 'characterRating') {
+      const id = String(e.botId || '').toLowerCase();
+      if (/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(id))
+        nativeEvents.push({id, ts, status, tabId});
+    }
+  }
+  ratings.sort((a,b)=>a.ts-b.ts);
+  nativeEvents.sort((a,b)=>a.ts-b.ts);
+  const preflightByTab = new Map();
+  for (const p of preflights) {
+    const rows = preflightByTab.get(p.tabId) || [];
+    rows.push(p);
+    preflightByTab.set(p.tabId, rows);
+  }
+  for (const rows of preflightByTab.values()) rows.sort((a,b)=>a.ts-b.ts);
+  let ratingPostsWithFailedPreflight = 0;
+  for (const rating of ratings) {
+    const rows = preflightByTab.get(rating.tabId) || [];
+    // Only same-tab, near-simultaneous preflights can be associated. A
+    // preflight is not itself a per-bot success or failure confirmation.
+    let best = null, distance = Infinity;
+    let low=0, high=rows.length;
+    while(low<high){const mid=(low+high)>>1;if(rows[mid].ts<rating.ts-2500)low=mid+1;else high=mid;}
+    for(let i=low;i<rows.length && rows[i].ts<=rating.ts+2500;i++){
+      const d=Math.abs(rows[i].ts-rating.ts);
+      if(d<distance){distance=d;best=rows[i];}
+    }
+    rating.preflightStatus=best?.status ?? null;
+    if (best && (best.status===0 || best.status>=400)) ratingPostsWithFailedPreflight++;
+  }
+  const byBot = new Map();
+  function add(e,kind){
+    const row = byBot.get(e.id) || {ratings:[],native:[],firstTs:e.ts,lastTs:e.ts};
+    row[kind].push(e); row.firstTs=Math.min(row.firstTs,e.ts);row.lastTs=Math.max(row.lastTs,e.ts);
+    byBot.set(e.id,row);
+  }
+  for(const r of ratings)add(r,'ratings');
+  for(const e of nativeEvents)add(e,'native');
+  let pairedNativeEvents=0, unpairedNativeEvents=0, successfulRatingOnlyBots=0;
+  let repeatedNativeEventBots=0, ratingFailThenSuccessBots=0, crossWorkerRetryBots=0;
+  const recent = [];
+  let sequence = 0;
+  for (const [,group] of byBot) {
+    const botLabel = `bot ${++sequence}`; // Ephemeral label; no bot ID in summaries.
+    const used = new Set();
+    let confirmedPairs=0;
+    for (const evt of group.native) {
+      let matched=-1;
+      for(let i=group.ratings.length-1;i>=0;i--){
+        const r=group.ratings[i];
+        if (r.ts > evt.ts || evt.ts-r.ts > 120000) continue;
+        if (!used.has(i) && r.status>=200 && r.status<300) {matched=i;break;}
+      }
+      if(matched>=0){used.add(matched);confirmedPairs++;pairedNativeEvents++;}
+      else unpairedNativeEvents++;
+    }
+    const successes=group.ratings.filter(r=>r.status>=200 && r.status<300);
+    const failures=group.ratings.filter(r=>r.status===0 || r.status>=400);
+    if(successes.length && !group.native.length) successfulRatingOnlyBots++;
+    if(group.native.length>1) repeatedNativeEventBots++;
+    if(successes.some(s=>failures.some(f=>f.ts<=s.ts && s.ts-f.ts<=900000))){
+      ratingFailThenSuccessBots++;
+      if(successes.some(s=>failures.some(f=>f.tabId!==s.tabId && f.ts<=s.ts && s.ts-f.ts<=900000)))crossWorkerRetryBots++;
+    }
+    recent.push({ts:group.lastTs,botLabel,ratingPosts:group.ratings.length,
+      ratingHttp2xx:successes.length,ratingFailures:failures.length,
+      nativeEvents:group.native.length,nativeHttp2xx:group.native.filter(e=>e.status>=200 && e.status<300).length,
+      matchedNearbyRatingEvents:confirmedPairs,workerTabs:new Set([...group.ratings,...group.native].map(e=>e.tabId).filter(x=>x!==null)).size});
+  }
+  return {ratingPosts:ratings.length,ratingHttp2xx:ratings.filter(r=>r.status>=200&&r.status<300).length,
+    ratingFailures:ratings.filter(r=>r.status===0||r.status>=400).length,
+    preflights:preflights.length,preflight401:preflights.filter(p=>p.status===401).length,
+    ratingPostsWithFailedPreflight,nativeEvents:nativeEvents.length,
+    nativeHttp2xx:nativeEvents.filter(e=>e.status>=200&&e.status<300).length,
+    uniqueBotCount:byBot.size,pairedNativeEvents,unpairedNativeEvents,
+    successfulRatingOnlyBots,repeatedNativeEventBots,ratingFailThenSuccessBots,crossWorkerRetryBots,
+    recent:recent.sort((a,b)=>b.ts-a.ts).slice(0,12),
+    note:'HTTP 2xx confirms request acceptance, not saved recommendation/UI state. Same-bot native event pairing is temporal and cannot prove a persisted Dislike. OPTIONS has no bot ID and is associated by tab/time only.'};
+}
+
 function buildApiEndpointInventory(events) {
   const routes = new Map();
   // Only response outcomes; request events would double-count transactions.
@@ -224,7 +372,15 @@ function buildApiEndpointInventory(events) {
     avgMs:x.timingSamples?Math.round(x.totalMs/x.timingSamples*10)/10:null,
     maxMs:Math.round(x.maxMs*10)/10,firstTs:x.firstTs,lastTs:x.lastTs
   }));
-  return {uniqueRoutes:routes.size,top,privateBodiesStored:false,queryValuesStored:false};
+  const all=[...routes.values()].map(x=>({
+    method:x.method,endpoint:x.endpoint,count:x.count,statuses:x.statuses,errors:x.errors,
+    avgMs:x.timingSamples?Math.round(x.totalMs/x.timingSamples*10)/10:null,
+    maxMs:Math.round(x.maxMs*10)/10,firstTs:x.firstTs,lastTs:x.lastTs
+  }));
+  const interesting=all.filter(x=>/\/(?:clone|suggest_tags|attach|attachments|memories|import|export|event)(?:\/|$)/i.test(x.endpoint))
+    .sort((a,b)=>b.lastTs-a.lastTs).slice(0,15);
+  const errorHotspots=all.filter(x=>x.errors>0).sort((a,b)=>b.errors-a.errors).slice(0,10);
+  return {uniqueRoutes:routes.size,top,interesting,errorHotspots,privateBodiesStored:false,queryValuesStored:false};
 }
 function buildMessageRemountPressure(events) {
   let added=0,removed=0,qolRelated=0,qolOwned=0,batches=0;
@@ -306,7 +462,7 @@ function buildGenerationRenderDiagnostics(events, windowMs = 8000) {
       firstDomBatchMs:firstDom ? Math.max(0,eventTs(firstDom)-responseTs) : null,
       longTasks:lts.length, longTaskMs:Math.round(longTaskMs*10)/10, maxLongTaskMs:Math.round(lts.reduce((m,e)=>Math.max(m,e.durationMs||0),0)*10)/10,
       longAnimationFrames:loafs.length, loafBlockingMs:Math.round(loafBlockingMs*10)/10, maxLoafBlockingMs:Math.round(loafs.reduce((m,e)=>Math.max(m,e.blockingDurationMs||0),0)*10)/10,
-      domBatches:dom.length, domMutations, qolRelated, noOp, messageNodesAdded:dom.reduce((n,e)=>n+(e.stats?.messageNodesAdded||0),0),
+      domBatches:dom.length, domMutations, qolRelated, noOp, domRecordsSkipped:dom.reduce((n,e)=>n+(e.stats?.budgetSkippedMutationRecords||0),0), messageNodesAdded:dom.reduce((n,e)=>n+(e.stats?.messageNodesAdded||0),0),
       mountedMessagesStart:Number.isFinite(startPressure?.mountedMessages)?startPressure.mountedMessages:null,
       mountedMessagesEnd:Number.isFinite(endPressure?.mountedMessages)?endPressure.mountedMessages:null,
       domElementsStart:Number.isFinite(startPressure?.domElements)?startPressure.domElements:null,
@@ -374,11 +530,26 @@ function buildGenerationRenderDiagnostics(events, windowMs = 8000) {
     medianResponseDomSignalMs:first.length?Math.round(median(first)*10)/10:null,
     firstMessageDomSamples:confirmedFirst.length,
     medianFirstMessageDomMs:confirmedFirst.length?Math.round(median(confirmedFirst)*10)/10:null,
+    repliesAlreadyPresentAtResponse:rows.filter(x=>x.domMatchStatus==='reply-already-present').length,
+    tentativeDomSignals:rows.filter(x=>Number.isFinite(x.responseDomSignalMs)&&!Number.isFinite(x.firstMessageDomMs)).length,
+    verifiedPostResponseReplySamples:confirmedFirst.length,
+    timingConfidence:{
+      exactReplyNodeAfterResponse:confirmedFirst.length,
+      replyAlreadyPresent:rows.filter(x=>x.domMatchStatus==='reply-already-present').length,
+      tentativeDomOnly:rows.filter(x=>Number.isFinite(x.responseDomSignalMs)&&!Number.isFinite(x.firstMessageDomMs)).length,
+      noResponseDomSignal:rows.filter(x=>!Number.isFinite(x.responseDomSignalMs)).length,
+      delayedOrLimited:rows.filter(x=>x.domMatchLateCheck||x.domMatchCoverageLimited).length,
+      confirmedFirstVisibleTextSamples:0,
+      interpretation:'Exact reply-node insertion is not the same as first text being painted. Tentative DOM changes must not be presented as response-to-visible-text timing.'
+    },
     legacyFirstMessageDomSamples:legacyFirst.length,
     generationsOver1sPostBlock:rows.filter(x=>x.longTaskMs>=1000).length,
     missingResponseDomSignal:rows.filter(x=>!Number.isFinite(x.responseDomSignalMs)).length,
     missingFirstMessageDom:rows.filter(x=>!Number.isFinite(x.firstMessageDomMs)).length,
     domMatchOutcomes:Object.entries(rows.reduce((a,x)=>{const k=x.domMatchStatus+' · '+x.domMatchReason;a[k]=(a[k]||0)+1;return a;},{})).sort((a,b)=>b[1]-a[1]).map(([label,count])=>({label,count})).slice(0,10),
+    generationsWithDomSamplingGaps:rows.filter(x=>x.domRecordsSkipped>0).length,
+    domMatchNotRecorded:rows.filter(x=>x.domMatchStatus==='not-recorded').length,
+    domMatchCoverageLimited:rows.filter(x=>x.domMatchCoverageLimited).length,
     mountedMessageBuckets, mountedMessageScaling, pageScaling:pageScaling.slice(0,8), routeSummaries,
     worst,
     recent:rows.slice(-50)
@@ -776,6 +947,12 @@ function buildCaptureHealthDiagnostics(events) {
   for (const e of domBatches) for (const r of (e.stats?.fastModeReasons || [])) fastReasonCounts[r.value || 'unknown'] = (fastReasonCounts[r.value || 'unknown'] || 0) + (r.count || 0);
   return {
     pressureSnapshots: pressure.length,
+    generationCachedPressureSnapshots: pressure.filter(e=>e.pressureSampleMode==='generation-recent-cache').length,
+    generationPressureSamples: pressure.filter(e=>/^generation-/.test(e.reason||'')).length,
+    pressureSamplerVersionObserved: Math.max(0,...pressure.map(e=>Number(e.pressureSamplerVersion)||0)),
+    generationPressureDecisions: Object.entries(pressure.filter(e=>/^generation-/.test(e.reason||''))
+      .reduce((counts,e)=>(counts[e.pressureCacheDecision || 'unreported']=(counts[e.pressureCacheDecision || 'unreported']||0)+1,counts),{}))
+      .map(([decision,count])=>({decision,count})).sort((a,b)=>b.count-a.count),
     maxDomElements: maxFinite(pressure, e => e.domElements),
     maxMountedMessages: maxFinite(pressure, e => e.mountedMessages),
     maxJsHeapUsedBytes: maxFinite(pressure, e => e.jsHeapUsedBytes),
@@ -806,6 +983,9 @@ function buildCaptureHealthDiagnostics(events) {
     resourceTimingProactiveClears: resourceMaintenance.length ? Math.max(...resourceMaintenance.map(e=>Number(e.proactiveClears)||0)) : 0,
     aggregatedTrackerErrors: trackerErrorSummaries.reduce((n,e)=>n+(Number(e.occurrences)||0),0),
     observerCallbacks: domBatches.reduce((n,e)=>n+(e.stats?.observerCallbacks || 0),0),
+    observerBudgetSkippedMutationRecords: domBatches.reduce((n,e)=>n+(e.stats?.budgetSkippedMutationRecords || 0),0),
+    observerBudgetExceededCallbacks: domBatches.reduce((n,e)=>n+(e.stats?.budgetExceededCallbacks || 0),0),
+    observerRecordLimitCallbacks: domBatches.reduce((n,e)=>n+(e.stats?.recordLimitCallbacks || 0),0),
     observerFastModeCallbacks: domBatches.reduce((n,e)=>n+(e.stats?.fastModeCallbacks || 0),0),
     observerFastModeMutations: domBatches.reduce((n,e)=>n+(e.stats?.fastModeMutations || 0),0),
     observerFastModeReasons: Object.entries(fastReasonCounts).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([value,count])=>({value,count})),
@@ -951,16 +1131,19 @@ function compactVersionProjection(e) {
     payload:e.payload && typeof e.payload==='object' ? {
       qolVersion:e.payload.qolVersion, protocolVersion:e.payload.protocolVersion, reason:e.payload.reason, traceLevel:e.payload.traceLevel,
       endpoint:e.payload.endpoint, requestedUrl:e.payload.requestedUrl, durationMs:e.payload.durationMs, status:e.payload.status, ok:e.payload.ok,
-      outcome:e.payload.outcome, counts:e.payload.counts, key:e.payload.key, storageKey:e.payload.storageKey, backend:e.payload.backend,
-      approxBytes:e.payload.approxBytes, records:e.payload.records, workerType:e.payload.workerType, origin:e.payload.origin
+      outcome:e.payload.outcome, counts:e.payload.counts, probeStatus:e.payload.probeStatus, count:e.payload.count, added:e.payload.added, removed:e.payload.removed, updated:e.payload.updated, changed:e.payload.changed, baseline:e.payload.baseline, httpStatus:e.payload.httpStatus, key:e.payload.key, storageKey:e.payload.storageKey, backend:e.payload.backend,
+      approxBytes:e.payload.approxBytes, records:e.payload.records, workerType:e.payload.workerType, origin:e.payload.origin,
+      // QoL v0.2.62 reports bookmark-star lifecycle counts without message text or IDs.
+      created:e.payload.created, repaired:e.payload.repaired, reused:e.payload.reused,
+      waiting:e.payload.waiting, examined:e.payload.examined
     } : undefined
   });
   if (e.type === 'lifecycle' && e.subtype === 'page-start') return { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, inspectorVersion:e.inspectorVersion, wasDiscarded:e.wasDiscarded===true, href:e.href, pageUrl:e.pageUrl || e.url };
   if (e.type === 'lifecycle' && e.subtype === 'route-change') return { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, pageUrl:e.pageUrl || e.to || e.url, from:e.from, to:e.to };
   if (e.type === 'lifecycle' && /^(page-show|page-hide|page-freeze|page-resume)$/.test(e.subtype || '')) return { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, persisted:e.persisted===true };
-  if (e.type === 'performance' && e.subtype === 'page-pressure') return decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, pageUrl:e.pageUrl || e.url, reason:e.reason, relatedRequestId:e.relatedRequestId, generationResponseTs:e.generationResponseTs, backendDurationMs:e.backendDurationMs, spikeId:e.spikeId, domElements:e.domElements, mountedMessages:e.mountedMessages, mountedMessageKind:e.mountedMessageKind, jsHeapUsedBytes:e.jsHeapUsedBytes, jsHeapTotalBytes:e.jsHeapTotalBytes, resourceEntries:e.resourceEntries, resourceTimingCapacityHint:e.resourceTimingCapacityHint });
+  if (e.type === 'performance' && e.subtype === 'page-pressure') return decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, pageUrl:e.pageUrl || e.url, reason:e.reason, pressureSampleMode:e.pressureSampleMode, pressureSamplerVersion:e.pressureSamplerVersion, pressureCacheDecision:e.pressureCacheDecision, cachedMeasurementAgeMs:e.cachedMeasurementAgeMs, relatedRequestId:e.relatedRequestId, generationResponseTs:e.generationResponseTs, backendDurationMs:e.backendDurationMs, spikeId:e.spikeId, domElements:e.domElements, mountedMessages:e.mountedMessages, mountedMessageKind:e.mountedMessageKind, jsHeapUsedBytes:e.jsHeapUsedBytes, jsHeapTotalBytes:e.jsHeapTotalBytes, resourceEntries:e.resourceEntries, resourceTimingCapacityHint:e.resourceTimingCapacityHint });
   if (e.type === 'performance' && e.subtype === 'resource-timing-buffer-full') return { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, pageUrl:e.pageUrl || e.url, configuredSize:e.configuredSize, resourceEntries:e.resourceEntries, clearAttempted:e.clearAttempted, cleared:e.cleared, clearError:e.clearError, occurrence:e.occurrence, suppressedSinceLast:e.suppressedSinceLast };
-  if (e.type === 'dom' && e.subtype === 'mutation-batch') return decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, pageUrl:e.pageUrl || e.url, stats:{ totalMutations:e.stats?.totalMutations||0, qolRelated:e.stats?.qolRelated||0, qolOwned:e.stats?.qolOwned||0, noOp:e.stats?.noOp||0, messageNodesAdded:e.stats?.messageNodesAdded||0, messageNodesRemoved:e.stats?.messageNodesRemoved||0, mountedMessages:e.stats?.mountedMessages, observerCallbacks:e.stats?.observerCallbacks||0, inspectorObserverMs:e.stats?.inspectorObserverMs||0, inspectorObserverWallMs:e.stats?.inspectorObserverWallMs, observerTimingContaminatedCallbacks:e.stats?.observerTimingContaminatedCallbacks||0, observerTimingContaminatedWallMs:e.stats?.observerTimingContaminatedWallMs||0, inspectorFlushMs:e.stats?.inspectorFlushMs||0, largeDomMode:e.stats?.largeDomMode===true, fastModeUsed:e.stats?.fastModeUsed===true, fastModeCallbacks:e.stats?.fastModeCallbacks||0, fastModeMutations:e.stats?.fastModeMutations||0, fastModeReasons:(e.stats?.fastModeReasons||[]).slice(0,6), maxObserverCallbackMs:e.stats?.maxObserverCallbackMs||0, observerCallbacksOver16ms:e.stats?.observerCallbacksOver16ms||0, observerCallbacksOver50ms:e.stats?.observerCallbacksOver50ms||0, topPatterns:(e.stats?.topPatterns||[]).slice(0,8) } });
+  if (e.type === 'dom' && e.subtype === 'mutation-batch') return decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, pageUrl:e.pageUrl || e.url, stats:{ totalMutations:e.stats?.totalMutations||0, qolRelated:e.stats?.qolRelated||0, qolOwned:e.stats?.qolOwned||0, noOp:e.stats?.noOp||0, messageNodesAdded:e.stats?.messageNodesAdded||0, messageNodesRemoved:e.stats?.messageNodesRemoved||0, mountedMessages:e.stats?.mountedMessages, observerCallbacks:e.stats?.observerCallbacks||0, inspectorObserverMs:e.stats?.inspectorObserverMs||0, inspectorObserverWallMs:e.stats?.inspectorObserverWallMs, observerTimingContaminatedCallbacks:e.stats?.observerTimingContaminatedCallbacks||0, observerTimingContaminatedWallMs:e.stats?.observerTimingContaminatedWallMs||0, inspectorFlushMs:e.stats?.inspectorFlushMs||0, largeDomMode:e.stats?.largeDomMode===true, fastModeUsed:e.stats?.fastModeUsed===true, fastModeCallbacks:e.stats?.fastModeCallbacks||0, fastModeMutations:e.stats?.fastModeMutations||0, budgetSkippedMutationRecords:e.stats?.budgetSkippedMutationRecords||0, budgetExceededCallbacks:e.stats?.budgetExceededCallbacks||0, recordLimitCallbacks:e.stats?.recordLimitCallbacks||0, fastModeReasons:(e.stats?.fastModeReasons||[]).slice(0,6), maxObserverCallbackMs:e.stats?.maxObserverCallbackMs||0, observerCallbacksOver16ms:e.stats?.observerCallbacksOver16ms||0, observerCallbacksOver50ms:e.stats?.observerCallbacksOver50ms||0, topPatterns:(e.stats?.topPatterns||[]).slice(0,8) } });
   if (e.type === 'performance' && (e.subtype === 'long-task' || e.subtype === 'long-animation-frame')) return decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, entryStartTs:e.entryStartTs, entryEndTs:e.entryEndTs, startTimeMs:e.startTimeMs, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, durationMs:e.durationMs||0, blockingDurationMs:e.blockingDurationMs||0, scripts:e.subtype==='long-animation-frame'?(e.scripts||[]).slice(0,3):undefined, inputCorrelation:e.inputCorrelation||null, attribution:e.attribution||null, pageUrl:e.pageUrl || e.url, url:e.url || e.pageUrl });
   if (e.type === 'performance' && (e.subtype === 'generation-response-dom-signal' || e.subtype === 'generation-first-message-dom' || e.subtype === 'auto-lag-spike' || e.subtype === 'generation-followup-skipped-late')) return decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, pageUrl:e.pageUrl || e.url, relatedRequestId:e.relatedRequestId, generationResponseTs:e.generationResponseTs, latencyMs:e.latencyMs, signalKind:e.signalKind, signalConfidence:e.signalConfidence, renderSignalVersion:e.renderSignalVersion, mountedMessagesAtResponse:e.mountedMessagesAtResponse, mountedMessages:e.mountedMessages, mountedDelta:e.mountedDelta, mountedMessageKind:e.mountedMessageKind, generationContentAdded:e.generationContentAdded===true, matchedReplyId:e.matchedReplyId===true, priorMessageReinserted:e.priorMessageReinserted===true, spikeId:e.spikeId, rollingWindowMs:e.rollingWindowMs, rollingLongTaskMs:e.rollingLongTaskMs, longTaskCount:e.longTaskCount, worstLongTaskMs:e.worstLongTaskMs, reason:e.reason, intendedDelayMs:e.intendedDelayMs, actualDelayMs:e.actualDelayMs, latenessMs:e.latenessMs, coalescedCount:e.coalescedCount });
   if (e.type === 'performance' && e.subtype === 'resource') return decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, name:e.name, durationMs:e.durationMs||0, transferSize:e.transferSize||0, encodedBodySize:e.encodedBodySize||0, thirdParty:e.thirdParty===true });
@@ -1019,7 +1202,7 @@ async function scanFullCaptureVersionSummary(db, total, button) {
     tx.onerror = () => reject(tx.error);
   });
   const summary = buildSummary(projected);
-  return { eventCount: total, firstTs, lastTs, durationMs: firstTs != null && lastTs != null ? Math.max(0,lastTs-firstTs) : 0, ...buildVersionDiagnostics(projected), quickDislike: summary.quickDislike, recommendationFeedback: summary.recommendationFeedback, nativeCharacterRating:summary.nativeCharacterRating, apiEndpointInventory:summary.apiEndpointInventory, messageRemountPressure:summary.messageRemountPressure, diagnosticConsistencyWarnings: summary.diagnosticConsistencyWarnings, listingRefill: buildListingRefillDiagnostics(projected), captureHealth: summary.captureHealth, scrollAndInput: summary.scrollAndInput, longTaskAttribution: summary.longTaskAttribution, generationRender: buildGenerationRenderDiagnostics(projected), recentPerformance: buildRecentPerformanceComparison(projected), pageHotspots: buildPageInstanceHotspots(projected), pagePressureGrowth: buildPagePressureGrowthDiagnostics(projected), autoLagSpikes: projected.filter(e=>e.type==='performance'&&e.subtype==='auto-lag-spike').length, summary };
+  return { eventCount: total, firstTs, lastTs, durationMs: firstTs != null && lastTs != null ? Math.max(0,lastTs-firstTs) : 0, ...buildVersionDiagnostics(projected), quickDislike: summary.quickDislike, recommendationFeedback: summary.recommendationFeedback, nativeCharacterRating:summary.nativeCharacterRating, feedbackTransactionTimeline:summary.feedbackTransactionTimeline, apiEndpointInventory:summary.apiEndpointInventory, nativeMemoryProbe:summary.nativeMemoryProbe, messageBookmarkDiagnostics:summary.messageBookmarkDiagnostics, pageStartupSessions:summary.pageStartupSessions, pageStartupCost:summary.pageStartupCost, pageSessionComparison:summary.pageSessionComparison, messageRemountPressure:summary.messageRemountPressure, diagnosticConsistencyWarnings: summary.diagnosticConsistencyWarnings, listingRefill: buildListingRefillDiagnostics(projected), captureHealth: summary.captureHealth, scrollAndInput: summary.scrollAndInput, longTaskAttribution: summary.longTaskAttribution, generationRender: buildGenerationRenderDiagnostics(projected), recentPerformance: buildRecentPerformanceComparison(projected), pageHotspots: buildPageInstanceHotspots(projected), pagePressureGrowth: buildPagePressureGrowthDiagnostics(projected), autoLagSpikes: projected.filter(e=>e.type==='performance'&&e.subtype==='auto-lag-spike').length, summary };
 }
 
 
@@ -1741,6 +1924,292 @@ function buildQolTraceDiagnostics(events) {
   };
 }
 
+
+// Native Memory Probe observability is deliberately evidence-only: the probe
+// runs in QoL's separate extension worker, which Inspector cannot interrogate.
+// Only explicit v2 diagnostics can prove a probe outcome; page GETs are separate.
+function buildNativeMemoryProbeDiagnostics(events) {
+  // QoL v0.2.62 emits feature-event: check-attempted, check-succeeded,
+  // check-failed. The safe payload uses a status such as baseline, unchanged,
+  // succeeded, auth-not-ready, rate-limited, cooldown, etc. Do not infer GET
+  // success from page network requests (QoL's request runs in its own worker).
+  const completedStatuses = new Set([
+    'baseline','initial-baseline','unchanged','succeeded','changes-detected','changes detected',
+    'auth-not-ready','auth-rejected','http-failed','invalid-chat-or-auth',
+    'access-denied','cooldown','already-checking','rate-limited','server-unavailable',
+    'timeout','request-error','extension-error','baseline-storage-error',
+    'unknown-response-shape','memory-list-too-large','unexpected-error',
+    'success','failed'
+  ]);
+  const successStatuses = new Set(['baseline','initial-baseline','unchanged','succeeded','changes-detected','changes detected','success']);
+  const pageReads = events.filter(e => e.type === 'network' &&
+    /\/conversations\/(?:[0-9a-f-]{36}|:id)\/memories(?:[/?#]|$)/i.test(String(e.url || e.finalUrl || e.requestedUrl || '')));
+  const rows = [];
+  for (const e of events) {
+    if (e.type !== 'qol') continue;
+    const feature = String(e.feature || '').toLowerCase();
+    const operation = String(e.operation || '').toLowerCase();
+    const subtype = String(e.subtype || '').toLowerCase();
+    if (!/(?:native[-_]?memory[-_]?probe|memory[-_]?quality[-_]?probe|memory[-_]?check)/.test([feature,operation,subtype].join(' '))) continue;
+    // Do not trust arbitrary future probe payloads. Take only the explicit
+    // already-privacy-filtered count/status fields; never export Memory IDs,
+    // content, request URLs, user IDs, or per-memory hashes.
+    const meta = e.meta && typeof e.meta === 'object' ? e.meta : {};
+    const payload = e.payload && typeof e.payload === 'object' ? e.payload : {};
+    const nested = payload.meta && typeof payload.meta === 'object' ? payload.meta : {};
+    const merged = {...nested,...payload,...meta};
+    const reported = String(merged.probeStatus || merged.status || merged.outcome || e.outcome || '')
+      .toLowerCase().trim().replace(/_/g,'-').slice(0,80);
+    const isAttempt = /check-attempted|probe-attempted|probe-start|check-start/.test(subtype);
+    const isCompletion = /check-succeeded|check-failed|probe-result|check-result|probe-complete|check-complete|operation-end/.test(subtype);
+    const status = !isAttempt && completedStatuses.has(reported) ? reported
+      : isCompletion ? 'outcome-not-published' : 'activity-only';
+    const bounded = key => { const n = Number(merged[key]); return merged[key] != null && Number.isFinite(n) && n >= 0 && n <= 5000 ? Math.floor(n) : null; };
+    const rawHttp = merged.httpStatus ?? merged.httpCode ?? e.status;
+    const http = Number(rawHttp);
+    const duration = Number(merged.durationMs ?? merged.elapsedMs ?? e.durationMs);
+    rows.push({ts:eventTs(e), status, source:'qol-diagnostic',
+      httpStatus:Number.isInteger(http) && http >= 100 && http <= 599 ? http : null,
+      durationMs:Number.isFinite(duration) && duration >= 0 && duration <= 120000 ? Math.round(duration) : null,
+      count:bounded('count'),added:bounded('added'),removed:bounded('removed'),updated:bounded('updated'),
+      changed:merged.changed === true, baseline:merged.baseline === true,
+      success:status !== 'activity-only' && status !== 'outcome-not-published' &&
+        (successStatuses.has(status) || (merged.ok === true && completedStatuses.has(status)))});
+  }
+  // One result per completion, not per started attempt or QoL heartbeat.
+  const results = rows.filter(r => r.status !== 'activity-only' && r.status !== 'outcome-not-published');
+  const traceSettings = events.filter(e => e.type === 'performance' && e.subtype === 'qol-trace-capture-config');
+  const enabledChecks = traceSettings.filter(e => e.enabled === true).length;
+  const disabledChecks = traceSettings.filter(e => e.enabled === false).length;
+  const successes = results.filter(r => r.success).length;
+  return {
+    diagnosticCaptureChecks:traceSettings.length,
+    tracingEnabledChecks:enabledChecks,
+    tracingDisabledChecks:disabledChecks,
+    observationReason:results.length ? 'explicit-QoL-result' : rows.length ? 'only-activity-events' :
+      traceSettings.length && !enabledChecks ? 'QoL-internals-tracing-disabled' :
+      'no-QoL-probe-result-published-or-visible',
+    explicitProbeEvents:rows.length, attemptedEvents:rows.filter(r=>r.status==='activity-only').length,
+    verifiedResults:results.length, successResults:successes, failureResults:results.length-successes,
+    observation:results.length ? 'explicit-probe-result' : rows.length ? 'probe-activity-only' : 'not-observed',
+    latest:results.length ? results[results.length-1] : null,
+    nativePageMemoryReads:pageReads.length,
+    statusCounts:Object.entries(rows.reduce((a,r)=>(a[r.status]=(a[r.status]||0)+1,a),{}))
+      .map(([status,count])=>({status,count})),
+    note:'QoL v0.2.62 emits privacy-safe Memory Probe status when normal or detailed v2 tracing is enabled. A missing event does not prove that the background probe failed. HTTP 200 is not inferred when QoL does not supply a status code.'
+  };
+}
+
+// QoL v0.2.62 can tell Inspector when its message-bookmark stars are created,
+// reused or repaired. These are QoL-reported counts, not evidence of a specific
+// CSS positioning defect and not a reason to add another DOM observer.
+function buildMessageBookmarkDiagnostics(events) {
+  const rows = events.filter(e=>e.type==='qol' && e.feature==='message-bookmarks' &&
+    /^(?:star-reconciled|slow-star-pass)/.test(String(e.subtype||'')));
+  const bounded = (obj,key) => {
+    const v=obj && obj[key];
+    const n=Number(v);
+    return v!=null && Number.isFinite(n) && n>=0 && n<=100000 ? n : 0;
+  };
+  const out={events:rows.length, reconciliations:0, slowPasses:0, starsCreated:0,
+    starsRepaired:0, starsReused:0, waitingForToolbar:0, slowestPassMs:0,
+    slowPassTotalMs:0, examinedOnSlowPasses:0};
+  for(const e of rows) {
+    const p=e.payload && typeof e.payload==='object' ? e.payload : {};
+    const m=e.meta && typeof e.meta==='object' ? e.meta : {};
+    const v={...p,...m};
+    if(String(e.subtype).startsWith('star-reconciled')) {
+      out.reconciliations++;
+      out.starsCreated+=bounded(v,'created');out.starsRepaired+=bounded(v,'repaired');
+      out.starsReused+=bounded(v,'reused');out.waitingForToolbar+=bounded(v,'waiting');
+    } else {
+      out.slowPasses++;
+      const ms=bounded(v,'durationMs') || bounded(e,'durationMs');
+      out.slowestPassMs=Math.max(out.slowestPassMs,ms);
+      out.slowPassTotalMs+=ms;
+      out.examinedOnSlowPasses+=bounded(v,'examined');
+    }
+  }
+  return out;
+}
+
+function buildPageStoragePressureDiagnostics(events) {
+  const starts = events.filter(e=>e.type==='lifecycle' && e.subtype==='page-start').slice().sort((a,b)=>eventTs(a)-eventTs(b));
+  const writes = events.filter(e=>e.type==='storage' && e.subtype==='localStorage-set');
+  const removals = events.filter(e=>e.type==='storage' && e.subtype==='localStorage-remove');
+  const xhr = events.filter(e=>e.type==='network' && e.subtype==='xhr-response');
+  let maxFiveMinuteStarts=0, left=0;
+  for (let right=0;right<starts.length;right++) {
+    while(eventTs(starts[right])-eventTs(starts[left])>300000) left++;
+    maxFiveMinuteStarts=Math.max(maxFiveMinuteStarts,right-left+1);
+  }
+  const byKey=new Map();
+  const safeKey = key => String(key||'unknown')
+    .replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/ig,':id')
+    .replace(/\b[0-9a-f]{24,}\b/ig,':id')
+    .replace(/^(isPartner_).+/i,'$1:id')
+    .slice(0,70);
+  for (const e of writes) {
+    const k=safeKey(e.key || e.storageKey);
+    byKey.set(k,(byKey.get(k)||0)+1);
+  }
+  return {
+    pageStarts:starts.length, maxFiveMinutePageStarts:maxFiveMinuteStarts,
+    storageSetEvents:writes.length, storageRemoveEvents:removals.length,
+    xhrResponses:xhr.length,
+    leadingWriteKeys:[...byKey].sort((a,b)=>b[1]-a[1]).slice(0,6).map(([key,count])=>({key,count})),
+    interpretation:maxFiveMinuteStarts>=20 ? 'high-page-start-burst' : maxFiveMinuteStarts>=10 ? 'moderate-page-start-burst' : 'no-significant-page-start-burst',
+    note:'Frequent starts and writes may reflect deliberate testing, reloads, multiple tabs, or site behavior. This report does not determine the cause.'
+  };
+}
+
+function buildPageStartupCostDiagnostics(events) {
+  const starts = new Map();
+  for (const event of events) {
+    if (event.type === 'lifecycle' && event.subtype === 'page-start' && event.pageId) {
+      const ts = eventTs(event);
+      if (!starts.has(event.pageId) || ts < starts.get(event.pageId).startedAt) {
+        starts.set(event.pageId, {pageId:event.pageId, startedAt:ts, route:routeLabel(event.pageUrl||event.href||event.url).replace(/\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b/ig, ':id'),
+          longTasks:0, longTaskMs:0, worstTaskMs:0, domMutations:0, qolRelated:0, qolOwned:0});
+      }
+    }
+  }
+  const windowMs = 10000;
+  for (const event of events) {
+    const row = starts.get(event.pageId);
+    if (!row || eventTs(event) < row.startedAt || eventTs(event) - row.startedAt > windowMs) continue;
+    if (event.type === 'performance' && event.subtype === 'long-task') {
+      row.longTasks++;
+      row.longTaskMs += Number(event.durationMs || 0);
+      row.worstTaskMs = Math.max(row.worstTaskMs, Number(event.durationMs || 0));
+    } else if (event.type === 'dom' && event.subtype === 'mutation-batch') {
+      row.domMutations += Number(event.stats?.totalMutations || 0);
+      row.qolRelated += Number(event.stats?.qolRelated || 0);
+      row.qolOwned += Number(event.stats?.qolOwned || 0);
+    }
+  }
+  const samples = [...starts.values()].map(row => ({...row, longTaskMs:Math.round(row.longTaskMs*10)/10,
+    worstTaskMs:Math.round(row.worstTaskMs*10)/10}));
+  const measured = samples.filter(x=>x.longTasks || x.domMutations);
+  return {windowMs, pageStarts:samples.length, measured:samples.length ? measured.length : 0,
+    avgBlockingMs:measured.length ? Math.round(measured.reduce((n,x)=>n+x.longTaskMs,0)/measured.length*10)/10 : 0,
+    highestBlocking:samples.slice().sort((a,b)=>b.longTaskMs-a.longTaskMs).slice(0,8),
+    note:'First ten seconds after page start; QoL-related is heuristic classification and QoL-owned is explicit DOM ownership, not measured QoL execution time.'};
+}
+
+function buildPageStartupSessions(events) {
+  const starts = events.filter(e=>e.type==='lifecycle'&&e.subtype==='page-start').slice().sort((a,b)=>eventTs(a)-eventTs(b));
+  const sessions=[];let current=null;
+  for(const e of starts){
+    const ts=eventTs(e),url=String(e.pageUrl||e.href||e.url||'');
+    if(!current||ts-current.lastTs>90000){
+      current={startTs:ts,lastTs:ts,starts:0,cloneStarts:0,workerStarts:0,tabIds:new Set(),routeTabCounts:new Map()};
+      sessions.push(current);
+    }
+    current.lastTs=ts;current.starts++;
+    if (/(?:[?&])dsQolLorebookClone(?:=|&|$)/i.test(url))current.cloneStarts++;
+    if (/(?:[?&])dsQol(?:RecommendationWorker|BotStatusWorker)|dsQuickDislike|dsListingRefill/i.test(url) || /qol-.*worker/i.test(String(e.pageRole||'')))current.workerStarts++;
+    if(Number.isInteger(e.tabId))current.tabIds.add(e.tabId);
+    // Same route and same tab starting repeatedly is a lead, not proof of
+    // unwanted reload. Avoid leaking IDs, URL parameters and page contents.
+    const tab=Number.isInteger(e.tabId)?e.tabId:'unknown';
+    const key=`${tab}|${routeLabel(url)}`;
+    current.routeTabCounts.set(key,(current.routeTabCounts.get(key)||0)+1);
+  }
+  const summarized=sessions.filter(s=>s.starts>=2).map(s=>({
+    startTs:s.startTs,endTs:s.lastTs,durationMs:s.lastTs-s.startTs,
+    pageStarts:s.starts,cloneStarts:s.cloneStarts,workerStarts:s.workerStarts,
+    distinctTabs:s.tabIds.size,repeatedSameTabRouteStarts:[...s.routeTabCounts.values()].reduce((n,c)=>n+Math.max(0,c-1),0)
+  }));
+  return {sessions:sessions.length,multiStartSessions:summarized.length,
+    top:summarized.sort((a,b)=>b.pageStarts-a.pageStarts).slice(0,8),
+    clonePageStarts:summarized.reduce((n,s)=>n+s.cloneStarts,0),
+    note:'Page starts may be intentional new tabs, clone actions, helper workers or reloads. Same-tab/route repeats are candidates for review, not confirmed loops.'};
+}
+
+function buildPageSessionComparison(events) {
+  const sessions = new Map();
+  const longByPage = new Map();
+  const pressureByPage = new Map();
+  const genByPage = new Map();
+  const round = x => Math.round(x * 10) / 10;
+  const sorted = events.slice().sort((a,b)=>eventTs(a)-eventTs(b));
+  for (const e of sorted) {
+    if (!e.pageId) continue;
+    const ts = eventTs(e);
+    if (e.type === 'lifecycle' && e.subtype === 'page-start') {
+      const row = sessions.get(e.pageId);
+      if (!row || ts < row.startedAt) {
+        sessions.set(e.pageId, {pageId:e.pageId,startedAt:ts,lastAt:ts,
+          route:routeLabel(e.pageUrl||e.url||e.href||'').replace(/\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b/ig, ':id').replace(/\b[0-9]{8,}\b/g, ':id'), generations:0,
+          longTasks:0,longTaskMs:0,worstTaskMs:0,startupLongTaskMs:0,
+          domMutations:0,qolOwnedMutations:0,qolRelatedMutations:0,
+          lagSpikes:0,backendTotalMs:0,backendCount:0});
+      }
+    }
+    if (e.type === 'performance' && e.subtype === 'long-task') {
+      const items = longByPage.get(e.pageId)||[];items.push(e);longByPage.set(e.pageId,items);
+    }
+    if (e.type === 'performance' && e.subtype === 'page-pressure') {
+      const items = pressureByPage.get(e.pageId)||[];items.push(e);pressureByPage.set(e.pageId,items);
+    }
+    if (isChatSuccessResponse(e)) {
+      const items = genByPage.get(e.pageId)||[];items.push(e);genByPage.set(e.pageId,items);
+    }
+  }
+  for (const e of sorted) {
+    const row = sessions.get(e.pageId);if (!row) continue;
+    const ts = eventTs(e);if (ts < row.startedAt) continue;
+    row.lastAt=Math.max(row.lastAt,ts);
+    if (e.type === 'performance' && e.subtype === 'long-task') {
+      const ms = Number(e.durationMs)||0;
+      row.longTasks++;row.longTaskMs+=ms;row.worstTaskMs=Math.max(row.worstTaskMs,ms);
+      if (ts-row.startedAt <= 10000) row.startupLongTaskMs+=ms;
+    } else if (e.type === 'performance' && e.subtype === 'auto-lag-spike') row.lagSpikes++;
+    else if (e.type === 'dom' && e.subtype === 'mutation-batch') {
+      row.domMutations+=Number(e.stats?.totalMutations)||0;
+      row.qolOwnedMutations+=Number(e.stats?.qolOwned)||0;
+      row.qolRelatedMutations+=Number(e.stats?.qolRelated)||0;
+    } else if (isChatSuccessResponse(e)) {
+      row.generations++;
+      if (Number.isFinite(e.durationMs)) {row.backendTotalMs+=e.durationMs;row.backendCount++;}
+    }
+  }
+  const result=[];
+  for (const row of sessions.values()) {
+    const p=pressureByPage.get(row.pageId)||[];
+    const heap=p.filter(e=>Number.isFinite(e.jsHeapUsedBytes));
+    const mounted=p.map(e=>Number(e.mountedMessages)).filter(Number.isFinite);
+    const l=longByPage.get(row.pageId)||[];
+    const post=[];
+    for (const g of genByPage.get(row.pageId)||[]) {
+      const ts=Number.isFinite(g.responseReceivedAt)?g.responseReceivedAt:eventTs(g);
+      const win=rangeForSorted(l,ts,ts+8000);
+      post.push(win.reduce((n,e)=>n+(Number(e.durationMs)||0),0));
+    }
+    const qolVersion=p.map(e=>String(e.qolIdentity?.version||'')).filter(Boolean).slice(-1)[0]||null;
+    result.push({pageId:row.pageId,startedAt:row.startedAt,durationMs:Math.max(0,row.lastAt-row.startedAt),
+      route:row.route,qolVersion,generations:row.generations,longTasks:row.longTasks,
+      longTaskMs:round(row.longTaskMs),worstTaskMs:round(row.worstTaskMs),startupLongTaskMs:round(row.startupLongTaskMs),
+      lagSpikes:row.lagSpikes,domMutations:row.domMutations,
+      qolOwnedMutations:row.qolOwnedMutations,qolRelatedMutations:row.qolRelatedMutations,
+      avgBackendMs:row.backendCount?round(row.backendTotalMs/row.backendCount):null,
+      avgPostResponseBlockingMs:post.length?round(post.reduce((a,b)=>a+b,0)/post.length):null,
+      p95PostResponseBlockingMs:post.length?round(percentile(post,0.95)):null,
+      maxMountedMessages:mounted.length?Math.max(...mounted):null,
+      firstHeapBytes:heap.length?heap[0].jsHeapUsedBytes:null,
+      lastHeapBytes:heap.length?heap[heap.length-1].jsHeapUsedBytes:null,
+      peakHeapBytes:heap.length?Math.max(...heap.map(e=>e.jsHeapUsedBytes)):null});
+  }
+  result.sort((a,b)=>b.generations-a.generations||b.longTaskMs-a.longTaskMs);
+  const withGenerations=result.filter(x=>x.generations>0);
+  return {totalPageSessions:result.length,chatSessions:withGenerations.length,
+    topByGenerations:result.slice(0,12),
+    worstStartups:result.slice().sort((a,b)=>b.startupLongTaskMs-a.startupLongTaskMs).slice(0,6),
+    worstPerGeneration:withGenerations.slice().sort((a,b)=>(b.avgPostResponseBlockingMs||0)-(a.avgPostResponseBlockingMs||0)).slice(0,8),
+    note:'Per-page comparisons are observational. Post-response windows can overlap; native Long Task time is not QoL-owned time. Heap growth is sample-to-sample, not an allocation trace; QoL-related DOM counts are heuristic.'};
+}
+
 function buildSummary(events) {
   const netResponses = events.filter(e => e.type === 'network' && /response$/.test(e.subtype || ''));
   const allErrors = events.filter(e => e.type === 'error' || (e.type === 'network' && e.status >= 400));
@@ -1819,8 +2288,15 @@ function buildSummary(events) {
   const pageRoleIndex = buildPageRoleIndex(events);
   const recommendationFeedback = buildRecommendationFeedbackDiagnostics(events, pageRoleIndex);
   const nativeCharacterRating = buildNativeCharacterRatingDiagnostics(events);
+  const feedbackTransactionTimeline = buildFeedbackTransactionTimeline(events);
   const apiEndpointInventory = buildApiEndpointInventory(events);
   const messageRemountPressure = buildMessageRemountPressure(events);
+  const nativeMemoryProbe = buildNativeMemoryProbeDiagnostics(events);
+  const messageBookmarkDiagnostics = buildMessageBookmarkDiagnostics(events);
+  const pageStoragePressure = buildPageStoragePressureDiagnostics(events);
+  const pageStartupSessions = buildPageStartupSessions(events);
+  const pageStartupCost = buildPageStartupCostDiagnostics(events);
+  const pageSessionComparison = buildPageSessionComparison(events);
 
   const statusZeroLikelyNavigation = netResponses.filter(e => e.status === 0 && /navigation|hidden|abort|unload/i.test(e.statusZeroHint || '')).length;
 
@@ -2146,8 +2622,15 @@ function buildSummary(events) {
     authRefreshRaces,
     recommendationFeedback,
     nativeCharacterRating,
+    feedbackTransactionTimeline,
     apiEndpointInventory,
     messageRemountPressure,
+    nativeMemoryProbe,
+    messageBookmarkDiagnostics,
+    pageStoragePressure,
+    pageStartupSessions,
+    pageStartupCost,
+    pageSessionComparison,
     counterDriver,
     qolTrace,
     dailyMessageLimits: {
@@ -2203,6 +2686,7 @@ function renderOverview() {
     ['NSFW true signals', s.nsfwSignals.true], ['NSFW false signals', s.nsfwSignals.false]
   ];
   if (s.qolTelemetry.count) chips.push(['QoL internals', s.qolTelemetry.count]);
+  if (s.nativeMemoryProbe?.verifiedResults) chips.push(['QoL Memory Probe', `${s.nativeMemoryProbe.verifiedResults} result(s)`]);
   if (s.nativeCharacterRating?.confirmedByBrowserObserver) chips.push(['Native Dislike events', `${s.nativeCharacterRating.successes}/${s.nativeCharacterRating.confirmedByBrowserObserver} HTTP 2xx`]);
   if (s.qolTrace?.operations?.count) chips.push(['QoL trace ops', s.qolTrace.operations.count]);
   const extra = [];
@@ -2210,10 +2694,55 @@ function renderOverview() {
     const x=s.nativeCharacterRating;
     extra.push(`<div><strong>Native characterRating:</strong> ${x.confirmedByBrowserObserver} browser-observed event response(s) · ${x.successes} HTTP 2xx · ${x.failures} error(s) · ${x.uniqueBotIds} bot ID(s). ${!x.confirmedByBrowserObserver && x.resourceTimingObservations ? `Resource Timing saw ${x.resourceTimingObservations} request(s), but their HTTP outcomes were not captured.` : ''} <em>This is separate from the Recombee negative rating; it is not evidence of QoL's saved-history state.</em></div>`);
   }
+  if (s.feedbackTransactionTimeline?.ratingPosts || s.feedbackTransactionTimeline?.nativeEvents || s.feedbackTransactionTimeline?.preflights) {
+    const f=s.feedbackTransactionTimeline;
+    extra.push(`<div><strong>Feedback HTTP timeline:</strong> ${f.ratingHttp2xx}/${f.ratingPosts} Recombee POST(s) HTTP 2xx · ${f.ratingFailures} failed/aborted rating POST(s) · ${f.preflight401} CORS preflight 401(s) · ${f.nativeHttp2xx}/${f.nativeEvents} native characterRating event(s) HTTP 2xx · ${f.pairedNativeEvents} native event(s) with nearby successful same-bot rating · ${f.ratingFailThenSuccessBots} bot(s) with a failed-then-successful rating (${f.crossWorkerRetryBots} observed across worker tabs). ${f.repeatedNativeEventBots} bot(s) had repeated native event requests. <em>Pairing is temporal; API acceptance does not verify the visible Dislike, and no saved feedback history is inferred.</em></div>`);
+  }
   if (s.apiEndpointInventory?.top?.length) {
     const a=s.apiEndpointInventory;
     extra.push(`<div><strong>Privacy-safe API inventory:</strong> ${a.uniqueRoutes} normalized method/endpoint combination(s). Most frequent: ${a.top.slice(0,5).map(x=>`${esc(x.method)} ${esc(x.endpoint)} (${x.count})`).join(' · ')}. No query-string values or response text are copied into this inventory.</div>`);
+    if(a.interesting?.length) extra.push(`<div><strong>Notable native API routes:</strong> ${a.interesting.slice(0,7).map(x=>`${esc(x.method)} ${esc(x.endpoint)} ×${x.count}`).join(' · ')}. Paths are templated; this is observation, not an API stability guarantee.</div>`);
+    if(a.errorHotspots?.length) extra.push(`<div><strong>API error hotspots:</strong> ${a.errorHotspots.slice(0,5).map(x=>`${esc(x.method)} ${esc(x.endpoint)} ${x.errors}/${x.count} errors`).join(' · ')}.</div>`);
   }
+  if (s.nativeMemoryProbe) {
+    const m=s.nativeMemoryProbe, x=m.latest;
+    extra.push(`<div><strong>QoL background Memory Probe:</strong> ${m.verifiedResults ? `${m.verifiedResults} explicit result(s) (${m.successResults||0} succeeded, ${m.failureResults||0} failed) · most recent ${esc(x.status)}${x.httpStatus ? ` · HTTP ${x.httpStatus}` : ''}${x.durationMs != null ? ` · ${x.durationMs}ms` : ''}${x.count != null ? ` · ${x.count} Memories` : ''}${x.added != null ? ` · +${x.added}/-${x.removed ?? 0}/~${x.updated ?? 0}` : ''}` : m.explicitProbeEvents ? `${m.explicitProbeEvents} diagnostic activity event(s), but no confirmed result` : 'Not observed — result unverified'}. ${m.nativePageMemoryReads} native page Memory GET record(s) (not proof of a QoL background check). <em>Background probe results require explicit QoL diagnostic events; absence is not evidence of failure. Memory text and IDs are not included in this summary.</em> ${m.observationReason==='QoL-internals-tracing-disabled' ? `Detailed QoL internals was off in all ${m.diagnosticCaptureChecks} observed configuration checks.` : ''}</div>`);
+  }
+  if (s.messageBookmarkDiagnostics?.events) {
+    const b=s.messageBookmarkDiagnostics;
+    extra.push(`<div><strong>QoL message-bookmark stars:</strong> ${b.reconciliations} reconciliation event(s) · ${b.starsCreated} created · ${b.starsRepaired} repaired · ${b.starsReused} reused · ${b.waitingForToolbar} waiting for native toolbars${b.slowPasses ? ` · ${b.slowPasses} slow pass(es), worst ${b.slowestPassMs.toFixed(0)}ms` : ''}. <em>These are QoL-reported counters, not proof of detached-star positioning or native rendering blame; require normal/detailed tracing.</em></div>`);
+  }
+  if (s.pageStoragePressure?.pageStarts) {
+    const p=s.pageStoragePressure;
+    extra.push(`<div><strong>Page/storage pressure:</strong> ${p.pageStarts} page starts (maximum ${p.maxFiveMinutePageStarts} within five minutes); ${p.storageSetEvents} localStorage writes, ${p.storageRemoveEvents} removals, ${p.xhrResponses} XHR response(s). Top normalized write keys: ${p.leadingWriteKeys.slice(0,4).map(k=>`${esc(k.key)} ×${k.count}`).join(', ')}. <em>These counts do not identify which extension or user action initiated the activity.</em></div>`);
+  }
+  if (s.pageSessionComparison?.chatSessions) {
+    const p=s.pageSessionComparison, busiest=p.topByGenerations?.[0], slowest=p.worstPerGeneration?.[0];
+    extra.push(`<div><strong>Per-page chat comparison:</strong> ${p.chatSessions} session(s) with successful generations${busiest ? ` · busiest ${esc(busiest.route)} ${busiest.generations} generations · avg 8s post-response blocking ${busiest.avgPostResponseBlockingMs?.toFixed(0) ?? '?'}ms` : ''}${slowest ? ` · slowest averaged ${slowest.avgPostResponseBlockingMs?.toFixed(0) ?? '?'}ms over ${slowest.generations} generations` : ''}. <em>Windows may overlap; QoL attribution is not implied. Full per-session details are in the export.</em></div>`);
+  }
+  if(s.pageStartupCost?.measured) {
+    const p=s.pageStartupCost, worst=p.highestBlocking[0];
+    extra.push(`<div><strong>First 10s startup costs:</strong> ${p.measured}/${p.pageStarts} page start(s) with measured work; average ${p.avgBlockingMs.toFixed(0)}ms accumulated Long Tasks${worst ? ` · worst ${worst.longTaskMs.toFixed(0)}ms on ${esc(worst.route)} (${worst.longTasks} tasks)` : ''}. <em>QoL-related DOM changes are not proof QoL caused the blocking.</em></div>`);
+  }
+  if(s.pageStartupSessions?.multiStartSessions) {
+    const p=s.pageStartupSessions;
+    extra.push(`<div><strong>Page-start sessions:</strong> ${p.multiStartSessions} cluster(s) with multiple starts · ${p.top[0]?.pageStarts || 0} starts in the busiest 90-second-separated cluster · ${p.top[0]?.distinctTabs || 0} distinct tab(s) · ${p.clonePageStarts} Lorebook clone-marker start(s). <em>Multiple tabs and intentional cloning are not automatically reload loops.</em></div>`);
+  }
+  if(s.captureHealth?.observerBudgetSkippedMutationRecords) {
+    const h=s.captureHealth;
+    extra.push(`<div><strong>DOM sampling gaps:</strong> ${h.observerBudgetSkippedMutationRecords} mutation record(s) skipped to keep Inspector responsive; ${h.observerBudgetExceededCallbacks} callback(s) hit the time budget and ${h.observerRecordLimitCallbacks} hit the record limit. <em>DOM totals describe processed records only; browser Long Tasks and network timing continue independently.</em></div>`);
+  }
+  if (s.generationRender?.count) {
+    const outcomes=s.generationRender.domMatchOutcomes||[];
+    const already=outcomes.filter(x=>String(x.label).startsWith('reply-already-present')).reduce((n,x)=>n+Number(x.count||0),0);
+    const unmatched=outcomes.filter(x=>String(x.label).startsWith('unmatched')).reduce((n,x)=>n+Number(x.count||0),0);
+    if(already||unmatched) extra.push(`<div><strong>Generation visibility:</strong> ${already} reply/replies already present when the response was observed (not a render failure); ${unmatched} unmatched outcome(s). <em>Already-present replies have no measurable response-to-first-render latency and must not be counted as failed rendering.</em></div>`);
+  }
+  if (s.captureHealth?.generationPressureSamples) {
+    const h=s.captureHealth, decisions=(h.generationPressureDecisions||[]).slice(0,3).map(x=>`${esc(x.decision)} ${x.count}`).join(' · ');
+    extra.push(`<div><strong>Generation pressure sampling:</strong> ${h.generationCachedPressureSnapshots||0}/${h.generationPressureSamples} snapshots reused cached DOM/resource counts · sampler ${h.pressureSamplerVersionObserved ? `v${h.pressureSamplerVersionObserved}` : 'unverified/older runtime'}${decisions ? ` · ${decisions}` : ''}. <em>Cached counts are not fresh DOM measurements. If the sampler is unverified, reload tabs after the extension update before comparing performance.</em></div>`);
+  }
+  if(s.generationRender?.generationsWithDomSamplingGaps) extra.push(`<div><strong>Generation DOM coverage:</strong> ${s.generationRender.generationsWithDomSamplingGaps} response window(s) overlapped Inspector DOM sampling gaps; ${s.generationRender.domMatchNotRecorded} lacked a finalized DOM match event. Missing signals are not automatically rendering failures.</div>`);
   if (s.messageRemountPressure?.batches) {
     const m=s.messageRemountPressure;
     extra.push(`<div><strong>Message-node churn:</strong> ${m.added} added / ${m.removed} removed across ${m.batches} DOM batches. These are message-container changes, not confirmed QoL-caused remounts.</div>`);
@@ -2258,6 +2787,7 @@ function renderOverview() {
   if (s.captureHealth && (s.captureHealth.pageFreezes || s.captureHealth.pageResumes || s.captureHealth.discardedPageStarts)) extra.push(`<div><strong>Page lifecycle:</strong> freeze ${s.captureHealth.pageFreezes} · resume ${s.captureHealth.pageResumes} · discarded/reloaded starts ${s.captureHealth.discardedPageStarts} · pagehide ${s.captureHealth.pageHides} · pageshow ${s.captureHealth.pageShows}.</div>`);
   if (s.longTaskAttribution?.loafFrameOverlap) extra.push(`<div><strong>Long Task attribution candidates:</strong> ${s.longTaskAttribution.loafFrameOverlap} / ${s.longTaskAttribution.longTasks} tasks overlapped Long Animation Frames; ${s.longTaskAttribution.loafScriptCandidates} had at least one script-source category, ${s.longTaskAttribution.explicitQolOperationOverlap} also overlapped explicit QoL operations. A matching script does not prove causation.</div>`);
   if (s.scrollAndInput?.scrollWindows || s.scrollAndInput?.slowInputEvents) extra.push(`<div><strong>Scroll &amp; input:</strong> ${s.scrollAndInput.scrollWindows} human-input-correlated scroll window(s) · ${s.scrollAndInput.scrollFrameGapsOver100ms} sampled frame gap(s) &gt;100ms · ${s.scrollAndInput.scrollLinkedLongTasks} temporally overlapping Long Task(s) · ${s.scrollAndInput.slowInputEvents} slow Event Timing entry/entries. These are correlations, not causality.</div>`);
+  if (s.generationRender?.count) extra.push(`<div><strong>Reply timing confidence:</strong> ${s.generationRender.repliesAlreadyPresentAtResponse||0} reply/replies already present at network observation; ${s.generationRender.verifiedPostResponseReplySamples||0} exact post-response reply node matches; ${s.generationRender.tentativeDomSignals||0} tentative DOM-change signals · ${s.generationRender.timingConfidence?.noResponseDomSignal||0} without a DOM signal · ${s.generationRender.timingConfidence?.delayedOrLimited||0} late/limited checks. None of these is a direct measurement of first visible text.</div>`);
   if (s.generationRender?.domMatchOutcomes?.length) extra.push(`<div><strong>Generation DOM checks:</strong> ${s.generationRender.domMatchOutcomes.slice(0,5).map(x=>`${esc(x.label)} (${x.count})`).join(' · ')}.</div>`);
   if (s.captureHealth?.captureChecks) {const c=s.captureHealth.captureChecks;extra.push(`<div><strong>QoL tracing status:</strong> opt-in enabled in ${c.qolCaptureOn} captured page/settings state(s), disabled in ${c.qolCaptureOff}; ${c.qolTracesReceived} trace-received signal(s), ${c.qolHandshakeOnly} handshake-only signal(s), ${c.qolNoTrace} no-response signal(s). Check opt-in and whether meaningful operations occurred before concluding the protocol is broken.</div>`);}
   if (s.captureHealth && (s.captureHealth.inspectorSelfThrottleEvents || s.captureHealth.aggregatedThirdPartyResourceRequests || s.captureHealth.aggregatedWorkerResourceRequests || s.captureHealth.aggregatedTrackerErrors || s.captureHealth.resourceTimingProactiveClears)) extra.push(`<div><strong>Inspector self-protection:</strong> throttle windows ${s.captureHealth.inspectorSelfThrottleEvents || 0}${s.captureHealth.inspectorSelfThrottleEvents ? ` (${(s.captureHealth.inspectorSelfThrottleUnionMs/1000).toFixed(1)}s merged coverage per page; ${(s.captureHealth.inspectorSelfThrottleMs/1000).toFixed(1)}s summed windows)` : ''} · aggregated third-party resource timings ${s.captureHealth.aggregatedThirdPartyResourceRequests || 0} · aggregated QoL-worker resource timings ${s.captureHealth.aggregatedWorkerResourceRequests || 0} · proactive Resource Timing clears ${s.captureHealth.resourceTimingProactiveClears || 0} · aggregated tracker/resource errors ${s.captureHealth.aggregatedTrackerErrors || 0}.</div>`);
@@ -2294,7 +2824,7 @@ function renderOverview() {
     }
   }
   if (s.chatGenerationSummary.count) extra.push(`<div><strong>Chat generations:</strong> ${s.chatGenerationSummary.count} · classifier true ${s.chatGenerationSummary.nsfwTrue} / false ${s.chatGenerationSummary.nsfwFalse} · ${s.chatGenerationSummary.classifierFlips} flip(s) · avg ${(s.chatGenerationSummary.avgMs/1000).toFixed(1)}s. <em>Per-message classifier only.</em></div>`);
-  if (s.generationRender?.count) { const g=s.generationRender; const buckets=(g.mountedMessageBuckets||[]).map(x=>`${x.label}: ${(x.avgLongTaskMs/1000).toFixed(2)}s avg`).join(', '); extra.push(`<div><strong>Post-generation render (${(g.windowMs/1000).toFixed(0)}s window):</strong> ${g.count} generation(s) · avg Long Task ${(g.avgLongTaskMs/1000).toFixed(2)}s · median ${(g.medianLongTaskMs/1000).toFixed(2)}s · p95 ${(g.p95LongTaskMs/1000).toFixed(2)}s · avg LoAF blocking ${(g.avgLoafBlockingMs/1000).toFixed(2)}s · ${g.generationsOver1sPostBlock} generation(s) with ≥1s post-response Long Tasks${g.medianResponseDomSignalMs!=null ? ` · median response→confirmed DOM signal ${g.medianResponseDomSignalMs.toFixed(0)}ms` : ''}${g.missingResponseDomSignal ? ` · ${g.missingResponseDomSignal} generation(s) without confirmed DOM signal` : ''}${g.legacyFirstMessageDomSamples ? ` · ${g.legacyFirstMessageDomSamples} legacy/unverified DOM sample(s) excluded` : ''}${g.mountedMessageScaling ? ` · mounted-message slope ${g.mountedMessageScaling.slope.toFixed(1)} ms/msg (R² ${g.mountedMessageScaling.r2.toFixed(2)})` : ''}${buckets ? ` · by mounted size: ${esc(buckets)}` : ''}.</div>`); const routes=(g.routeSummaries||[]).map(r=>`${r.routeKind==='story'?'Story':'/chat'}: ${r.count} gen · ${(r.avgLongTaskMs/1000).toFixed(2)}s avg${r.maxMounted!=null?` · mounted ${r.minMounted}-${r.maxMounted}`:''}${r.mountedMessageScaling?` · slope ${r.mountedMessageScaling.slope.toFixed(1)} ms/msg`:''}`).join(' | '); if(routes) extra.push(`<div><strong>Generation render by route:</strong> ${esc(routes)}.</div>`); }
+  if (s.generationRender?.count) { const g=s.generationRender; const buckets=(g.mountedMessageBuckets||[]).map(x=>`${x.label}: ${(x.avgLongTaskMs/1000).toFixed(2)}s avg`).join(', '); extra.push(`<div><strong>Post-generation render (${(g.windowMs/1000).toFixed(0)}s window):</strong> ${g.count} generation(s) · avg Long Task ${(g.avgLongTaskMs/1000).toFixed(2)}s · median ${(g.medianLongTaskMs/1000).toFixed(2)}s · p95 ${(g.p95LongTaskMs/1000).toFixed(2)}s · avg LoAF blocking ${(g.avgLoafBlockingMs/1000).toFixed(2)}s · ${g.generationsOver1sPostBlock} generation(s) with ≥1s post-response Long Tasks${g.medianResponseDomSignalMs!=null ? ` · median tentative DOM-change signal ${g.medianResponseDomSignalMs.toFixed(0)}ms` : ''}${g.missingResponseDomSignal ? ` · ${g.missingResponseDomSignal} generation(s) without confirmed DOM signal` : ''}${g.legacyFirstMessageDomSamples ? ` · ${g.legacyFirstMessageDomSamples} legacy/unverified DOM sample(s) excluded` : ''}${g.mountedMessageScaling ? ` · mounted-message slope ${g.mountedMessageScaling.slope.toFixed(1)} ms/msg (R² ${g.mountedMessageScaling.r2.toFixed(2)})` : ''}${buckets ? ` · by mounted size: ${esc(buckets)}` : ''}.</div>`); const routes=(g.routeSummaries||[]).map(r=>`${r.routeKind==='story'?'Story':'/chat'}: ${r.count} gen · ${(r.avgLongTaskMs/1000).toFixed(2)}s avg${r.maxMounted!=null?` · mounted ${r.minMounted}-${r.maxMounted}`:''}${r.mountedMessageScaling?` · slope ${r.mountedMessageScaling.slope.toFixed(1)} ms/msg`:''}`).join(' | '); if(routes) extra.push(`<div><strong>Generation render by route:</strong> ${esc(routes)}.</div>`); }
   if (s.workerResources?.requests) { const top=(s.workerResources.top||[]).slice(0,4).map(x=>`${x.workerRole} ${x.endpointGroup}: ${x.requests} req · avg ${x.avgDurationMs.toFixed(0)}ms · max ${x.maxDurationMs.toFixed(0)}ms`).join(' | '); extra.push(`<div><strong>QoL worker resources:</strong> ${s.workerResources.requests.toLocaleString()} aggregated request timing(s) in ${s.workerResources.summaryEvents} summary event(s)${top?` · ${esc(top)}`:''}.</div>`); }
   if (s.recentPerformance?.available) { const r=s.recentPerformance.recent,p=s.recentPerformance.previous,mins=s.recentPerformance.windowMs/60000; extra.push(`<div><strong>Recent performance:</strong> last ${mins.toFixed(0)}m Long Tasks ${(r.longTaskMs/1000).toFixed(1)}s vs prior ${(p.longTaskMs/1000).toFixed(1)}s${s.recentPerformance.longTaskRatio!=null ? ` (${s.recentPerformance.longTaskRatio.toFixed(1)}×)` : ''} · LoAF block ${(r.loafBlockingMs/1000).toFixed(1)}s vs ${(p.loafBlockingMs/1000).toFixed(1)}s · DOM ${r.domMutations.toLocaleString()} vs ${p.domMutations.toLocaleString()} · generations ${r.generations} vs ${p.generations}.</div>`); }
   if (s.autoLagSpikes?.count) extra.push(`<div><strong>Automatic lag spikes:</strong> ${s.autoLagSpikes.count} trigger(s) captured; each adds immediate + 10s page-pressure context with a 30s cooldown.</div>`);
@@ -2555,14 +3085,14 @@ function redactLorebookExportPayload(value, depth = 0, stats = { contentFields:0
   if(privacy) out._inspectorLorebookPrivacy=privacy;
   return {value:out,stats};
 }
-function sanitizeForExport(value, depth = 0) {
+function sanitizeForExport(value, depth = 0, parentKey = "") {
   if (depth > 12) return '[MAX_DEPTH]';
   if (value == null || ['number','boolean'].includes(typeof value)) return value;
   if (typeof value === 'string') return redactExportString(value);
-  if (Array.isArray(value)) return value.map(v => sanitizeForExport(v, depth + 1));
+  if (Array.isArray(value)) return value.map(v => sanitizeForExport(v, depth + 1, parentKey));
   if (typeof value === 'object') {
     const out = {};
-    for (const [k,v] of Object.entries(value)) out[k] = isSecretKey(k) ? '[REDACTED]' : sanitizeForExport(v, depth + 1);
+    for (const [k,v] of Object.entries(value)) out[k] = parentKey === 'pageStartupSessions' && k === 'sessions' && typeof v === 'number' ? v : isSecretKey(k) ? '[REDACTED]' : (/^(?:locationHash|urlHash|fragment)$/i.test(k) || (k==='hash' && typeof v==='string' && v.startsWith('#'))) ? '[REDACTED_FRAGMENT]' : /^(?:search|queryString)$/i.test(k) && typeof v === 'string' ? inspectorSafeUrl(v) : sanitizeForExport(v, depth + 1, k);
     return out;
   }
   return String(value);
@@ -2875,14 +3405,14 @@ async function exportJson() {
       req.onerror = () => reject(req.error);
     });
     const version = chrome.runtime.getManifest().version;
-    const fullCaptureVersions = await scanFullCaptureVersionSummary(db, total, button);
+    const fullCaptureVersions = sanitizeForExport(await scanFullCaptureVersionSummary(db, total, button));
     const recentSampleSummary = buildSummary(sanitizeForExport(allEvents));
     const meta = {
       exportedAt: new Date().toISOString(), extension: 'SpicyChat Inspector', version,
       storedEvents: total,
       note: 'Defense-in-depth sanitization is applied at capture/storage and again during export. Sensitive network payloads are metadata-only by default: chat text/history, persona text, account/profile fields, character-authoring text, Rulebook instructions/descriptions/labels, image uploads, third-party payloads, Lorebook entry content/keywords and native Memory text are redacted while diagnostic counts/IDs/status/model fields and fingerprints are retained where useful. Confirmed first-message render timing excludes unverified DOM signals. Export reads IndexedDB directly and uses gzip when supported. DOM batches retain aggregate counts but only a compact representative sample. Attribution is evidence-based.',
       summaryScope: 'full capture compact projection', loadedSampleEvents: allEvents.length,
-      networkPrivacyPolicy: { chatText:'redacted', conversationHistory:'metadata-only', personaText:'metadata-only', accountProfile:'metadata-only', characterAuthoringText:'metadata-only', rulebookAuthoredText:'metadata-only', lorebookEntryContent:'redacted', lorebookEntryKeywords:'redacted', nativeMemoryContent:'redacted', imageUploads:'metadata-only', thirdPartyBodies:'metadata-only', retainedDiagnostics:['IDs where useful','status/error codes','model/inference settings','NSFW flags','timestamps','lengths/counts','fnv1a32 fingerprints'] },
+      networkPrivacyPolicy: { chatText:'redacted', conversationHistory:'metadata-only', personaText:'metadata-only', accountProfile:'metadata-only', characterAuthoringText:'metadata-only', rulebookAuthoredText:'metadata-only', lorebookEntryContent:'redacted', lorebookEntryKeywords:'redacted', nativeMemoryContent:'redacted', urlQueryValues:'redacted', urlFragments:'redacted', imageUploads:'metadata-only', thirdPartyBodies:'metadata-only', retainedDiagnostics:['IDs where useful','status/error codes','model/inference settings','NSFW flags','timestamps','lengths/counts','fnv1a32 fingerprints'] },
       lorebookPrivacyPolicy: { entryContent: 'redacted', entryKeywords: 'redacted', retainedDiagnostics: ['IDs','names','versions','timestamps','lengths/counts','fnv1a32 fingerprints'], scope: 'SpicyChat /lorebooks API request/response bodies' },
       summary: fullCaptureVersions.summary,
       diagnosticConsistencyWarnings: fullCaptureVersions.summary?.diagnosticConsistencyWarnings || [],

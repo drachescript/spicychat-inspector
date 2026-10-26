@@ -64,6 +64,11 @@
   const PRESSURE_HIDDEN_MS = 600_000;
   let pressureTimer = null;
   let lastPressureSampleAt = 0;
+  let lastFullPressureSnapshot = null;
+  let lastFullPressureAt = 0;
+  let lastFullPressureRoute = '';
+  const PRESSURE_SAMPLER_VERSION = 2;
+  const GENERATION_PRESSURE_CACHE_MAX_AGE_MS = 12000;
   const GENERATION_RENDER_WINDOW_MS = 8_000;
   const GENERATION_FOLLOWUP_MAX_LATENESS_MS = 30_000;
   const pendingGenerationRenders = new Map();
@@ -164,6 +169,10 @@
   const LARGE_DOM_HEAP_THRESHOLD_BYTES = 1_000_000_000;
   const LARGE_LIST_DOM_ELEMENT_THRESHOLD = 12_000;
   const LARGE_MUTATION_BATCH_THRESHOLD = 250;
+  // A slow callback blocks the same thread as SpicyChat's renderer. Keep DOM
+  // sampling bounded per callback; skipped records are reported as gaps, not 0s.
+  const DOM_CALLBACK_MAX_RECORDS = IS_FIREFOX_ANDROID ? 80 : 120;
+  const DOM_CALLBACK_BUDGET_MS = IS_FIREFOX_ANDROID ? 3 : 5;
   const DOM_FAST_MODE_HOLD_MS = 30_000;
   let lastKnownDomElements = 0;
   let lastKnownMountedMessages = 0;
@@ -220,9 +229,54 @@
   const PSID_VALUE_RE = /\b(psid)([:=])([A-Za-z0-9_-]{8,})/gi;
   const URLENC_SECRET_RE = /(^|[?&])(refresh_token|access_token|id_token|token|password|client_secret|session|jwt|api_key|apikey|frontend_sign|p?_?psid)=([^&#]*)/gi;
 
+
+// Query values and URL fragments can contain analytics IDs and page titles.
+// Keep only bounded parameter names and explicit non-sensitive worker flags.
+const INSPECTOR_SAFE_WORKER_QUERY = new Set([
+  'dsQolRecommendationWorker','dsQolBotStatusWorker','dsQuickDislike',
+  'dsQolLorebookClone','dsQolWorkerLight','dsListingRefill'
+]);
+function inspectorSafeUrl(value) {
+  const source = String(value || '');
+  if (!source || (!source.includes('?') && !source.includes('#') && !/^https?:\/\/[^/]+\/[^?#]*(?:[0-9a-f]{20,}|[0-9]{8,}|@)/i.test(source))) return source;
+  try {
+    const absolute = /^https?:\/\//i.test(source);
+    const url = new URL(source, 'https://spicychat.ai');
+    const query = [];
+    const seen = new Set();
+    for (const [name, originalValue] of url.searchParams) {
+      if (query.length >= 24) break;
+      const key = /^[a-z][a-z0-9_.-]{0,48}$/i.test(name) ? name : 'parameter';
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const safeValue = INSPECTOR_SAFE_WORKER_QUERY.has(key) && /^[01]$/.test(originalValue)
+        ? originalValue : '[REDACTED]';
+      query.push(`${key}=${safeValue}`);
+    }
+    let path = url.pathname;
+    if (absolute && !/(?:^|\.)(?:spicychat\.ai|nd-api\.com)$/i.test(url.hostname)) {
+      path = path.split('/').map(segment => /^(?:[0-9a-f]{20,}|[0-9]{8,}|[^/]+@[^/]+)$/i.test(segment) ? ':id' : segment).join('/');
+    }
+    const prefix = absolute ? url.origin + path : source.startsWith('?') ? '' : path;
+    return prefix + (query.length ? '?' + query.join('&') : url.search ? '?[REDACTED]' : '')
+      + (url.hash ? '#[REDACTED_FRAGMENT]' : '');
+  } catch (_) { return source.split(/[?#]/, 1)[0] + (source.includes('?') ? '?[REDACTED]' : '') + (source.includes('#') ? '#[REDACTED_FRAGMENT]' : ''); }
+}
+function inspectorRedactUrlsInText(value) {
+  if (typeof value !== 'string') return value;
+  // Trailing punctuation is not part of a URL in a diagnostic error message.
+  const safe = value.replace(/https?:\/\/[^\s<>'"\\]+/gi, raw => {
+    const match = /([),.;}]+)$/.exec(raw);
+    const suffix = match ? match[1] : '';
+    return inspectorSafeUrl(suffix ? raw.slice(0, -suffix.length) : raw) + suffix;
+  });
+  return /^[/?#]/.test(safe) && (safe.includes('?') || safe.includes('#'))
+    ? inspectorSafeUrl(safe) : safe;
+}
+
   function redactString(s) {
     if (typeof s !== 'string') return s;
-    return s.replace(JWT_RE, '[REDACTED_JWT]').replace(BEARER_RE, 'Bearer [REDACTED]').replace(URLENC_SECRET_RE, (m, p, k) => `${p}${k}=[REDACTED]`).replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`).replace(PRIVATE_IDENTIFIER_VALUE_RE, (m, prefix) => `${prefix}[REDACTED]`);
+    return inspectorRedactUrlsInText(s.replace(JWT_RE, '[REDACTED_JWT]').replace(BEARER_RE, 'Bearer [REDACTED]').replace(URLENC_SECRET_RE, (m, p, k) => `${p}${k}=[REDACTED]`).replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`).replace(PRIVATE_IDENTIFIER_VALUE_RE, (m, prefix) => `${prefix}[REDACTED]`));
   }
 
   function isSpicyChatCoreHost(hostname) {
@@ -243,7 +297,7 @@
     if (Array.isArray(value)) return value.slice(0, 600).map(v => sanitize(v, depth + 1));
     if (typeof value === 'object') {
       const out = {};
-      for (const [k, v] of Object.entries(value).slice(0, 1200)) out[k] = isSecretKey(k) ? '[REDACTED]' : sanitize(v, depth + 1);
+      for (const [k, v] of Object.entries(value).slice(0, 1200)) out[k] = isSecretKey(k) ? '[REDACTED]' : (/^(?:locationHash|urlHash|fragment)$/i.test(k) || (k==='hash' && typeof v==='string' && v.startsWith('#'))) ? '[REDACTED_FRAGMENT]' : /^(?:search|queryString)$/i.test(k) && typeof v === 'string' ? inspectorSafeUrl(v) : sanitize(v, depth + 1);
       return out;
     }
     return String(value);
@@ -953,6 +1007,7 @@
     return {
       totalMutations: 0, detailedChanges: 0, qolRelated: 0, qolOwned: 0, noOp: 0,
       formattingSwapsCoalesced: 0, mobileSkippedMutationRecords: 0, mobileChildListOnly: IS_FIREFOX_ANDROID,
+      budgetSkippedMutationRecords: 0, budgetExceededCallbacks: 0, recordLimitCallbacks: 0,
       messageNodesAdded: 0, messageNodesRemoved: 0, observerCallbacks: 0,
       inspectorObserverMs: 0, inspectorObserverWallMs: 0,
       observerTimingContaminatedCallbacks: 0, observerTimingContaminatedWallMs: 0,
@@ -1410,7 +1465,39 @@
   function samplePagePressure(reason = 'periodic', extra = {}) {
     if (!settings?.capturePerformance) return null;
     lastPressureSampleAt = Date.now();
-    const snapshot = pagePressureSnapshot(reason, extra);
+    const now = Date.now();
+    // Generation stress tests can request three snapshots per reply. Reuse
+    // recent DOM/resource measurements instead of synchronously walking the
+    // whole page again; keep a distinct event and request ID for correlation.
+    const generation = /^generation-(?:response|followup-2s|followup-8s)$/.test(reason);
+    const age = now - lastFullPressureAt;
+    const sameRoute = lastFullPressureRoute === location.pathname;
+    const hasFreshCache = !!lastFullPressureSnapshot && lastFullPressureAt > 0 &&
+      age >= 0 && age <= GENERATION_PRESSURE_CACHE_MAX_AGE_MS && sameRoute;
+    // Cached DOM elements are intentionally approximate; mounted-message count,
+    // heap use, and the request correlation remain fresh. Do not scan the full
+    // document three times for every generation in sustained stress tests.
+    const reuse = generation && hasFreshCache;
+    const sampleDecision = reuse ? 'reused' : !generation ? 'normal-full'
+      : !lastFullPressureSnapshot ? 'cold-start'
+      : !sameRoute ? 'route-changed' : age > GENERATION_PRESSURE_CACHE_MAX_AGE_MS
+        ? 'expired' : 'clock-reset';
+    const snapshot = reuse ? {
+      ...lastFullPressureSnapshot, reason, ...extra,
+      pressureSampleMode: 'generation-recent-cache',
+      pressureSamplerVersion: PRESSURE_SAMPLER_VERSION,
+      pressureCacheDecision: sampleDecision,
+      cachedMeasurementAgeMs: age,
+      // Never carry over request IDs or event timing from another generation.
+      mountedMessages: sampleMountedMessageCount(false),
+      jsHeapUsedBytes: Number.isFinite(performance.memory?.usedJSHeapSize) ? performance.memory.usedJSHeapSize : lastKnownJsHeapUsedBytes,
+      resourceEntries: null, interaction: interactionState(), qolIdentity: passiveQolIdentity()
+    } : {
+      ...pagePressureSnapshot(reason, extra),
+      pressureSamplerVersion: PRESSURE_SAMPLER_VERSION,
+      pressureCacheDecision: sampleDecision
+    };
+    if (!reuse) { lastFullPressureSnapshot = snapshot; lastFullPressureAt = now; lastFullPressureRoute = location.pathname; }
     if (Number.isFinite(snapshot.domElements)) lastKnownDomElements = snapshot.domElements;
     if (Number.isFinite(snapshot.mountedMessages)) lastKnownMountedMessages = snapshot.mountedMessages;
     if (Number.isFinite(snapshot.jsHeapUsedBytes)) lastKnownJsHeapUsedBytes = snapshot.jsHeapUsedBytes;
@@ -1634,14 +1721,32 @@
           bump(domStats.fastModeReasons, fastReason);
         }
         const highDetail = currentHighDetailDomMode();
-        const useFastCapture = !!fastReason || !highDetail || mutations.length > 80 || Date.now() < selfThrottleUntil;
+        // A single childList record can replace hundreds of children even when
+        // there are fewer than 80 total records. Detect that cheaply and use
+        // summary-only capture instead of deep subtree/text traversal.
+        const highFanout = mutations.some(m => m.type === 'childList' &&
+          ((m.addedNodes?.length || 0) + (m.removedNodes?.length || 0)) > 48);
+        const useFastCapture = !!fastReason || highFanout || !highDetail || mutations.length > 80 || Date.now() < selfThrottleUntil;
         const fastBudget = { messageDescendantScans: IS_FIREFOX_ANDROID ? 2 : (highDetail ? 12 : 8), qolAncestorScans: IS_FIREFOX_ANDROID ? 2 : (highDetail ? 16 : 6) };
         let formattingSwaps = 0;
-        // Under excessive mobile mutation bursts, avoid long Inspector callbacks.
-        // Explicitly report unsampled records; never claim complete DOM coverage.
-        const mobileLimit = IS_FIREFOX_ANDROID ? 120 : mutations.length;
-        if (mutations.length > mobileLimit) domStats.mobileSkippedMutationRecords += mutations.length - mobileLimit;
-        for (const m of (mutations.length > mobileLimit ? mutations.slice(0, mobileLimit) : mutations)) {
+        const maxRecords = Math.min(mutations.length, DOM_CALLBACK_MAX_RECORDS);
+        const timeBudget = DOM_CALLBACK_BUDGET_MS + (highDetail && !IS_FIREFOX_ANDROID ? 2 : 0);
+        if (mutations.length > maxRecords) {
+          domStats.budgetSkippedMutationRecords += mutations.length - maxRecords;
+          domStats.recordLimitCallbacks++;
+          if (IS_FIREFOX_ANDROID) domStats.mobileSkippedMutationRecords += mutations.length - maxRecords;
+        }
+        for (let i = 0; i < maxRecords; i++) {
+          // Check elapsed time every fourth record, rather than inspecting a
+          // giant burst to completion while chat rendering is stalled.
+          if (i >= 4 && (i & 3) === 0 && performance.now() - observerStarted > timeBudget) {
+            domStats.budgetSkippedMutationRecords += maxRecords - i;
+            if (IS_FIREFOX_ANDROID) domStats.mobileSkippedMutationRecords += maxRecords - i;
+            domStats.budgetExceededCallbacks++;
+            domSlowObserverUntil = Math.max(domSlowObserverUntil, Date.now() + 30_000);
+            break;
+          }
+          const m = mutations[i];
           if (isKnownDialogueFormattingSwap(m)) {
             formattingSwaps++;
             continue;
@@ -1728,6 +1833,9 @@
       totalMutations: domStats.totalMutations,
       formattingSwapsCoalesced: domStats.formattingSwapsCoalesced,
       mobileSkippedMutationRecords: domStats.mobileSkippedMutationRecords,
+      budgetSkippedMutationRecords: domStats.budgetSkippedMutationRecords,
+      budgetExceededCallbacks: domStats.budgetExceededCallbacks,
+      recordLimitCallbacks: domStats.recordLimitCallbacks,
       mobileChildListOnly: domStats.mobileChildListOnly,
       formattingSwapNoOpCountUnknown: domStats.formattingSwapsCoalesced,
       detailedChanges: domQueue.length,
@@ -1971,10 +2079,39 @@
     }
     return false;
   }
+  // An eventual background Memory Probe bridge event must never turn into a
+  // second channel for private Memory content. Only a fixed aggregate schema
+  // survives, even if a future QoL release accidentally sends more fields.
+  function sanitizeMemoryProbeDiagnostic(e) {
+    const signal = `${e.feature || ''} ${e.operation || ''} ${e.subtype || ''}`.toLowerCase();
+    if (!/(?:native[-_]?memory[-_]?probe|memory[-_]?quality[-_]?probe|memory[-_]?check)/.test(signal)) return e;
+    const input = {...(e.payload && typeof e.payload === 'object' ? e.payload : {}),
+      ...(e.meta && typeof e.meta === 'object' ? e.meta : {})};
+    const safe = {};
+    for (const key of ['status','probeStatus','outcome']) {
+      if (typeof input[key] === 'string' && /^[a-z0-9 -]{1,65}$/i.test(input[key])) safe[key] = input[key].slice(0,65);
+    }
+    for (const key of ['ok','baseline','changed']) if (typeof input[key] === 'boolean') safe[key] = input[key];
+    for (const key of ['count','added','removed','updated','httpStatus','durationMs','elapsedMs']) {
+      const v = input[key];
+      if (typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 120000) safe[key] = v;
+    }
+    e.meta = safe;
+    e.payload = { ...safe };
+    e.counts = null;
+    e.requestedUrl = null;
+    e.storageKey = null;
+    e.requestId = null;
+    e.requestFingerprint = null;
+    e.operationId = null;
+    e.parentOperationId = null;
+    return e;
+  }
+
   function trackQolTelemetry(e) {
     const receivedAt = Date.now();
     const eventTs = traceEventTs(e, receivedAt);
-    e = noteQolTraceSequence({ ...e, ts: eventTs, receivedAt });
+    e = sanitizeMemoryProbeDiagnostic(noteQolTraceSequence({ ...e, ts: eventTs, receivedAt }));
     if (shouldDedupeQolTelemetry(e, eventTs, receivedAt)) return;
 
     recentQol.push(e);
