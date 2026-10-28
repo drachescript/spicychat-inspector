@@ -1,3 +1,12 @@
+## 0.1.3
+- Added a Lorebook operations report with entry creation/read counts, nearby follow-up requests, pagination candidates, errors, and per-book activity. It does not assume a backup is incomplete just because the API returns paged entries.
+- Added worker activity summaries by page and role. Browser-observed responses and aggregated Resource Timing requests are kept separate so they are not double-counted.
+- Made QoL trace availability clearer when tracing is off, only a handshake was seen, or operation traces were actually recorded.
+- Added capture coverage warnings for skipped DOM mutation records, Inspector throttling, and Resource Timing buffer limits.
+- Added Long Task comparisons by chat, lorebook, worker, and other page contexts, with the measurement limits stated.
+- Fixed HTTP 429 / SC-001-5201 being reported as a daily message cap without explicit daily-limit evidence.
+- Added an exact-reply text observation using the existing DOM observer. It checks for nonempty text in the matching reply container without recording the text; it is not a paint-timing measurement.
+- Added optional export-only pseudonymization for names, identifiers, and fingerprints, keeping matching references linked within a single export.
 ## 0.1.2
 - Updated Inspector diagnostics for QoL v0.2.62: native Memory Probe success, unchanged, baseline, cooldown and error outcomes now appear correctly when tracing is enabled.
 - Added optional message-bookmark star creation, repair, reuse and slow-pass summaries from existing QoL traces, without adding another page observer.

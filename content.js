@@ -1253,6 +1253,7 @@ function inspectorRedactUrlsInText(value) {
             reason, hasReplyId:!!pending.replyId, exactReplyPresentAtResponse:!!pending.replyPresentAtResponse,
             priorDomMutationCount:pre.length, postResponseMessageMutationCount:pending.postMessageMutations || 0,
             mountedMessagesAtResponse:pending.mountedMessagesAtResponse,
+            replyTextObserved:!!pending.replyTextObserved,
             lateCheck:latenessMs>GENERATION_FOLLOWUP_MAX_LATENESS_MS, coverageLimited:document.hidden || latenessMs>GENERATION_FOLLOWUP_MAX_LATENESS_MS,
             signalConfidence:pending.firstMessageDomTs?(pending.matchedReplyId?'high':'low'):(pending.replyPresentAtResponse?'high':'unverified')});
         }
@@ -1298,6 +1299,28 @@ function inspectorRedactUrlsInText(value) {
     setTimeout(() => emitOrSample(meta, 1), delayMs);
   }
 
+  // Uses the existing mutation observer and exact reply ID; no added observer,
+  // content recording, text snapshots, or polling. This is NOT a paint metric.
+  function noteExactReplyText(pending, phase) {
+    if (!pending?.replyId || pending.replyTextObserved || pending.route !== location.pathname || document.hidden) return;
+    const now=Date.now();
+    if (now < pending.responseTs || now - pending.responseTs > GENERATION_RENDER_WINDOW_MS) return;
+    const node=document.getElementById(`message-${pending.replyId}`);
+    if (!node || !node.isConnected) return;
+    const text=String(node.textContent||'').trim();
+    if (!text) return;
+    // Check geometry only on a candidate exact message, not on every mutation.
+    const hasLayout=!!node.getClientRects?.().length;
+    if (!hasLayout) return;
+    pending.replyTextObserved=true;
+    emit({type:'performance',subtype:'generation-reply-text-observed',
+      relatedRequestId:pending.requestId,generationResponseTs:pending.responseTs,
+      latencyMs:Math.max(0,now-pending.responseTs),phase,
+      textChars:text.length,hasLayoutBox:true,exactReplyIdMatched:true,
+      observation:'nonempty-text-in-exact-reply-container',
+      paintConfirmed:false,interaction:interactionState()});
+  }
+
   function beginGenerationRenderWindow(event) {
     if (!settings?.capturePerformance || !isSuccessfulChatResponse(event)) return;
     enableHighDetailDom('generation-response');
@@ -1319,6 +1342,7 @@ function inspectorRedactUrlsInText(value) {
       route:location.pathname, postMessageMutations:0,
       mountedMessagesAtResponse: Number.isFinite(lastKnownMountedMessages) ? lastKnownMountedMessages : null };
     pendingGenerationRenders.set(requestId, pending);
+    if (replyPresentAtResponse) noteExactReplyText(pending, 'already-present-at-response');
     const responsePressure = samplePagePressure('generation-response', meta);
     if (Number.isFinite(responsePressure?.mountedMessages)) pending.mountedMessagesAtResponse = responsePressure.mountedMessages;
     scheduleGenerationFollowup(2_000, 'generation-followup-2s', meta);
@@ -1343,6 +1367,11 @@ function inspectorRedactUrlsInText(value) {
     // Retain a bounded, content-free history even if the DOM changes before
     // the network completion signal arrives (common with streamed responses).
     const now=Date.now();
+    if (item.messageRelated || item.generationContentAdded === true || (item.messageNodesAdded || 0) > 0) {
+      // Bound work in rapid/automated chats. A missed observation stays missing.
+      const pendingText=[...pendingGenerationRenders.values()].slice(-6);
+      for (const pending of pendingText) noteExactReplyText(pending,'post-response-mutation');
+    }
     const meaningful = item.generationContentAdded === true || (item.messageNodesAdded || 0) > 0;
     if (meaningful) {
       recentMessageDomChanges.push({ts:now,route:location.pathname,count:item.messageNodesAdded || 0});
@@ -1372,6 +1401,7 @@ function inspectorRedactUrlsInText(value) {
     if (!matchedReplyId && !storySignal && !treeTransition && !(mountedDelta > 0 && !priorOnly)) return;
     active.firstMessageDomTs = now;
     active.matchedReplyId=matchedReplyId;
+    if (matchedReplyId && !active.replyTextObserved) requestAnimationFrame(() => noteExactReplyText(active,'next-animation-frame'));
     const signalKind = storySignal ? 'story-content-added-unverified'
       : matchedReplyId ? 'reply-id-node-added'
       : treeTransition ? 'message-tree-reconstructed-unverified' : 'message-count-increased-unverified';

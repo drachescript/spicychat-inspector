@@ -107,3 +107,7 @@ small { font-size: 10px; color: #858997; font-weight: 500; }
   .inspector pre { padding: 10px; font-size: 11px; }
   .inspector .detailHead { top: 0; }
 }
+/* Optional export-only pseudonymization; does not change on-device captures. */
+.exportPrivacy { padding: 6px 18px 9px; font-size: 12px; }
+.exportPrivacy label { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; cursor: pointer; }
+.exportPrivacy input { margin: 0; accent-color: #9c3030; }
