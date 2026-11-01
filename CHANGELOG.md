@@ -1,3 +1,21 @@
+## 0.1.4
+- Grouped static assets and tracker resources on QoL helper pages into a few bounded Resource Timing categories, avoiding page-close event bursts; slow API request timings remain individually observable.
+- Changed reported Inspector throttle coverage to stop at observed page hide/freeze and distinguish events emitted after page closure from genuine active capture gaps. Unobserved page endings remain upper bounds, not asserted data loss.
+- Clarified that browser page-freeze lifecycle signals are not Long Tasks or evidence of a blocked main thread.
+- Added static-vs-API worker timing breakdowns and labeled QoL features beside severe Long Tasks when actual trace events are present; nearby activity is not treated as causation.
+- Corrected page-context reporting to use page starts and observed SPA route transitions instead of locking in the first event's context; chats, Favorites, creator pages, Lorebooks, lists, and QoL worker pages are distinguished.
+- Recognized current QoL 0.2.65 helper-page markers (including bot-backup and Lorebook export workers) in new captures and older URL-redacted recordings. Worker helpers use the existing light capture path without new DOM observers.
+- Added derived severe-Long-Task windows (≥1s), showing nearby network outcomes, DOM sampling gaps, QoL traces and visibility indicators without inferring causes or recording message contents.
+- Tightened the defense-in-depth redaction of Typesense search keys in captured/exported diagnostic strings.
+- Restricted favorites count-difference reporting to sufficiently nearby account snapshots; latest account totals, native requested IDs, indexed matches, and page hits remain separate observations.
+- Verified observed Typesense POST responses against the October 29 HAR: the 19 recorded search POSTs match 19 Inspector network responses. Browser preflight OPTIONS are not page fetch/XHR responses and are not counted as search POSTs.
+- Compacted favorites and Typesense requests/responses at the page bridge. Preserve request counts, requested-ID counts, result counts, status, and timing without keeping individual favorite IDs, full filter values, bot names, or search hit documents.
+- Added defense-in-depth sanitation on capture/export plus one-time cleanup of older saved Typesense events; historical exports are also sanitized on read.
+- Preserved exact saved-favorite array counts when available before bridge truncation; do not convert previously redacted counts back to unknown.
+- Clarified that export summary projections omit some low-value events and must not be confused with exact stored-event totals; exposed the different count scopes.
+- Added a favorites search-coverage summary, distinguishing account favorite counts, native requested-ID counts, Typesense hits, and separate small-batch probe searches; it does not claim that unmatched bots are deleted.
+- Kept all other existing capture settings and QoL trace opt-in behavior unchanged.
+
 ## 0.1.3
 - Added a Lorebook operations report with entry creation/read counts, nearby follow-up requests, pagination candidates, errors, and per-book activity. It does not assume a backup is incomplete just because the API returns paged entries.
 - Added worker activity summaries by page and role. Browser-observed responses and aggregated Resource Timing requests are kept separate so they are not double-counted.

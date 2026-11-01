@@ -18,7 +18,8 @@ const SECRET_VALUE_RE = /(Bearer\s+[A-Za-z0-9._~+/=-]{10,}|\beyJ[A-Za-z0-9_-]{5,
 // Keep only bounded parameter names and explicit non-sensitive worker flags.
 const INSPECTOR_SAFE_WORKER_QUERY = new Set([
   'dsQolRecommendationWorker','dsQolBotStatusWorker','dsQuickDislike',
-  'dsQolLorebookClone','dsQolWorkerLight','dsListingRefill'
+  'dsQolLorebookClone','dsQolWorkerLight','dsListingRefill',
+  'dsQolBotBackupWorker','dsQolLorebookBackupWorker','dsQolLorebookExport','dsQolListingRefillWorker','dsListFill','dsQuickLessLike','dsQolQuickDislikeWorker','dsQolQuickLessLikeWorker','dsQolPersonaRefresh'
 ]);
 function inspectorSafeUrl(value) {
   const source = String(value || '');
@@ -58,7 +59,7 @@ function inspectorRedactUrlsInText(value) {
     ? inspectorSafeUrl(safe) : safe;
 }
 
-function redactExportString(value) { return inspectorRedactUrlsInText(String(value ?? '').replace(SECRET_VALUE_RE, '[REDACTED]').replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`).replace(PRIVATE_IDENTIFIER_VALUE_RE, (m, prefix) => `${prefix}[REDACTED]`)); }
+function redactExportString(value) { return inspectorRedactUrlsInText(String(value ?? '').replace(/(x-typesense-api-key\s*[:=]\s*[\"']?)[^\s&\"',}]+/gi, '$1[REDACTED]').replace(SECRET_VALUE_RE, '[REDACTED]').replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`).replace(PRIVATE_IDENTIFIER_VALUE_RE, (m, prefix) => `${prefix}[REDACTED]`)); }
 
 async function msg(data) { const res = await chrome.runtime.sendMessage(data); if (!res?.ok) throw new Error(res?.error || 'Request failed'); return res; }
 function esc(v) { return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -120,6 +121,36 @@ function requestHeadersOf(e) {
   return /request$/.test(e.subtype || '') ? (e.headers ?? null) : null;
 }
 function requestStartTs(e) { return Number.isFinite(Number(e?.requestStartedAt)) ? Number(e.requestStartedAt) : eventTs(e); }
+function inspectorWorkerRoleFromUrl(raw) {
+  if (!raw) return null;
+  try {
+    const u = new URL(String(raw), 'https://spicychat.ai');
+    if (!/(?:^|\.)spicychat\.ai$/i.test(u.hostname)) return null;
+    // Preserve role identity even in older exports with [REDACTED] query values.
+    // Presence is only accepted for known helper markers on SpicyChat pages.
+    const flags = [
+      ['dsQolBotStatusWorker', 'qol-bot-status-worker'],
+      ['dsQolRecommendationWorker', 'qol-recommendation-worker'],
+      ['dsQuickDislike', 'qol-recommendation-worker'],
+      ['dsQuickLessLike', 'qol-recommendation-worker'],
+      ['dsQolQuickDislikeWorker', 'qol-recommendation-worker'],
+      ['dsQolQuickLessLikeWorker', 'qol-recommendation-worker'],
+      ['dsQolBotBackupWorker', 'qol-bot-backup-worker'],
+      ['dsQolLorebookBackupWorker', 'qol-lorebook-backup-worker'],
+      ['dsQolLorebookExport', 'qol-lorebook-backup-worker'],
+      ['dsQolListingRefillWorker', 'qol-listing-refill-worker'],
+      ['dsListingRefill', 'qol-listing-refill-worker'],
+      ['dsListFill', 'qol-listing-refill-worker'],
+      ['dsQolPersonaRefresh', 'qol-persona-refresh-worker'],
+    ];
+    for (const [param, role] of flags) {
+      const value = u.searchParams.get(param);
+      if (value === '1' || value === '[REDACTED]') return role;
+    }
+  } catch (_) {}
+  return null;
+}
+
 function recommendationWorkerKindFromUrl(url) {
   if (!url) return null;
   try {
@@ -142,7 +173,7 @@ function buildPageRoleIndex(events) {
   const startsByTab = new Map();
   for (const e of events) {
     const markerKind = recommendationWorkerKindFromUrl(e.href || e.pageUrl || e.to || e.url);
-    const explicitRole = e.pageRole || (markerKind === 'bot-status-worker' ? 'qol-bot-status-worker' : (markerKind ? 'qol-recommendation-worker' : null));
+    const explicitRole = e.pageRole || inspectorWorkerRoleFromUrl(e.href || e.pageUrl || e.to || e.url);
     const canSeedPageRole = (e.type === 'lifecycle' && e.subtype === 'page-start') || !!e.pageRole;
     if (explicitRole && canSeedPageRole && e.pageId && e.pageId !== 'browser-webrequest' && e.browserObserver !== true && !pageRoles.has(e.pageId)) pageRoles.set(e.pageId, { role: explicitRole, kind: markerKind || 'persisted', pageId: e.pageId, tabId: e.tabId ?? null, startTs: eventTs(e) });
     if (e.type === 'lifecycle' && e.subtype === 'page-start' && Number.isInteger(e.tabId)) {
@@ -171,7 +202,7 @@ function buildPageRoleIndex(events) {
     if (e?.pageRole) return { role:e.pageRole, kind:'persisted', pageId:e.pageId && e.pageId!=='browser-webrequest' ? e.pageId : null, tabId:e.tabId ?? null };
     return null;
   }
-  const workerPages=[...pageRoles.values()].filter(x=>x.role==='qol-recommendation-worker'||x.role==='qol-bot-status-worker');
+  const workerPages=[...pageRoles.values()].filter(x=>/worker$/.test(x.role||''));
   return { pageRoles, intervalsByTab, workerPages, roleForEvent };
 }
 function isListingRefillPageUrl(url) {
@@ -207,6 +238,8 @@ function routeLabel(url) {
     else if (u.searchParams.get('dsQolRecommendationWorker') === '1') out += '?dsQolRecommendationWorker=1';
     else if (u.searchParams.get('dsQuickDislike') === '1') out += '?dsQuickDislike=1';
     else if (u.searchParams.get('dsListingRefill') === '1') out += '?dsListingRefill=1';
+    else if (u.searchParams.has('dsQolBotBackupWorker')) out += '?dsQolBotBackupWorker=1';
+    else if (u.searchParams.has('dsQolLorebookBackupWorker')) out += '?dsQolLorebookBackupWorker=1';
     return out;
   } catch (_) { return String(url || '(unknown)'); }
 }
@@ -944,10 +977,43 @@ function buildCaptureHealthDiagnostics(events) {
   const domBatches = events.filter(e => e.type === 'dom' && e.subtype === 'mutation-batch');
   const resourceBufferFull = events.filter(e=>e.type==='performance'&&e.subtype==='resource-timing-buffer-full');
   const selfThrottle = events.filter(e=>e.type==='performance'&&e.subtype==='inspector-self-throttle');
-  const throttleByPage=new Map();
-  for(const e of selfThrottle){const page=e.pageId||'(unknown)';if(!throttleByPage.has(page))throttleByPage.set(page,[]);throttleByPage.get(page).push([Number(e.ts)||0,(Number(e.ts)||0)+Math.max(0,Number(e.durationMs)||0)]);}
-  const mergedThrottle=[];
-  for(const [page,rows] of throttleByPage){rows.sort((a,b)=>a[0]-b[0]);for(const [start,end] of rows){const last=mergedThrottle[mergedThrottle.length-1];if(last&&last.page===page&&start<=last.end) last.end=Math.max(last.end,end);else mergedThrottle.push({page,start,end});}}
+  const throttleByPage=new Map(), lifecycleByPage=new Map();
+  // Report separately: requested 30-second throttle windows are upper bounds,
+  // not 30 seconds of lost recording for workers that close milliseconds later.
+  for (const e of lifecycle) {
+    if (!e.pageId || !['page-hide','page-freeze','page-resume','page-show','page-start'].includes(e.subtype)) continue;
+    const list=lifecycleByPage.get(e.pageId)||[];list.push(e);lifecycleByPage.set(e.pageId,list);
+  }
+  for (const list of lifecycleByPage.values()) list.sort((a,b)=>eventTs(a)-eventTs(b));
+  let postCloseThrottleEvents=0,clippedThrottleEvents=0,throttleWindowsWithoutObservedEnd=0;
+  for (const e of selfThrottle) {
+    const page=e.pageId||'(unknown)',start=Number(e.ts)||0;
+    const announcedEnd=start+Math.max(0,Number(e.durationMs)||0);
+    if(!throttleByPage.has(page))throttleByPage.set(page,[]);
+    const phases=lifecycleByPage.get(page)||[];
+    const prior=phases.filter(x=>eventTs(x)<=start).at(-1);
+    const closedBefore=prior && ['page-hide','page-freeze'].includes(prior.subtype);
+    const nextEnd=phases.find(x=>eventTs(x)>start && ['page-hide','page-freeze'].includes(x.subtype));
+    const boundedEnd=closedBefore ? start : Math.min(announcedEnd,nextEnd?eventTs(nextEnd):announcedEnd);
+    if(closedBefore)postCloseThrottleEvents++;
+    if(boundedEnd<announcedEnd)clippedThrottleEvents++;
+    if(!closedBefore&&!nextEnd)throttleWindowsWithoutObservedEnd++;
+    throttleByPage.get(page).push({start,announcedEnd,boundedEnd});
+  }
+  const mergeThrottle=(endKey)=>{
+    const merged=[];
+    for(const [page,rows] of throttleByPage){
+      rows.sort((a,b)=>a.start-b.start);
+      for(const x of rows){const end=x[endKey];if(end<=x.start)continue;
+        const last=merged[merged.length-1];
+        if(last&&last.page===page&&x.start<=last.end)last.end=Math.max(last.end,end);
+        else merged.push({page,start:x.start,end});
+      }
+    }
+    return merged;
+  };
+  const reportedThrottle=mergeThrottle('announcedEnd');
+  const mergedThrottle=mergeThrottle('boundedEnd');
   const captureCoverageNotes=events.filter(e=>e.type==='performance'&&['generation-dom-match-result','qol-trace-capture-config','qol-trace-link-status'].includes(e.subtype));
   const resourceSummaries = events.filter(e=>e.type==='performance'&&e.subtype==='resource-summary');
   const workerResourceSummaries = events.filter(e=>e.type==='performance'&&e.subtype==='worker-resource-summary');
@@ -986,7 +1052,11 @@ function buildCaptureHealthDiagnostics(events) {
     resourceTimingBufferClearFailures: resourceBufferFull.filter(e=>(e.clearAttempted === true || typeof e.cleared === 'boolean') && e.cleared !== true).length,
     inspectorSelfThrottleEvents: selfThrottle.length,
     inspectorSelfThrottleMs: selfThrottle.reduce((n,e)=>n+(Number(e.durationMs)||0),0),
+    inspectorSelfThrottleReportedUnionMs: reportedThrottle.reduce((n,x)=>n+Math.max(0,x.end-x.start),0),
     inspectorSelfThrottleUnionMs: mergedThrottle.reduce((n,x)=>n+Math.max(0,x.end-x.start),0),
+    inspectorSelfThrottleClippedEvents: clippedThrottleEvents,
+    inspectorSelfThrottleAfterPageClose: postCloseThrottleEvents,
+    inspectorSelfThrottleUnboundedEvents: throttleWindowsWithoutObservedEnd,
     inspectorSelfThrottleWindows: mergedThrottle.slice(-30).map(x=>({pageId:x.page,startTs:x.start,endTs:x.end,durationMs:x.end-x.start})),
     captureChecks:{generationResults:captureCoverageNotes.filter(e=>e.subtype==='generation-dom-match-result').length,qolCaptureOn:captureCoverageNotes.filter(e=>e.subtype==='qol-trace-capture-config'&&e.enabled===true).length,qolCaptureOff:captureCoverageNotes.filter(e=>e.subtype==='qol-trace-capture-config'&&e.enabled===false).length,qolNoTrace:captureCoverageNotes.filter(e=>e.subtype==='qol-trace-link-status'&&e.status==='no-response').length,qolHandshakeOnly:captureCoverageNotes.filter(e=>e.subtype==='qol-trace-link-status'&&e.status==='handshake-only').length,qolTracesReceived:captureCoverageNotes.filter(e=>e.subtype==='qol-trace-link-status'&&e.status==='trace-received').length},
     inspectorSelfThrottleReasons: Object.entries(selfThrottle.reduce((acc,e)=>{ const k=e.reason||'unknown'; acc[k]=(acc[k]||0)+1; return acc; },{})).sort((a,b)=>b[1]-a[1]).map(([reason,count])=>({reason,count})),
@@ -1188,6 +1258,11 @@ function compactVersionProjection(e) {
     const reqBody = requestBodyOf(e);
     if (/(?:^|\/)chat$/.test(label) && reqBody && typeof reqBody==='object') out.requestBody={ inference_model:reqBody.inference_model??null, inference_settings:reqBody.inference_settings||null, conversation_id:reqBody.conversation_id??null, character_id:reqBody.character_id??null, alt_message_id:reqBody.alt_message_id??null, continue_chat:reqBody.continue_chat??null };
     else if (/\/spicychat-prod\/ratings\/?$/i.test(label) && reqBody && typeof reqBody==='object') out.requestBody={ itemId:reqBody.itemId??null, rating:reqBody.rating??null, cascadeCreate:reqBody.cascadeCreate??null };
+    if (/\/multi_search\/?$/i.test(label)) {
+      if(reqBody?.searches)out.requestBody={searches:reqBody.searches.map(x=>({requestedCharacterIds:x.requestedCharacterIds??null}))};
+      if(e.body?.results)out.body={results:e.body.results.map(x=>({found:x.found??null,hits:{count:x.hits?.count??(Array.isArray(x.hits)?x.hits.length:null)}}))};
+    }
+    if (/\/users\/settings\/?$/i.test(label) && e.body?.liked_bots)out.body={liked_bots:{count:e.body.liked_bots.count??null}};
     if (/\/lorebooks(?:\/|$)/i.test(label) && /response$/.test(e.subtype||'') && e.body && typeof e.body==='object' && !Array.isArray(e.body)) out.body={num_entries:e.body.num_entries??null, entries:Array.isArray(e.body.entries)?new Array(Math.min(e.body.entries.length,1000)):undefined};
     if (/\/characters\/[^/]+\/messages(?:\/[^/?]+)?$/i.test(label) && /response$/.test(e.subtype||'') && e.body && typeof e.body==='object') out.body={ num_messages:e.body.num_messages??null };
     else if ((e.status===401 || e.authInvalidToken) && e.body && typeof e.body==='object') out.body={ errorCode:e.body.errorCode??e.body?.error?.code??null, message:e.body.message??e.body.error??null };
@@ -1217,7 +1292,7 @@ async function scanFullCaptureVersionSummary(db, total, button) {
     tx.onerror = () => reject(tx.error);
   });
   const summary = buildSummary(projected);
-  return { eventCount: total, firstTs, lastTs, durationMs: firstTs != null && lastTs != null ? Math.max(0,lastTs-firstTs) : 0, ...buildVersionDiagnostics(projected), quickDislike: summary.quickDislike, recommendationFeedback: summary.recommendationFeedback, nativeCharacterRating:summary.nativeCharacterRating, feedbackTransactionTimeline:summary.feedbackTransactionTimeline, apiEndpointInventory:summary.apiEndpointInventory, nativeMemoryProbe:summary.nativeMemoryProbe, messageBookmarkDiagnostics:summary.messageBookmarkDiagnostics, pageStartupSessions:summary.pageStartupSessions, pageStartupCost:summary.pageStartupCost, pageSessionComparison:summary.pageSessionComparison, lorebookOperations:summary.lorebookOperations, inspectorWorkerActivity:summary.inspectorWorkerActivity, qolTraceAvailability:summary.qolTraceAvailability, rateLimits:summary.rateLimits, captureConfidence:summary.captureConfidence, performanceByContext:summary.performanceByContext, messageRemountPressure:summary.messageRemountPressure, diagnosticConsistencyWarnings: summary.diagnosticConsistencyWarnings, listingRefill: buildListingRefillDiagnostics(projected), captureHealth: summary.captureHealth, scrollAndInput: summary.scrollAndInput, longTaskAttribution: summary.longTaskAttribution, generationRender: buildGenerationRenderDiagnostics(projected), recentPerformance: buildRecentPerformanceComparison(projected), pageHotspots: buildPageInstanceHotspots(projected), pagePressureGrowth: buildPagePressureGrowthDiagnostics(projected), autoLagSpikes: projected.filter(e=>e.type==='performance'&&e.subtype==='auto-lag-spike').length, summary };
+  return { eventCount: total, firstTs, lastTs, durationMs: firstTs != null && lastTs != null ? Math.max(0,lastTs-firstTs) : 0, ...buildVersionDiagnostics(projected), quickDislike: summary.quickDislike, recommendationFeedback: summary.recommendationFeedback, nativeCharacterRating:summary.nativeCharacterRating, feedbackTransactionTimeline:summary.feedbackTransactionTimeline, apiEndpointInventory:summary.apiEndpointInventory, nativeMemoryProbe:summary.nativeMemoryProbe, messageBookmarkDiagnostics:summary.messageBookmarkDiagnostics, pageStartupSessions:summary.pageStartupSessions, pageStartupCost:summary.pageStartupCost, pageSessionComparison:summary.pageSessionComparison, lorebookOperations:summary.lorebookOperations, favoritesCoverage:summary.favoritesCoverage, inspectorWorkerActivity:summary.inspectorWorkerActivity, qolTraceAvailability:summary.qolTraceAvailability, rateLimits:summary.rateLimits, captureConfidence:summary.captureConfidence, performanceByContext:summary.performanceByContext, messageRemountPressure:summary.messageRemountPressure, diagnosticConsistencyWarnings: summary.diagnosticConsistencyWarnings, listingRefill: buildListingRefillDiagnostics(projected), captureHealth: summary.captureHealth, scrollAndInput: summary.scrollAndInput, longTaskAttribution: summary.longTaskAttribution, generationRender: buildGenerationRenderDiagnostics(projected), recentPerformance: buildRecentPerformanceComparison(projected), pageHotspots: buildPageInstanceHotspots(projected), pagePressureGrowth: buildPagePressureGrowthDiagnostics(projected), autoLagSpikes: projected.filter(e=>e.type==='performance'&&e.subtype==='auto-lag-spike').length, summary };
 }
 
 
@@ -2347,32 +2422,52 @@ function buildCoverageConfidenceDiagnostics(events,captureHealth) {
     if(!skipped&&!limitCallbacks)continue;
     const key=e.pageId||'(unknown)';const row=byPage.get(key)||{pageId:key,route:routeLabel(e.pageUrl),skippedMutationRecords:0,budgetLimitCallbacks:0};row.skippedMutationRecords+=skipped;row.budgetLimitCallbacks+=limitCallbacks;byPage.set(key,row);
   }
-  return {level:recordsSkipped||c.inspectorSelfThrottleEvents?'sampled-with-gaps':'no-recorded-throttle',
+  return {level:recordsSkipped||c.inspectorSelfThrottleUnionMs>0?'sampled-with-gaps':c.inspectorSelfThrottleEvents?'throttle-notices-no-observed-active-window':'no-recorded-throttle',
     skippedMutationRecords:recordsSkipped,budgetLimitCallbacks:c.observerBudgetExceededCallbacks||0,recordLimitCallbacks:c.observerRecordLimitCallbacks||0,
     selfThrottleEvents:c.inspectorSelfThrottleEvents||0,selfThrottleUnionMs:c.inspectorSelfThrottleUnionMs||0,
+    selfThrottleReportedUnionMs:c.inspectorSelfThrottleReportedUnionMs||0,
+    selfThrottleAfterPageClose:c.inspectorSelfThrottleAfterPageClose||0,
     resourceTimingBufferFullOccurrences:c.resourceTimingBufferFullOccurrences||0,
     generationChecks:gen.length,generationLimitedChecks:limited,
     topPages:[...byPage.values()].sort((a,b)=>b.skippedMutationRecords-a.skippedMutationRecords).slice(0,8),
     note:'Skipped records describe Inspector sampling, not missing application mutations in absolute terms. A lack of recorded throttling cannot establish complete coverage. Long Task and DOM comparisons must account for capture gaps.'};
 }
 function buildPerformanceContextDiagnostics(events,roleIndex=buildPageRoleIndex(events)) {
-  const groups=new Map(),pages=new Map();
-  const classify=e=>{
-    const role=roleIndex.roleForEvent(e)?.role||e.pageRole||'';
-    if(/worker/i.test(role))return 'worker';
-    const path=routeLabel(e.pageUrl||e.url);
-    if(/^\/(?:chat|story)(?:\/|$)/.test(path))return 'chat';
-    if(/lorebook/i.test(path))return 'lorebook';
+  // A network event can be stored before page-start. Seed routes from lifecycle
+  // events instead of permanently treating the first event as the page type.
+  // SPA route changes are attributed by timestamp, not reclassified retroactively.
+  const byPage=new Map(), segments=new Map(), groups=new Map();
+  const contextFor=(url,role)=>{
+    if(/worker$/.test(role||''))return 'worker';
+    const route=routeLabel(url);
+    if(/^\/(?:[a-z]{2}\/)?(?:chat|story)(?:\/|$)/i.test(route))return 'chat';
+    if(/\/lorebook(?:\/|$)/i.test(route))return 'lorebook';
+    if(/\/favorite-bots(?:\/|$)/i.test(route))return 'favorites';
+    if(/^\/(?:my-creations|chatbot\/edit)(?:\/|$)/i.test(route))return 'creator';
+    if(/^\/chats(?:\/|$)/i.test(route))return 'chat-list';
     return 'other';
   };
-  const getPage=e=>{
-    const id=e.pageId||`tab:${e.tabId??'unknown'}`,ts=eventTs(e);
-    const p=pages.get(id)||{pageId:id,context:classify(e),minTs:ts,maxTs:ts,events:0,gens:0,longTasks:0,longTaskMs:0,hiddenLongTasks:0,focusedLongTasks:0,unknownFocusLongTasks:0};
-    p.minTs=Math.min(p.minTs,ts);p.maxTs=Math.max(p.maxTs,ts);p.events++;pages.set(id,p);return p;
-  };
   for(const e of events){
-    if(e.pageId==null)continue;
-    const p=getPage(e);
+    if(!e.pageId||e.pageId==='browser-webrequest'||e.type!=='lifecycle'||!['page-start','route-change'].includes(e.subtype))continue;
+    const route=e.subtype==='route-change'?(e.to||e.pageUrl):(e.href||e.pageUrl||e.url);
+    const page=byPage.get(e.pageId)||[];
+    page.push({ts:eventTs(e),url:route,context:contextFor(route,roleIndex.roleForEvent(e)?.role||e.pageRole)});
+    byPage.set(e.pageId,page);
+  }
+  for(const rows of byPage.values())rows.sort((a,b)=>a.ts-b.ts);
+  for(const e of events){
+    if(!e.pageId||e.pageId==='browser-webrequest')continue;
+    const ts=eventTs(e), role=roleIndex.roleForEvent(e)?.role||e.pageRole||'';
+    const routeRows=byPage.get(e.pageId)||[];
+    let current=null,lo=0,hi=routeRows.length;
+    while(lo<hi){const mid=(lo+hi)>>1;if(routeRows[mid].ts<=ts){current=routeRows[mid];lo=mid+1;}else hi=mid;}
+    // Out-of-order timestamps or older captures can lack page-start; use the
+    // nearest recorded page route, not the request URL of an unrelated API.
+    const route=current||routeRows[0]||null;
+    const context=/worker$/.test(role)?'worker':(route?.context||contextFor(e.pageUrl||e.href||e.to||'',role));
+    const key=`${e.pageId}::${context}`;
+    const p=segments.get(key)||{pageId:e.pageId,context,minTs:ts,maxTs:ts,events:0,gens:0,longTasks:0,longTaskMs:0,hiddenLongTasks:0,focusedLongTasks:0,unknownFocusLongTasks:0};
+    p.minTs=Math.min(p.minTs,ts);p.maxTs=Math.max(p.maxTs,ts);p.events++;segments.set(key,p);
     if(isChatSuccessResponse(e))p.gens++;
     if(e.type==='performance'&&e.subtype==='long-task'){
       p.longTasks++;p.longTaskMs+=Number(e.durationMs)||0;
@@ -2381,13 +2476,44 @@ function buildPerformanceContextDiagnostics(events,roleIndex=buildPageRoleIndex(
       else p.unknownFocusLongTasks++;
     }
   }
-  for(const p of pages.values()){
+  for(const p of segments.values()){
     const g=groups.get(p.context)||{context:p.context,pages:0,measuredMinutes:0,generations:0,longTasks:0,longTaskMs:0,focusedLongTasks:0,hiddenLongTasks:0,unknownFocusLongTasks:0};
-    const duration=Math.max(0,p.maxTs-p.minTs);g.pages++;g.measuredMinutes+=duration/60000;g.generations+=p.gens;g.longTasks+=p.longTasks;g.longTaskMs+=p.longTaskMs;g.focusedLongTasks+=p.focusedLongTasks;g.hiddenLongTasks+=p.hiddenLongTasks;g.unknownFocusLongTasks+=p.unknownFocusLongTasks;groups.set(p.context,g);
+    g.pages++;g.measuredMinutes+=Math.max(0,p.maxTs-p.minTs)/60000;g.generations+=p.gens;g.longTasks+=p.longTasks;g.longTaskMs+=p.longTaskMs;g.focusedLongTasks+=p.focusedLongTasks;g.hiddenLongTasks+=p.hiddenLongTasks;g.unknownFocusLongTasks+=p.unknownFocusLongTasks;groups.set(p.context,g);
   }
   return {groups:[...groups.values()].map(g=>({...g,measuredMinutes:Math.round(g.measuredMinutes*10)/10,longTaskMs:Math.round(g.longTaskMs),longTaskMsPerObservedMinute:g.measuredMinutes>=1?Math.round(g.longTaskMs/g.measuredMinutes*10)/10:null,longTaskMsPerGeneration:g.generations?Math.round(g.longTaskMs/g.generations):null})).sort((a,b)=>b.longTaskMs-a.longTaskMs),
-    note:'Session windows use first/last recorded events and may contain inactive time; per-minute rates are descriptive, not normalized foreground benchmarks. Long Task focus is known only where interaction metadata is present. Overlapping generations prevent causal per-generation attribution.'};
+    note:'Contexts use page-start and observed SPA route transitions, not API endpoints. A route segment is not necessarily a new browser tab. Windows include possible idle time; per-minute values are descriptive, not matched foreground benchmarks. Long Tasks and generations are observational, not causal attribution.'};
 }
+
+function buildSevereFreezeTimeline(events,roleIndex=buildPageRoleIndex(events)) {
+  // Derived from existing events; does not create observers, extra page work or
+  // record private text. Existing Inspector auto-lag captures are left intact.
+  const tasks=events.filter(e=>e.type==='performance'&&e.subtype==='long-task'&&Number(e.durationMs)>=1000)
+    .sort((a,b)=>Number(b.durationMs)-Number(a.durationMs));
+  const pageEvents=new Map();
+  for(const e of events){if(!e.pageId)continue;const list=pageEvents.get(e.pageId)||[];list.push(e);pageEvents.set(e.pageId,list);}
+  for(const rows of pageEvents.values())rows.sort((a,b)=>eventTs(a)-eventTs(b));
+  const top=tasks.slice(0,8).map(task=>{
+    const durationMs=Number(task.durationMs)||0;
+    const end=Number.isFinite(task.entryEndTs)?task.entryEndTs:eventTs(task);
+    const start=Number.isFinite(task.entryStartTs)?task.entryStartTs:end-durationMs;
+    const near=rangeForSorted(pageEvents.get(task.pageId)||[],start-15000,end+10000);
+    const dom=near.filter(e=>e.type==='dom'&&e.subtype==='mutation-batch');
+    const network=near.filter(e=>e.type==='network'&&/response$/.test(e.subtype||''));
+    const errors=near.filter(e=>e.type==='error'&&e.likelyNonCriticalTracker!==true);
+    const trace=near.filter(e=>e.type==='qol'&&(/trace|operation|activity-tag/i.test(`${e.subtype||''} ${e.category||''}`)||Number.isFinite(e.traceSeq)));
+    const features=new Map();
+    for(const e of trace){const feature=String(e.feature||e.module||'unknown').slice(0,80);features.set(feature,(features.get(feature)||0)+1);}
+    const nearbyQolFeatures=[...features].sort((a,b)=>b[1]-a[1]).slice(0,6).map(([feature,count])=>({feature,count}));
+    const labels={};for(const e of network){const status=String(e.status??'unknown');labels[status]=(labels[status]||0)+1;}
+    const role=roleIndex.roleForEvent(task)?.role||task.pageRole||null;
+    return {pageId:task.pageId,ts:eventTs(task),startTs:start,endTs:end,durationMs:Math.round(durationMs),pageContext:/worker$/.test(role||'')?'worker':(routeLabel(task.pageUrl||task.url)||'(unknown)'),workerRole:role,
+      hidden:task.interaction?.hidden??null,focused:task.interaction?.windowFocused??task.interaction?.documentHasFocus??null,
+      nearbyRecordedEvents:near.length,nearbyDomBatches:dom.length,nearbyDomMutations:dom.reduce((n,e)=>n+(Number(e.stats?.totalMutations)||0),0),nearbySkippedMutations:dom.reduce((n,e)=>n+(Number(e.stats?.budgetSkippedMutationRecords)||0),0),nearbyNetworkResponses:network.length,networkStatuses:labels,nearbyNonTrackerErrors:errors.length,nearbyQolTraceEvents:trace.length,nearbyQolFeatures,
+      nearbyAutoLagMarkers:near.filter(e=>e.type==='performance'&&e.subtype==='auto-lag-spike').length};
+  });
+  return {count:tasks.length,thresholdMs:1000,top,coverage:'Only recorded Long Tasks are considered. Nearby DOM/network/QoL events show temporal association, not the cause of a freeze. Gaps and hidden-tab timer suspension can prevent complete timelines.'};
+}
+
 function buildRateLimitDiagnostics(events) {
   const network=events.filter(e=>e.type==='network'&&/(?:xhr|fetch)-response$/.test(e.subtype||'')&&Number(e.status)===429);
   const byCode={};const endpoints=new Map();const samples=[];
@@ -2397,6 +2523,39 @@ function buildRateLimitDiagnostics(events) {
   }
   return {http429:network.length,byErrorCode:byCode,byEndpoint:[...endpoints].sort((a,b)=>b[1]-a[1]).slice(0,8).map(([endpoint,count])=>({endpoint,count})),recent:samples.slice(-10),
     dailyCapConfirmed:network.filter(isKnownDailyMessageLimitEvent).length,note:'429/SC-001-5201 is an observed rate limit, not by itself evidence of a daily message allowance being exhausted. Distinct explicit daily-cap evidence is required.'};
+}
+
+// v0.1.4: compare list size to actual native and probe search coverage.
+// Counts are diagnostic metadata, never raw favorite identifiers.
+function buildFavoritesCoverageDiagnostics(events){
+  const settings=[],searches=[];
+  for(const e of events){
+    if(e.type!=='network'||!/(?:xhr|fetch)-response$/.test(e.subtype||''))continue;
+    const ep=endpointUrl(e).split('?')[0];
+    if(/\/users\/settings\/?$/i.test(ep)){
+      const n=e.body?.liked_bots?.count;
+      if(Number.isFinite(n))settings.push({ts:eventTs(e),count:n,pageId:e.pageId||null});
+    }else if(/\/multi_search\/?$/i.test(ep)){
+      const search=e.requestBody?.searches?.[0],res=e.body?.results?.[0];
+      if(Number.isFinite(search?.requestedCharacterIds)||Number.isFinite(res?.found))searches.push({ts:eventTs(e),pageId:e.pageId||null,requestedIds:Number.isFinite(search?.requestedCharacterIds)?search.requestedCharacterIds:null,
+        found:Number.isFinite(res?.found)?res.found:null,returned:Number.isFinite(res?.hits?.count)?res.hits.count:Array.isArray(res?.hits)?res.hits.length:null,status:e.status});
+    }
+  }
+  settings.sort((a,b)=>a.ts-b.ts);
+  const native=searches.filter(x=>x.requestedIds!=null).sort((a,b)=>b.requestedIds-a.requestedIds||b.ts-a.ts)[0]||null;
+  const latest=settings.at(-1)||null;
+  const related=native?settings.filter(x=>x.ts<=native.ts&&native.ts-x.ts<=300000).sort((a,b)=>b.ts-a.ts)[0]||null:null;
+  const comparable=!!(native&&related&&related.count>=native.requestedIds);
+  const probes=searches.filter(x=>x.requestedIds!=null&&x.requestedIds<=100);
+  return {accountFavoriteCount:latest?.count??null,accountFavoriteCountTs:latest?.ts??null,
+    accountCountNearNativeSearch:related?.count??null,accountCountNearNativeSearchTs:related?.ts??null,
+    nativeRequestedIds:native?.requestedIds??null,nativeSearchTs:native?.ts??null,
+    nativeIndexedFound:native?.found??null,nativeReturnedHits:native?.returned??null,
+    nativeSearchObservations:native?searches.filter(x=>x.requestedIds===native.requestedIds).length:0,
+    smallBatchSearchesObserved:probes.length,smallBatchRequestedIdOccurrences:probes.reduce((n,x)=>n+x.requestedIds,0),smallBatchFoundOccurrences:probes.reduce((n,x)=>n+(x.found||0),0),
+    notIncludedInNativeQuery:comparable?related.count-native.requestedIds:null,
+    comparisonScope:comparable?'account-count-observed-within-5m-before-native-search':'no-comparable-account-snapshot',
+    coverage:'Latest saved-favorites count and largest observed native search may come from different browsing moments. Only a compatible account snapshot within 5 minutes BEFORE that request is compared. Typesense found is total matching hits, not page-returned hits. No unique omitted-ID verification or proof of deletion.'};
 }
 
 function buildSummary(events) {
@@ -2436,9 +2595,15 @@ function buildSummary(events) {
     x.requests += Number(e.requests)||0; x.totalDurationMs += Number(e.totalDurationMs)||0; x.maxDurationMs = Math.max(x.maxDurationMs, Number(e.maxDurationMs)||0); x.over500ms += Number(e.over500ms)||0; x.over1000ms += Number(e.over1000ms)||0;
     workerResourceGroups.set(key,x);
   }
+  const staticWorkerEndpoint = value => /(?:^spicychat\.ai\/(?:assets|cdn-cgi|app-shell|media)\/|^spicychat-cdn-or-other-api\/|^google-fonts\/|^third-party\/|^fonts\.(?:googleapis|gstatic)\.com\/|^static\.cloudflareinsights\.com\/|\/static-assets\/|\.(?:js|css|mjs|woff2?|ttf|png|jpe?g|webp|svg|gif)(?:$|\?))/i.test(String(value||''));
+  const apiWorkerEndpoint = value => /(?:nd-api\.com|recombee\.com|\/api\/|\/v\d+\/|\/multi_search)/i.test(String(value||''));
   const workerResources = {
     summaryEvents: workerResourceSummaryEvents.length,
     requests: workerResourceSummaryEvents.reduce((n,e)=>n+(Number(e.requests)||0),0),
+    staticAssetTimingObservations:workerResourceSummaryEvents.filter(e=>!apiWorkerEndpoint(e.endpointGroup)&&staticWorkerEndpoint(e.endpointGroup)).reduce((n,e)=>n+(Number(e.requests)||0),0),
+    apiTimingObservations:workerResourceSummaryEvents.filter(e=>apiWorkerEndpoint(e.endpointGroup)).reduce((n,e)=>n+(Number(e.requests)||0),0),
+    pagesWithSummary:new Set(workerResourceSummaryEvents.map(e=>e.pageId).filter(Boolean)).size,
+    note:'These are Resource Timing observations, not unique network requests. API response events may describe the same work; counts must not be added.',
     top:[...workerResourceGroups.values()].map(x=>({...x,avgDurationMs:x.requests?Math.round(x.totalDurationMs/x.requests*10)/10:0,totalDurationMs:Math.round(x.totalDurationMs*10)/10,maxDurationMs:Math.round(x.maxDurationMs*10)/10})).sort((a,b)=>b.requests-a.requests||b.totalDurationMs-a.totalDurationMs).slice(0,10)
   };
   const storage = events.filter(e => e.type === 'storage');
@@ -2487,11 +2652,13 @@ function buildSummary(events) {
   const pageStartupCost = buildPageStartupCostDiagnostics(events);
   const pageSessionComparison = buildPageSessionComparison(events);
   const lorebookOperations = buildLorebookOperationDiagnostics(events);
+  const favoritesCoverage = buildFavoritesCoverageDiagnostics(events);
   const inspectorWorkerActivity = buildInspectorWorkerActivityDiagnostics(events,pageRoleIndex);
   const qolTraceAvailability = buildQolTraceAvailabilityDiagnostics(events);
   const rateLimits = buildRateLimitDiagnostics(events);
   const captureConfidence = buildCoverageConfidenceDiagnostics(events,buildCaptureHealthDiagnostics(events));
   const performanceByContext = buildPerformanceContextDiagnostics(events,pageRoleIndex);
+  const severeFreezeTimeline = buildSevereFreezeTimeline(events,pageRoleIndex);
 
   const statusZeroLikelyNavigation = netResponses.filter(e => e.status === 0 && /navigation|hidden|abort|unload/i.test(e.statusZeroHint || '')).length;
 
@@ -2827,11 +2994,13 @@ function buildSummary(events) {
     pageStartupCost,
     pageSessionComparison,
     lorebookOperations,
+    favoritesCoverage,
     inspectorWorkerActivity,
     qolTraceAvailability,
     rateLimits,
     captureConfidence,
     performanceByContext,
+    severeFreezeTimeline,
     counterDriver,
     qolTrace,
     dailyMessageLimits: {
@@ -2896,10 +3065,15 @@ function renderOverview() {
     extra.push(`<div><strong>Lorebook operations:</strong> ${l.observedRequests} observed API response(s) across ${l.booksObserved} book(s) · ${c['create-entry']||0} entry creations · ${c['load-book-and-entries']||0} book/entry reads · ${c['update-entry']||0} entry updates · ${l.errors} failed requests${l.observedCursorLoads?` · ${l.observedCursorLoads} cursor-bearing read(s)`:''}${l.medianSuccessfulCreateSpacingMs!=null?` · median entry creation spacing ${l.medianSuccessfulCreateSpacingMs}ms`:''}${l.adjacentCreateToLoadPairs?` · ${l.adjacentCreateToLoadPairs} reads within 5s after an entry POST (median delay ${l.medianCreateToLoadMs}ms)`:''}. <em>Nearby requests do not prove an automatic refresh; reported totals do not verify backup completeness. Details are in the export.</em></div>`);
     if(l.paginationCandidates?.length)extra.push(`<div><strong>Lorebook page-size checks:</strong> ${l.paginationCandidates.length} book(s) reported more entries than were present in their largest observed single response. <em>This can be normal pagination, not a confirmed missing-entry bug.</em></div>`);
   }
+  if(s.favoritesCoverage?.nativeRequestedIds!=null){
+    const f=s.favoritesCoverage;
+    extra.push(`<div><strong>Favorites search coverage:</strong> ${f.accountFavoriteCount!=null?`${f.accountFavoriteCount.toLocaleString()} latest observed saved IDs · `:''}${f.nativeRequestedIds.toLocaleString()} IDs in the largest observed native search${f.nativeIndexedFound!=null?` · ${f.nativeIndexedFound.toLocaleString()} indexed hits reported`:''}${f.notIncludedInNativeQuery!=null?` · ${f.notIncludedInNativeQuery.toLocaleString()} IDs not present in that native request`:''}${f.smallBatchSearchesObserved?` · ${f.smallBatchSearchesObserved} small-batch search(es) observed`:''}. <em>${esc(f.coverage)}</em></div>`);
+  }
   if(s.qolTraceAvailability){const t=s.qolTraceAvailability;extra.push(`<div><strong>QoL trace availability:</strong> ${esc(t.state)} · ${t.configChecks} configuration checks (${t.enabledChecks} enabled, ${t.disabledChecks} disabled) · ${t.explicitTraceEvents} observed trace event(s)${t.latestLinkStatus?` · latest connection ${esc(t.latestLinkStatus)}`:''}. <em>${esc(t.recommendation)}</em></div>`);}
   if(s.inspectorWorkerActivity?.workerPages){const w=s.inspectorWorkerActivity;extra.push(`<div><strong>Worker activity:</strong> ${w.workerPages} worker page(s) · ${w.browserObservedResponses.toLocaleString()} directly observed API responses · ${w.resourceTimingSummarizedRequests.toLocaleString()} Resource Timing aggregated requests. Most active: ${w.top.slice(0,3).map(x=>`${esc(x.role)} ${x.summaryRequests} resource timing(s), ${x.requestsObserved} API response(s)`).join(' | ')}. <em>These request layers may overlap; neither establishes unique bot checks or cache efficiency.</em></div>`);}
-  if(s.captureConfidence){const c=s.captureConfidence;extra.push(`<div><strong>Capture coverage:</strong> ${esc(c.level)} · ${c.skippedMutationRecords.toLocaleString()} budget-skipped mutation record(s) · ${c.selfThrottleEvents} throttle event(s) / ${(c.selfThrottleUnionMs/1000).toFixed(1)}s of throttle windows · ${c.resourceTimingBufferFullOccurrences} resource buffer-full occurrence(s). <em>Skipped records mean DOM coverage was incomplete; zero reported skips is not proof of perfect capture.</em></div>`);}
+  if(s.captureConfidence){const c=s.captureConfidence;extra.push(`<div><strong>Capture coverage:</strong> ${esc(c.level)} · ${c.skippedMutationRecords.toLocaleString()} budget-skipped mutation record(s) · ${c.selfThrottleEvents} throttle notice(s) / ${(c.selfThrottleUnionMs/1000).toFixed(1)}s of page-lifecycle-bounded windows${c.selfThrottleAfterPageClose?` · ${c.selfThrottleAfterPageClose} notice(s) after page hide/freeze`:''} · ${c.resourceTimingBufferFullOccurrences} resource buffer-full occurrence(s). <em>Announced windows are not measured data loss; windows without observed page ends remain upper bounds.</em></div>`);}
   if(s.rateLimits?.http429){const r=s.rateLimits;extra.push(`<div><strong>Rate limits:</strong> ${r.http429} HTTP 429 response(s), codes ${Object.entries(r.byErrorCode).map(([k,v])=>`${esc(k)} ×${v}`).join(', ')}. <em>SC-001-5201 / “Too many requests” is not automatically a daily message cap.</em></div>`);}
+  if(s.severeFreezeTimeline?.top?.length){const f=s.severeFreezeTimeline,near=f.top[0].nearbyQolFeatures||[];extra.push(`<div><strong>Severe Long Task windows:</strong> ${f.count} task(s) ≥1s; worst ${f.top[0].durationMs.toLocaleString()}ms on ${esc(f.top[0].pageContext)}, with ${f.top[0].nearbyDomBatches} nearby DOM batch(es), ${f.top[0].nearbyNetworkResponses} network response(s) and ${f.top[0].nearbyQolTraceEvents} QoL trace event(s)${near.length?` · observed QoL features ${near.map(x=>`${esc(x.feature)} ×${x.count}`).join(', ')}`:''}. <em>Nearby activity does not establish causation; detailed windows are in the export.</em></div>`);}
   if(s.performanceByContext?.groups?.length){const contexts=s.performanceByContext.groups.filter(x=>x.longTasks);if(contexts.length)extra.push(`<div><strong>Long Tasks by page context:</strong> ${contexts.map(x=>`${esc(x.context)} ${x.longTasks} / ${(x.longTaskMs/1000).toFixed(1)}s${x.longTaskMsPerObservedMinute!=null?` (${x.longTaskMsPerObservedMinute.toFixed(0)}ms per observed minute)`:''}`).join(' · ')}. <em>Time spans include possible idle periods; no QoL/native attribution is implied.</em></div>`);}
   if (s.nativeCharacterRating) {
     const x=s.nativeCharacterRating;
@@ -2995,13 +3169,13 @@ function renderOverview() {
   if (Object.values(ac).some(Boolean)) extra.push(`<div><strong>Attribution:</strong> confirmed QoL ${ac.qolConfirmed}, likely QoL ${ac.qolLikely}, native SpicyChat ${ac.spicychatNative}, third-party ${ac.thirdParty}, other extension ${ac.otherExtension}, unknown/mixed ${ac.unknownMixed}.</div>`);
   if (s.domSummary.batches) extra.push(`<div><strong>DOM churn:</strong> ${s.domSummary.totalMutations.toLocaleString()} mutations · ${s.domSummary.qolOwned.toLocaleString()} QoL-owned · ${s.domSummary.qolRelated.toLocaleString()} direct/owned ds-related · ${s.domSummary.noOp.toLocaleString()} no-op${s.domSummary.topPatterns[0] ? ` · top: ${esc(s.domSummary.topPatterns[0].pattern)} ×${s.domSummary.topPatterns[0].count}` : ''}.</div>`);
   if (s.captureHealth?.pressureSnapshots) extra.push(`<div><strong>Page pressure:</strong> ${s.captureHealth.pressureSnapshots} snapshot(s) · max ${s.captureHealth.maxDomElements.toLocaleString()} DOM element(s)${s.captureHealth.maxMountedMessages ? ` · max ${s.captureHealth.maxMountedMessages} mounted message(s)` : ''}${s.captureHealth.maxJsHeapUsedBytes ? ` · max JS heap ${formatBytes(s.captureHealth.maxJsHeapUsedBytes)}` : ''}${s.captureHealth.maxResourceEntries ? ` · max ${s.captureHealth.maxResourceEntries} Resource Timing entries` : ''}${s.captureHealth.resourceTimingBufferFullEvents ? ` · buffer-full events ${s.captureHealth.resourceTimingBufferFullEvents} · clear attempts ${s.captureHealth.resourceTimingBufferClearAttempts||0} / ${s.captureHealth.resourceTimingBufferClears||0} succeeded${s.captureHealth.resourceTimingBufferClearFailures ? ` / ${s.captureHealth.resourceTimingBufferClearFailures} failed` : ''}` : ''}${s.captureHealth.observerFastModeCallbacks ? ` · fast observer ${s.captureHealth.observerFastModeCallbacks} callback(s) / ${s.captureHealth.observerFastModeMutations.toLocaleString()} mutation(s)` : ''}.</div>`);
-  if (s.captureHealth && (s.captureHealth.pageFreezes || s.captureHealth.pageResumes || s.captureHealth.discardedPageStarts)) extra.push(`<div><strong>Page lifecycle:</strong> freeze ${s.captureHealth.pageFreezes} · resume ${s.captureHealth.pageResumes} · discarded/reloaded starts ${s.captureHealth.discardedPageStarts} · pagehide ${s.captureHealth.pageHides} · pageshow ${s.captureHealth.pageShows}.</div>`);
+  if (s.captureHealth && (s.captureHealth.pageFreezes || s.captureHealth.pageResumes || s.captureHealth.discardedPageStarts)) extra.push(`<div><strong>Browser page lifecycle (not Long Tasks):</strong> freeze ${s.captureHealth.pageFreezes} · resume ${s.captureHealth.pageResumes} · discarded/reloaded starts ${s.captureHealth.discardedPageStarts} · pagehide ${s.captureHealth.pageHides} · pageshow ${s.captureHealth.pageShows}. <em>Page freeze is a browser lifecycle signal, not a measured multi-second main-thread stall.</em></div>`);
   if (s.longTaskAttribution?.loafFrameOverlap) extra.push(`<div><strong>Long Task attribution candidates:</strong> ${s.longTaskAttribution.loafFrameOverlap} / ${s.longTaskAttribution.longTasks} tasks overlapped Long Animation Frames; ${s.longTaskAttribution.loafScriptCandidates} had at least one script-source category, ${s.longTaskAttribution.explicitQolOperationOverlap} also overlapped explicit QoL operations. A matching script does not prove causation.</div>`);
   if (s.scrollAndInput?.scrollWindows || s.scrollAndInput?.slowInputEvents) extra.push(`<div><strong>Scroll &amp; input:</strong> ${s.scrollAndInput.scrollWindows} human-input-correlated scroll window(s) · ${s.scrollAndInput.scrollFrameGapsOver100ms} sampled frame gap(s) &gt;100ms · ${s.scrollAndInput.scrollLinkedLongTasks} temporally overlapping Long Task(s) · ${s.scrollAndInput.slowInputEvents} slow Event Timing entry/entries. These are correlations, not causality.</div>`);
   if (s.generationRender?.count) extra.push(`<div><strong>Reply timing confidence:</strong> ${s.generationRender.repliesAlreadyPresentAtResponse||0} reply/replies already present at network observation; ${s.generationRender.verifiedPostResponseReplySamples||0} exact post-response reply node matches; ${s.generationRender.tentativeDomSignals||0} tentative DOM-change signals · ${s.generationRender.timingConfidence?.noResponseDomSignal||0} without a DOM signal · ${s.generationRender.timingConfidence?.delayedOrLimited||0} late/limited checks. None of these is a direct measurement of first visible text.</div>`);
   if (s.generationRender?.domMatchOutcomes?.length) extra.push(`<div><strong>Generation DOM checks:</strong> ${s.generationRender.domMatchOutcomes.slice(0,5).map(x=>`${esc(x.label)} (${x.count})`).join(' · ')}.</div>`);
   if (s.captureHealth?.captureChecks) {const c=s.captureHealth.captureChecks;extra.push(`<div><strong>QoL tracing status:</strong> opt-in enabled in ${c.qolCaptureOn} captured page/settings state(s), disabled in ${c.qolCaptureOff}; ${c.qolTracesReceived} trace-received signal(s), ${c.qolHandshakeOnly} handshake-only signal(s), ${c.qolNoTrace} no-response signal(s). Check opt-in and whether meaningful operations occurred before concluding the protocol is broken.</div>`);}
-  if (s.captureHealth && (s.captureHealth.inspectorSelfThrottleEvents || s.captureHealth.aggregatedThirdPartyResourceRequests || s.captureHealth.aggregatedWorkerResourceRequests || s.captureHealth.aggregatedTrackerErrors || s.captureHealth.resourceTimingProactiveClears)) extra.push(`<div><strong>Inspector self-protection:</strong> throttle windows ${s.captureHealth.inspectorSelfThrottleEvents || 0}${s.captureHealth.inspectorSelfThrottleEvents ? ` (${(s.captureHealth.inspectorSelfThrottleUnionMs/1000).toFixed(1)}s merged coverage per page; ${(s.captureHealth.inspectorSelfThrottleMs/1000).toFixed(1)}s summed windows)` : ''} · aggregated third-party resource timings ${s.captureHealth.aggregatedThirdPartyResourceRequests || 0} · aggregated QoL-worker resource timings ${s.captureHealth.aggregatedWorkerResourceRequests || 0} · proactive Resource Timing clears ${s.captureHealth.resourceTimingProactiveClears || 0} · aggregated tracker/resource errors ${s.captureHealth.aggregatedTrackerErrors || 0}.</div>`);
+  if (s.captureHealth && (s.captureHealth.inspectorSelfThrottleEvents || s.captureHealth.aggregatedThirdPartyResourceRequests || s.captureHealth.aggregatedWorkerResourceRequests || s.captureHealth.aggregatedTrackerErrors || s.captureHealth.resourceTimingProactiveClears)) extra.push(`<div><strong>Inspector self-protection:</strong> throttle notices ${s.captureHealth.inspectorSelfThrottleEvents || 0}${s.captureHealth.inspectorSelfThrottleEvents ? ` (${(s.captureHealth.inspectorSelfThrottleUnionMs/1000).toFixed(1)}s page-lifecycle-bounded windows; ${(s.captureHealth.inspectorSelfThrottleReportedUnionMs/1000).toFixed(1)}s announced upper-bound windows; ${s.captureHealth.inspectorSelfThrottleAfterPageClose||0} already hidden/frozen)` : ''} · aggregated third-party resource timings ${s.captureHealth.aggregatedThirdPartyResourceRequests || 0} · aggregated QoL-worker resource timings ${s.captureHealth.aggregatedWorkerResourceRequests || 0} · proactive Resource Timing clears ${s.captureHealth.resourceTimingProactiveClears || 0} · aggregated tracker/resource errors ${s.captureHealth.aggregatedTrackerErrors || 0}.</div>`);
   if (s.captureHealth && (s.captureHealth.inspectorObserverMs || s.captureHealth.inspectorFlushMs)) {
     const slow = s.captureHealth.observerBatchesOver50ms || 0;
     const warning = (s.captureHealth.avgObserverCallbackMs || 0) >= 4 || slow > 0
@@ -3037,7 +3211,7 @@ function renderOverview() {
   if (s.chatGenerationSummary.count) extra.push(`<div><strong>Chat generations:</strong> ${s.chatGenerationSummary.count} · classifier true ${s.chatGenerationSummary.nsfwTrue} / false ${s.chatGenerationSummary.nsfwFalse} · ${s.chatGenerationSummary.classifierFlips} flip(s) · avg ${(s.chatGenerationSummary.avgMs/1000).toFixed(1)}s. <em>Per-message classifier only.</em></div>`);
   if (s.generationRender?.count) { const g=s.generationRender; const buckets=(g.mountedMessageBuckets||[]).map(x=>`${x.label}: ${(x.avgLongTaskMs/1000).toFixed(2)}s avg`).join(', '); extra.push(`<div><strong>Post-generation render (${(g.windowMs/1000).toFixed(0)}s window):</strong> ${g.count} generation(s) · avg Long Task ${(g.avgLongTaskMs/1000).toFixed(2)}s · median ${(g.medianLongTaskMs/1000).toFixed(2)}s · p95 ${(g.p95LongTaskMs/1000).toFixed(2)}s · avg LoAF blocking ${(g.avgLoafBlockingMs/1000).toFixed(2)}s · ${g.generationsOver1sPostBlock} generation(s) with ≥1s post-response Long Tasks${g.medianResponseDomSignalMs!=null ? ` · median tentative DOM-change signal ${g.medianResponseDomSignalMs.toFixed(0)}ms` : ''}${g.missingResponseDomSignal ? ` · ${g.missingResponseDomSignal} generation(s) without confirmed DOM signal` : ''}${g.legacyFirstMessageDomSamples ? ` · ${g.legacyFirstMessageDomSamples} legacy/unverified DOM sample(s) excluded` : ''}${g.mountedMessageScaling ? ` · mounted-message slope ${g.mountedMessageScaling.slope.toFixed(1)} ms/msg (R² ${g.mountedMessageScaling.r2.toFixed(2)})` : ''}${buckets ? ` · by mounted size: ${esc(buckets)}` : ''}.</div>`); const routes=(g.routeSummaries||[]).map(r=>`${r.routeKind==='story'?'Story':'/chat'}: ${r.count} gen · ${(r.avgLongTaskMs/1000).toFixed(2)}s avg${r.maxMounted!=null?` · mounted ${r.minMounted}-${r.maxMounted}`:''}${r.mountedMessageScaling?` · slope ${r.mountedMessageScaling.slope.toFixed(1)} ms/msg`:''}`).join(' | '); if(routes) extra.push(`<div><strong>Generation render by route:</strong> ${esc(routes)}.</div>`); }
   if (s.generationRender?.replyTextObservations) { const g=s.generationRender;extra.push(`<div><strong>Exact reply text witness:</strong> ${g.replyTextObservations} reply container(s) with nonempty text and layout geometry · ${g.replyTextAfterResponseSamples} observed after response${g.medianReplyTextObservedMs!=null?` (median ${g.medianReplyTextObservedMs.toFixed(0)}ms)`:''} · ${g.replyTextAlreadyPresentAtResponse} already present at response. <em>Observation is not first paint or verified screen visibility. Content is not saved.</em></div>`); }
-  if (s.workerResources?.requests) { const top=(s.workerResources.top||[]).slice(0,4).map(x=>`${x.workerRole} ${x.endpointGroup}: ${x.requests} req · avg ${x.avgDurationMs.toFixed(0)}ms · max ${x.maxDurationMs.toFixed(0)}ms`).join(' | '); extra.push(`<div><strong>QoL worker resources:</strong> ${s.workerResources.requests.toLocaleString()} aggregated request timing(s) in ${s.workerResources.summaryEvents} summary event(s)${top?` · ${esc(top)}`:''}.</div>`); }
+  if (s.workerResources?.requests) { const w=s.workerResources,top=(w.top||[]).slice(0,4).map(x=>`${x.workerRole} ${x.endpointGroup}: ${x.requests} timing(s) · avg ${x.avgDurationMs.toFixed(0)}ms · max ${x.maxDurationMs.toFixed(0)}ms`).join(' | '); extra.push(`<div><strong>QoL worker resources:</strong> ${w.requests.toLocaleString()} Resource Timing observation(s) across ${w.pagesWithSummary} page(s) in ${w.summaryEvents} summary event(s) · ${w.staticAssetTimingObservations} static/third-party timing(s), ${w.apiTimingObservations} API timing(s)${top?` · ${esc(top)}`:''}. <em>Timing observations can overlap observed HTTP responses; these are not unique requests.</em></div>`); }
   if (s.recentPerformance?.available) { const r=s.recentPerformance.recent,p=s.recentPerformance.previous,mins=s.recentPerformance.windowMs/60000; extra.push(`<div><strong>Recent performance:</strong> last ${mins.toFixed(0)}m Long Tasks ${(r.longTaskMs/1000).toFixed(1)}s vs prior ${(p.longTaskMs/1000).toFixed(1)}s${s.recentPerformance.longTaskRatio!=null ? ` (${s.recentPerformance.longTaskRatio.toFixed(1)}×)` : ''} · LoAF block ${(r.loafBlockingMs/1000).toFixed(1)}s vs ${(p.loafBlockingMs/1000).toFixed(1)}s · DOM ${r.domMutations.toLocaleString()} vs ${p.domMutations.toLocaleString()} · generations ${r.generations} vs ${p.generations}.</div>`); }
   if (s.autoLagSpikes?.count) extra.push(`<div><strong>Automatic lag spikes:</strong> ${s.autoLagSpikes.count} trigger(s) captured; each adds immediate + 10s page-pressure context with a 30s cooldown.</div>`);
   if (s.pageHotspots?.length) extra.push(`<div><strong>Worst page instance:</strong> ${esc(s.pageHotspots[0].dominantRoute || routeLabel(s.pageHotspots[0].pageUrl))} · ${(s.pageHotspots[0].longTaskMs/1000).toFixed(1)}s Long Tasks / ${s.pageHotspots[0].longTasks} · ${s.pageHotspots[0].domMutations.toLocaleString()} mutations over ${(s.pageHotspots[0].durationMs/60000).toFixed(1)}m${s.pageHotspots[0].routeChanges ? ` · ${s.pageHotspots[0].routeChanges} SPA route change(s)` : ''}.</div>`);
@@ -3432,7 +3606,7 @@ function sanitizeSettingsForExport(value) {
   const out=exportPick(v,['version','show_nsfw','auto_response_enabled','tts_include_narration']);
   if(v.selected_languages!==undefined) out.selected_languages=exportPrivateMeta(v.selected_languages,'selected-languages');
   if(v.selected_tags!==undefined) out.selected_tags=exportPrivateMeta(v.selected_tags,'selected-tags');
-  if(v.liked_bots!==undefined) out.liked_bots={redacted:true,kind:'liked-bots',count:Array.isArray(v.liked_bots)?v.liked_bots.length:null,fingerprint:exportFingerprintValue(v.liked_bots)};
+  if(v.liked_bots!==undefined) out.liked_bots={redacted:true,kind:'liked-bots',count:Number.isFinite(v.liked_bots?.count)?v.liked_bots.count:Array.isArray(v.liked_bots)?v.liked_bots.length:null,fingerprint:v.liked_bots?.redacted===true?(v.liked_bots.fingerprint||null):exportFingerprintValue(v.liked_bots)};
   if(v.userId!==undefined) out.userId=exportPrivateMeta(v.userId,'user-id');
   out._inspectorPrivacy={redacted:true,policy:'user-settings-metadata-only',keyCount:Object.keys(v).length};
   return out;
@@ -3540,9 +3714,39 @@ function sanitizePrivateApiBodyForExport(value, kind) {
   return sanitizePrivateRecordForExport(parsed.value, kind);
 }
 
+function sanitizeSearchForExport(value,role){
+  if(value==null)return value;
+  let v=value;
+  if(typeof v==='string'){try{v=JSON.parse(v);}catch(_){return {_inspectorPrivacy:{redacted:true,policy:'typesense-metadata-only',parseFailed:true}};}}
+  if(!v||typeof v!=='object')return {_inspectorPrivacy:{redacted:true,policy:'typesense-metadata-only',parseFailed:true}};
+  if(v.__duplicate_body__===true)return {__duplicate_body__:true,fingerprint:typeof v.fingerprint==='string'?v.fingerprint:null,_inspectorPrivacy:{redacted:true,policy:'typesense-metadata-only'}};
+  const out={_inspectorPrivacy:{redacted:true,policy:'typesense-metadata-only'}};
+  if(role==='request'&&Array.isArray(v.searches)){
+    out.searchCount=v.searches.length;
+    out.searches=v.searches.slice(0,20).map(x=>{
+      const filter=typeof x?.filter_by==='string'?x.filter_by:'';
+      const ids=/character_id:\[([^\]]*)\]/i.exec(filter);
+      return {collection:typeof x?.collection==='string'?x.collection.slice(0,90):null,
+        page:Number.isFinite(x?.page)?x.page:null,per_page:Number.isFinite(x?.per_page)?x.per_page:null,
+        requestedCharacterIds:Number.isFinite(x?.requestedCharacterIds)?x.requestedCharacterIds:ids?(ids[1].match(/\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b/gi)||[]).length:null,
+        filterPresent:typeof x?.filterPresent==='boolean'?x.filterPresent:!!filter,
+        filterClauseNames:(Array.isArray(x?.filterClauseNames)?x.filterClauseNames:[...new Set([...filter.matchAll(/(?:^|&&)\s*([a-z][a-z0-9_]*)\s*:/gi)].map(m=>m[1].toLowerCase()))]).filter(k=>/^[a-z0-9_]{1,48}$/.test(k)).slice(0,24)};
+    });
+  }
+  if(role==='response'&&Array.isArray(v.results)){
+    out.resultCount=v.results.length;
+    out.results=v.results.slice(0,20).map(x=>({found:Number.isFinite(x?.found)?x.found:null,
+      hits:{count:Array.isArray(x?.hits)?x.hits.length:Number.isFinite(x?.hits?.count)?x.hits.count:null},
+      out_of:Number.isFinite(x?.out_of)?x.out_of:null,page:Number.isFinite(x?.page)?x.page:null,
+      error:x?.error!=null?{reported:true}:null}));
+  }
+  return out;
+}
+
 function sanitizeNetworkPayloadForExport(value,{url,role,status}){
   if(value==null)return value;
   const path=exportNetworkPath(url);
+  if(/\/multi_search\/?$/i.test(path))return sanitizeSearchForExport(value,role);
   if(isNativeMemoryApiExportUrl(url))return sanitizePrivateApiBodyForExport(value,'native-memory');
   if(isRulebookApiExportUrl(url))return sanitizePrivateApiBodyForExport(value,'rulebook');
   if(role==='response'&&Number(status)>=400)return sanitizeErrorForExport(value);
@@ -3584,6 +3788,10 @@ function applyNetworkExportPrivacy(event){
     if(Array.isArray(safe.signals))safe.signals=[];
     safe.rulebookPrivacy={redacted:true,policy:'authored-text-metadata-only'};
     return safe;
+  }
+  if(/\/multi_search\/?$/i.test(exportNetworkPath(url))){
+    if(Array.isArray(safe.signals))safe.signals=[];
+    safe.searchPrivacy={redacted:true,policy:'typesense-metadata-only'};
   }
   if(safe.requestBody!=null)safe.requestBody=sanitizeNetworkPayloadForExport(safe.requestBody,{url,role:'request',status:safe.status});
   if(safe.body!=null){const role=/(?:request|incomplete)$/.test(subtype)&&!/response$/.test(subtype)?'request':'response';safe.body=sanitizeNetworkPayloadForExport(safe.body,{url,role,status:safe.status});}
@@ -3657,8 +3865,9 @@ async function exportJson() {
       exportedAt: new Date().toISOString(), extension: 'SpicyChat Inspector', version, shareSafePseudonymized:shareSafe,
       storedEvents: total,
       note: 'Defense-in-depth sanitization is applied at capture/storage and again during export. Sensitive network payloads are metadata-only by default: chat text/history, persona text, account/profile fields, character-authoring text, Rulebook instructions/descriptions/labels, image uploads, third-party payloads, Lorebook entry content/keywords and native Memory text are redacted while diagnostic counts/IDs/status/model fields and fingerprints are retained where useful. Confirmed first-message render timing excludes unverified DOM signals. Export reads IndexedDB directly and uses gzip when supported. DOM batches retain aggregate counts but only a compact representative sample. Attribution is evidence-based.',
-      summaryScope: 'full capture compact projection', loadedSampleEvents: allEvents.length,
-      networkPrivacyPolicy: { chatText:'redacted', conversationHistory:'metadata-only', personaText:'metadata-only', accountProfile:'metadata-only', characterAuthoringText:'metadata-only', rulebookAuthoredText:'metadata-only', lorebookEntryContent:'redacted', lorebookEntryKeywords:'redacted', nativeMemoryContent:'redacted', urlQueryValues:'redacted', urlFragments:'redacted', imageUploads:'metadata-only', thirdPartyBodies:'metadata-only', retainedDiagnostics:['IDs where useful','status/error codes','model/inference settings','NSFW flags','timestamps','lengths/counts','fnv1a32 fingerprints'] },
+      summaryScope: 'full capture compact projection (not raw event count)', loadedSampleEvents: allEvents.length,
+      eventCountScopes:{storedEvents:total,fullProjectionEvents:fullCaptureVersions.summary?.totalEvents??null,recentLoadedSampleEvents:allEvents.length,projectionOmitsLowValueEvents:true},
+      networkPrivacyPolicy: { chatText:'redacted', conversationHistory:'metadata-only', personaText:'metadata-only', accountProfile:'metadata-only', characterAuthoringText:'metadata-only', rulebookAuthoredText:'metadata-only', lorebookEntryContent:'redacted', lorebookEntryKeywords:'redacted', nativeMemoryContent:'redacted', urlQueryValues:'redacted', urlFragments:'redacted', imageUploads:'metadata-only', thirdPartyBodies:'metadata-only', typesenseSearch:'metadata-only (counts, no favorite IDs/hits)', retainedDiagnostics:['IDs where useful','status/error codes','model/inference settings','NSFW flags','timestamps','lengths/counts','fnv1a32 fingerprints'] },
       lorebookPrivacyPolicy: { entryContent: 'redacted', entryKeywords: 'redacted', retainedDiagnostics: ['IDs','names','versions','timestamps','lengths/counts','fnv1a32 fingerprints'], scope: 'SpicyChat /lorebooks API request/response bodies' },
       summary: fullCaptureVersions.summary,
       diagnosticConsistencyWarnings: fullCaptureVersions.summary?.diagnosticConsistencyWarnings || [],

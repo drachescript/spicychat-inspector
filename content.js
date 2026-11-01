@@ -15,6 +15,11 @@
       const u = new URL(location.href);
       if (u.searchParams.get('dsQolBotStatusWorker') === '1') return 'qol-bot-status-worker';
       if (u.searchParams.get('dsQolRecommendationWorker') === '1' || u.searchParams.get('dsQuickDislike') === '1') return 'qol-recommendation-worker';
+      if (u.searchParams.get('dsQuickLessLike') === '1' || u.searchParams.get('dsQolQuickDislikeWorker') === '1' || u.searchParams.get('dsQolQuickLessLikeWorker') === '1') return 'qol-recommendation-worker';
+      if (u.searchParams.get('dsQolBotBackupWorker') === '1') return 'qol-bot-backup-worker';
+      if (u.searchParams.get('dsQolLorebookBackupWorker') === '1' || u.searchParams.get('dsQolLorebookExport') === '1') return 'qol-lorebook-backup-worker';
+      if (u.searchParams.get('dsQolListingRefillWorker') === '1' || u.searchParams.get('dsListingRefill') === '1' || u.searchParams.get('dsListFill') === '1') return 'qol-listing-refill-worker';
+      if (u.searchParams.get('dsQolPersonaRefresh') === '1') return 'qol-persona-refresh-worker';
     } catch (_) {}
     return null;
   }
@@ -234,7 +239,8 @@
 // Keep only bounded parameter names and explicit non-sensitive worker flags.
 const INSPECTOR_SAFE_WORKER_QUERY = new Set([
   'dsQolRecommendationWorker','dsQolBotStatusWorker','dsQuickDislike',
-  'dsQolLorebookClone','dsQolWorkerLight','dsListingRefill'
+  'dsQolLorebookClone','dsQolWorkerLight','dsListingRefill',
+  'dsQolBotBackupWorker','dsQolLorebookBackupWorker','dsQolLorebookExport','dsQolListingRefillWorker','dsListFill','dsQuickLessLike','dsQolQuickDislikeWorker','dsQolQuickLessLikeWorker','dsQolPersonaRefresh'
 ]);
 function inspectorSafeUrl(value) {
   const source = String(value || '');
@@ -276,6 +282,7 @@ function inspectorRedactUrlsInText(value) {
 
   function redactString(s) {
     if (typeof s !== 'string') return s;
+    s = s.replace(/(x-typesense-api-key\s*[:=]\s*[\"']?)[^\s&\"',}]+/gi, '$1[REDACTED]');
     return inspectorRedactUrlsInText(s.replace(JWT_RE, '[REDACTED_JWT]').replace(BEARER_RE, 'Bearer [REDACTED]').replace(URLENC_SECRET_RE, (m, p, k) => `${p}${k}=[REDACTED]`).replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`).replace(PRIVATE_IDENTIFIER_VALUE_RE, (m, prefix) => `${prefix}[REDACTED]`));
   }
 
@@ -700,13 +707,30 @@ function inspectorRedactUrlsInText(value) {
   }
 
   function normalizeWorkerEndpoint(name) {
+    // Worker startup creates many distinct asset URLs. Group these coarsely;
+    // preserve named API paths where timing diagnosis needs that detail.
+    // No additional observers, DOM reads or network calls are needed.
     try {
       const u = new URL(name, location.href);
-      let path = u.pathname
-        .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ig, ':id')
-        .replace(/\/\d{4,}(?=\/|$)/g, '/:n');
-      return `${u.hostname}${path}`.slice(0, 300);
-    } catch (_) { return String(name || '').slice(0, 300); }
+      const host = u.hostname.toLowerCase();
+      const path = u.pathname;
+      if (/(^|\.)spicychat\.ai$/.test(host)) {
+        if (/^\/assets\//i.test(path)) return 'spicychat.ai/assets/*';
+        if (/^\/cdn-cgi\//i.test(path)) return 'spicychat.ai/cdn-cgi/*';
+        if (/^\/(?:api|users|chats|chatbot|v\d+|multi_search)(?:\/|$)/i.test(path)) {
+          return `${host}${path.replace(/[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}/ig, ':id').replace(/\/\d{4,}(?=\/|$)/g, '/:n')}`.slice(0, 180);
+        }
+        return 'spicychat.ai/app-shell/*';
+      }
+      if (/^(?:prod|ts-lb)\.nd-api\.com$/.test(host)) {
+        return `${host}${path.replace(/[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}/ig, ':id').replace(/\/\d{4,}(?=\/|$)/g, '/:n')}`.slice(0, 180);
+      }
+      if (/(^|\.)nd-api\.com$/.test(host)) return 'spicychat-cdn-or-other-api/*';
+      if (/(^|\.)recombee\.com$/.test(host)) return /\/ratings\/?$/i.test(path) ? 'recombee.com/ratings/*' : 'recombee.com/other-api/*';
+      if (/^(?:fonts\.googleapis\.com|fonts\.gstatic\.com)$/.test(host)) return 'google-fonts/*';
+      if (/(?:cloudflareinsights|googletagmanager|google-analytics|doubleclick|sentry|clarity\.ms)/i.test(host)) return 'third-party/analytics/*';
+      return 'third-party/other/*';
+    } catch (_) { return 'unclassified-resource'; }
   }
 
   function workerResourceGroup(entry) {
@@ -1090,7 +1114,7 @@ function inspectorRedactUrlsInText(value) {
 
   function isNormalChatRoute() { return /^\/chat\//.test(location.pathname); }
   function isStoryRoute() { return /^\/story\//.test(location.pathname); }
-  function isQolWorkerPage() { return PAGE_ROLE === 'qol-bot-status-worker' || PAGE_ROLE === 'qol-recommendation-worker'; }
+  function isQolWorkerPage() { return !!PAGE_ROLE?.startsWith('qol-') && PAGE_ROLE.endsWith('-worker'); }
   function mountedMessageKind() { return isStoryRoute() ? 'story' : (isNormalChatRoute() ? 'chat' : null); }
 
   function domTextMeta(value) {
@@ -2524,7 +2548,10 @@ function inspectorRedactUrlsInText(value) {
           maybeProactiveClearResourceTimings();
           const thirdParty = (() => { try { return !isSpicyChatCoreHost(new URL(e.name).hostname); } catch (_) { return false; } })();
           const workerGroup = workerResourceGroup(e);
-          const workerOutlier = Number(e.duration || 0) >= 1500 || recentLongTasks.some(x => Date.now() - x.ts <= 1500);
+          // Only API outliers deserve their own record. A nearby Long Task
+          // should not force every static asset into individual events.
+          const workerApi = !!workerGroup && /(?:nd-api\.com|recombee\.com|\/api\/|\/v\d+\/|\/multi_search)/i.test(workerGroup.endpointGroup);
+          const workerOutlier = workerApi && Number(e.duration || 0) >= 1500;
           if (workerGroup && !workerOutlier) {
             aggregateWorkerResource(e, workerGroup);
             continue;

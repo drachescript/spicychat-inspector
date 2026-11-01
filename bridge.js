@@ -164,7 +164,59 @@
     } catch (_) { return null; }
   }
 
-  function parseBodyText(text, contentType = '') {
+  // v0.1.4: aggregate sensitive, potentially huge favorites and Typesense bodies
+  // in the page before they cross the window message bridge. Do not store IDs,
+  // individual search hits, names, query strings, or raw filter values.
+  const SEARCH_ID_RE = /\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b/gi;
+  function compactSearchEnvelope(value, url, role) {
+    let path = '';
+    try { path = new URL(String(url || ''), location.href).pathname; } catch (_) {}
+    if (!/\/(?:multi_search|users\/settings)\/?$/i.test(path)) return null;
+    if (typeof value === 'string') {
+      try { value = JSON.parse(value); } catch (_) {
+        return { _inspectorPrivacy: { redacted:true, policy:'favorites-search-unparseable', parseFailed:true } };
+      }
+    }
+    if (!value || typeof value !== 'object') return { _inspectorPrivacy: {redacted:true,policy:'favorites-search-unexpected-body'} };
+    if (/\/users\/settings\/?$/i.test(path)) {
+      if (role !== 'response') return null;
+      const liked = value.liked_bots;
+      return {
+        version: typeof value.version === 'number' ? value.version : null,
+        show_nsfw: typeof value.show_nsfw === 'boolean' ? value.show_nsfw : null,
+        liked_bots: liked && liked.redacted === true ? liked : {
+          redacted:true,kind:'liked-bots',count:Array.isArray(liked)?liked.length:null,
+          fingerprint:Array.isArray(liked)?fingerprintText(liked):null
+        },
+        _inspectorPrivacy:{redacted:true,policy:'user-settings-metadata-only',keyCount:Object.keys(value).length}
+      };
+    }
+    const safeResults = Array.isArray(value.results) ? value.results.slice(0,20).map(v => ({
+      found:Number.isFinite(v?.found)?v.found:null,
+      hits:Array.isArray(v?.hits)?{count:v.hits.length}:null,
+      out_of:Number.isFinite(v?.out_of)?v.out_of:null,
+      page:Number.isFinite(v?.page)?v.page:null,
+      error:v?.error != null ? {reported:true} : null
+    })) : null;
+    const safeSearches = Array.isArray(value.searches) ? value.searches.slice(0,20).map(v => {
+      const filter=typeof v?.filter_by==='string'?v.filter_by:'';
+      const matches=filter.match(/character_id:\[([^\]]*)\]/i);
+      return {
+        collection:typeof v?.collection==='string'?v.collection.slice(0,90):null,
+        per_page:Number.isFinite(v?.per_page)?v.per_page:null,
+        page:Number.isFinite(v?.page)?v.page:null,
+        requestedCharacterIds:matches?(matches[1].match(SEARCH_ID_RE)||[]).length:null,
+        filterPresent:!!filter,
+        filterClauseNames:[...new Set([...filter.matchAll(/(?:^|&&)\s*([a-z][a-z0-9_]*)\s*:/gi)].map(x=>x[1].toLowerCase()))].slice(0,24)
+      };
+    }) : null;
+    const out={_inspectorPrivacy:{redacted:true,policy:'typesense-metadata-only'},searchCount:safeSearches?.length??null,resultCount:safeResults?.length??null};
+    if(safeSearches)out.searches=safeSearches;
+    if(safeResults)out.results=safeResults;
+    return out;
+  }
+
+  function parseBodyText(text, contentType = '', url = '', role = 'response') {
     if (typeof text !== 'string') return text;
     // Parse the original JSON before masking inline IDs: replacing a bare
     // numeric userId inside JSON text would otherwise invalidate the JSON.
@@ -174,6 +226,8 @@
     if (/json|graphql/i.test(contentType) || trimmed.startsWith('{') || trimmed.startsWith('[')) {
       try { parsed = JSON.parse(trimmed); } catch (_) {}
     }
+    const compact = compactSearchEnvelope(parsed === undefined ? trimmed : parsed, url, role);
+    if (compact) return compact;
     const safeParsed = parsed === undefined ? undefined : sanitize(parsed);
     const safeText = redactString(text);
     if (safeText.length > MAX_BODY) {
@@ -187,11 +241,11 @@
     return safeParsed ?? safeText;
   }
 
-  function bodyFromInit(body) {
+  function bodyFromInit(body, url = '') {
     if (body == null) return null;
     if (typeof body === 'string') {
       const trimmed = body.trim();
-      if (trimmed.startsWith('{') || trimmed.startsWith('[')) return parseBodyText(body, 'application/json');
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) return parseBodyText(body, 'application/json', url, 'request');
       if (/^[^=&\s]+=[^&]*(?:&[^=&\s]+=[^&]*)*$/.test(trimmed)) {
         try {
           const out = {};
@@ -275,7 +329,7 @@
       const method = init?.method || input?.method || 'GET';
       const requestId = nextRequestId('f');
       const initiator = shortInitiatorStack();
-      const requestBody = bodyFromInit(init?.body);
+      const requestBody = bodyFromInit(init?.body, requestedUrl);
       const initiatorHint = initiatorSourceHint(initiator);
       emit({ type: 'network', subtype: 'fetch-request', requestId, method, url: requestedUrl, requestedUrl, headers: headersToObject(init?.headers || input?.headers), body: requestBody, requestFingerprint: fingerprintText(`${method}|${requestedUrl}|${JSON.stringify(requestBody ?? null)}`), initiator: initiatorHint === 'extension' ? initiator : null, initiatorSourceHint: initiatorHint });
       try {
@@ -298,7 +352,7 @@
           const clone = response.clone();
           const ct = meta.contentType;
           if (/json|text|javascript|graphql|xml|html/i.test(ct)) {
-            clone.text().then(text => emit({ ...meta, responseChars: text.length, responseFingerprint: fingerprintText(redactString(text)), body: parseBodyText(text, ct) })).catch(() => emit(meta));
+            clone.text().then(text => emit({ ...meta, responseChars: text.length, responseFingerprint: fingerprintText(redactString(text)), body: parseBodyText(text, ct, meta.finalUrl, 'response') })).catch(() => emit(meta));
           } else emit(meta);
         } catch (_) { emit(meta); }
         return response;
@@ -329,7 +383,7 @@
       meta.started = performance.now();
       meta.startedAt = meta.started;
       this.addEventListener('abort', () => { meta.aborted = true; }, { once: true });
-      const requestBody = bodyFromInit(body);
+      const requestBody = bodyFromInit(body, meta.requestedUrl);
       const xhrInitiatorHint = initiatorSourceHint(meta.initiator);
       emit({ type: 'network', subtype: 'xhr-request', requestId: meta.requestId, method: meta.method, url: meta.url, requestedUrl: meta.requestedUrl || meta.url, headers: meta.headers, body: requestBody, requestFingerprint: fingerprintText(`${meta.method}|${meta.requestedUrl || meta.url}|${JSON.stringify(requestBody ?? null)}`), initiator: xhrInitiatorHint === 'extension' ? meta.initiator : null, initiatorSourceHint: xhrInitiatorHint });
       this.addEventListener('loadend', () => {
@@ -352,9 +406,9 @@
             const text = this.responseText || '';
             responseChars = text.length;
             responseFingerprint = fingerprintText(redactString(text));
-            responseBody = parseBodyText(text, ct);
+            responseBody = parseBodyText(text, ct, this.responseURL || meta.requestedUrl, 'response');
           } else if (this.responseType === 'json') {
-            responseBody = this.response;
+            responseBody = compactSearchEnvelope(this.response, this.responseURL || meta.requestedUrl, 'response') || this.response;
             responseFingerprint = fingerprintText(sanitize(this.response));
           }
           else responseBody = `[${this.responseType || 'unknown'} response]`;

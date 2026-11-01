@@ -13,6 +13,7 @@ const NETWORK_PRIVACY_MIGRATION_KEY = 'sci_network_privacy_migrated_0037_ruleboo
 const REQUEST_IDENTIFIER_PRIVACY_MIGRATION_KEY = 'sci_request_identifier_privacy_migrated_0100';
 const NATIVE_MEMORY_PRIVACY_MIGRATION_KEY = 'sci_native_memory_privacy_migrated_0101';
 const URL_PRIVACY_MIGRATION_KEY = 'sci_url_query_privacy_migrated_0122';
+const FAVORITES_SEARCH_PRIVACY_MIGRATION_KEY = 'sci_favorites_search_privacy_migrated_0140';
 
 const DEFAULT_SETTINGS = {
   recording: true,
@@ -85,20 +86,38 @@ function isMirroredDriverDuplicate(event) {
   const targetTs = Number(event.driverTs) || Number(event.ts) || Date.now();
   return list.some(x => Math.abs((Number(x.ts) || 0) - targetTs) <= 15000);
 }
-function recommendationWorkerRoleFromUrl(url) {
-  if (!url) return null;
+function inspectorWorkerRoleFromUrl(raw) {
+  if (!raw) return null;
   try {
-    const u = new URL(String(url));
-    if (u.searchParams.get('dsQolBotStatusWorker') === '1') return 'qol-bot-status-worker';
-    if (u.searchParams.get('dsQolRecommendationWorker') === '1') return 'qol-recommendation-worker';
-    if (u.searchParams.get('dsQuickDislike') === '1') return 'qol-recommendation-worker';
-  } catch (_) {
-    const raw = String(url);
-    if (/(?:[?&])dsQolBotStatusWorker=1(?:&|$)/.test(raw)) return 'qol-bot-status-worker';
-    if (/(?:[?&])dsQolRecommendationWorker=1(?:&|$)/.test(raw) || /(?:[?&])dsQuickDislike=1(?:&|$)/.test(raw)) return 'qol-recommendation-worker';
-  }
+    const u = new URL(String(raw), 'https://spicychat.ai');
+    if (!/(?:^|\.)spicychat\.ai$/i.test(u.hostname)) return null;
+    // Preserve role identity even in older exports with [REDACTED] query values.
+    // Presence is only accepted for known helper markers on SpicyChat pages.
+    const flags = [
+      ['dsQolBotStatusWorker', 'qol-bot-status-worker'],
+      ['dsQolRecommendationWorker', 'qol-recommendation-worker'],
+      ['dsQuickDislike', 'qol-recommendation-worker'],
+      ['dsQuickLessLike', 'qol-recommendation-worker'],
+      ['dsQolQuickDislikeWorker', 'qol-recommendation-worker'],
+      ['dsQolQuickLessLikeWorker', 'qol-recommendation-worker'],
+      ['dsQolBotBackupWorker', 'qol-bot-backup-worker'],
+      ['dsQolLorebookBackupWorker', 'qol-lorebook-backup-worker'],
+      ['dsQolLorebookExport', 'qol-lorebook-backup-worker'],
+      ['dsQolListingRefillWorker', 'qol-listing-refill-worker'],
+      ['dsListingRefill', 'qol-listing-refill-worker'],
+      ['dsListFill', 'qol-listing-refill-worker'],
+      ['dsQolPersonaRefresh', 'qol-persona-refresh-worker'],
+    ];
+    for (const [param, role] of flags) {
+      const value = u.searchParams.get(param);
+      if (value === '1' || value === '[REDACTED]') return role;
+    }
+  } catch (_) {}
   return null;
 }
+
+function recommendationWorkerRoleFromUrl(url) { return inspectorWorkerRoleFromUrl(url); }
+
 function rememberTabPageRole(tabId, pageId, role) {
   if (!Number.isInteger(tabId) || tabId < 0 || !pageId) return;
   if (role) tabPageRoles.set(tabId, { pageId, role, detectedAt: Date.now() });
@@ -269,7 +288,8 @@ const SIGNAL_KEY_RE = /^(is_nsfw|isNsfwEnabled|moderation_status|moderationStatu
 // Keep only bounded parameter names and explicit non-sensitive worker flags.
 const INSPECTOR_SAFE_WORKER_QUERY = new Set([
   'dsQolRecommendationWorker','dsQolBotStatusWorker','dsQuickDislike',
-  'dsQolLorebookClone','dsQolWorkerLight','dsListingRefill'
+  'dsQolLorebookClone','dsQolWorkerLight','dsListingRefill',
+  'dsQolBotBackupWorker','dsQolLorebookBackupWorker','dsQolLorebookExport','dsQolListingRefillWorker','dsListFill','dsQuickLessLike','dsQolQuickDislikeWorker','dsQolQuickLessLikeWorker','dsQolPersonaRefresh'
 ]);
 function inspectorSafeUrl(value) {
   const source = String(value || '');
@@ -311,6 +331,7 @@ function inspectorRedactUrlsInText(value) {
 
 function redactString(s) {
   if (typeof s !== 'string') return s;
+  s = s.replace(/(x-typesense-api-key\s*[:=]\s*[\"']?)[^\s&\"',}]+/gi, '$1[REDACTED]');
   return inspectorRedactUrlsInText(s.replace(JWT_RE, '[REDACTED_JWT]').replace(BEARER_RE, 'Bearer [REDACTED]').replace(URLENC_SECRET_RE, (m, p, k) => `${p}${k}=[REDACTED]`).replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`).replace(PRIVATE_IDENTIFIER_VALUE_RE, (m, prefix) => `${prefix}[REDACTED]`));
 }
 
@@ -649,7 +670,7 @@ function sanitizeUserSettingsPayload(value) {
   const out = pickObjectFields(v, ['version','show_nsfw','auto_response_enabled','tts_include_narration']);
   if (v.selected_languages !== undefined) out.selected_languages = bodyPrivacyMeta(v.selected_languages, 'selected-languages');
   if (v.selected_tags !== undefined) out.selected_tags = bodyPrivacyMeta(v.selected_tags, 'selected-tags');
-  if (v.liked_bots !== undefined) out.liked_bots = { redacted: true, kind: 'liked-bots', count: Array.isArray(v.liked_bots) ? v.liked_bots.length : null, fingerprint: fingerprintDiagnosticValue(v.liked_bots) };
+  if (v.liked_bots !== undefined) out.liked_bots = { redacted: true, kind: 'liked-bots', count: Number.isFinite(v.liked_bots?.count) ? v.liked_bots.count : Array.isArray(v.liked_bots) ? v.liked_bots.length : null, fingerprint: v.liked_bots?.redacted === true ? (v.liked_bots.fingerprint || null) : fingerprintDiagnosticValue(v.liked_bots) };
   if (v.userId !== undefined) out.userId = bodyPrivacyMeta(v.userId, 'user-id');
   out._inspectorPrivacy = { redacted: true, policy: 'user-settings-metadata-only', keyCount: Object.keys(v).length };
   return out;
@@ -767,12 +788,52 @@ function sanitizeNativeMemoryBody(value) {
   // dates, booleans, the memory type and redacted content length/fingerprint.
   return sanitizePrivateApiBody(value, 'native-memory');
 }
+// Strict allowlist: raw Typesense filters and hit documents can expose thousands
+// of favorite IDs and bot metadata, and overwhelm long-running captures.
+function sanitizeSearchPayload(value, role) {
+  const parsed=parsePrivacyBody(value);
+  if(parsed.parseFailed || !parsed.value || typeof parsed.value!=='object')
+    return {_inspectorPrivacy:{redacted:true,policy:'typesense-metadata-only',parseFailed:true}};
+  const v=parsed.value;
+  if(v.__duplicate_body__===true)return {__duplicate_body__:true,fingerprint:typeof v.fingerprint==='string'?v.fingerprint:null,_inspectorPrivacy:{redacted:true,policy:'typesense-metadata-only'}};
+  const clean={_inspectorPrivacy:{redacted:true,policy:'typesense-metadata-only'}};
+  if(role==='request' && Array.isArray(v.searches)) {
+    clean.searchCount=v.searches.length;
+    clean.searches=v.searches.slice(0,20).map(x=>{
+      const filter=typeof x?.filter_by==='string'?x.filter_by:'';
+      const clause=/character_id:\[([^\]]*)\]/i.exec(filter);
+      return {
+        collection: typeof x?.collection==='string'?x.collection.slice(0,90):null,
+        page:Number.isFinite(x?.page)?x.page:null,
+        per_page:Number.isFinite(x?.per_page)?x.per_page:null,
+        requestedCharacterIds:Number.isFinite(x?.requestedCharacterIds)?x.requestedCharacterIds:clause?(clause[1].match(/\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b/gi)||[]).length:null,
+        filterPresent:typeof x?.filterPresent==='boolean'?x.filterPresent:!!filter,
+        filterClauseNames:(Array.isArray(x?.filterClauseNames)?x.filterClauseNames:
+          [...new Set([...filter.matchAll(/(?:^|&&)\s*([a-z][a-z0-9_]*)\s*:/gi)].map(m=>m[1].toLowerCase()))])
+          .filter(x=>/^[a-z0-9_]{1,48}$/.test(x)).slice(0,24)
+      };
+    });
+  }
+  if(role==='response' && Array.isArray(v.results)) {
+    clean.resultCount=v.results.length;
+    clean.results=v.results.slice(0,20).map(x=>({
+      found:Number.isFinite(x?.found)?x.found:null,
+      hits:{count:Array.isArray(x?.hits)?x.hits.length:Number.isFinite(x?.hits?.count)?x.hits.count:null},
+      out_of:Number.isFinite(x?.out_of)?x.out_of:null,
+      page:Number.isFinite(x?.page)?x.page:null,
+      error:x?.error!=null?{reported:true}:null
+    }));
+  }
+  return clean;
+}
+
 function sanitizeNetworkBodyByEndpoint(value, { url, role, status }) {
   if (value == null) return value;
   const path = networkPathname(url);
   // Rulebooks contain authored instructions in combined_rules, definition,
   // meter labels, conditions, descriptions, and future beta-specific fields.
   // An allowlist-based recursive scrub prevents new fields leaking silently.
+  if (/\/multi_search\/?$/i.test(path)) return sanitizeSearchPayload(value,role);
   if (isNativeMemoryApiUrl(url)) return sanitizeNativeMemoryBody(value);
   if (isRulebookApiUrl(url)) return sanitizePrivateApiBody(value, 'rulebook');
   if (role === 'response' && Number(status) >= 400) return sanitizeErrorPayload(value);
@@ -813,6 +874,10 @@ function applyNetworkPayloadPrivacy(event) {
     // Legacy extracted signals might contain private payload fragments.
     if (Array.isArray(next.signals) && next.signals.length) { next.signals = []; changed = true; }
     next.memoryPrivacy = { redacted: true, policy: 'native-memory-metadata-only' };
+  }
+  if (/\/multi_search\/?$/i.test(networkPathname(url))) {
+    if (Array.isArray(next.signals) && next.signals.length) { next.signals = []; changed = true; }
+    next.searchPrivacy={redacted:true,policy:'typesense-metadata-only'};
   }
   if (isRulebookApiUrl(url)) {
     next.rulebookPrivacy = { redacted: true, policy: 'authored-text-metadata-only' };
@@ -1360,6 +1425,29 @@ async function migrateExistingNativeMemoryPrivacy() {
   await chrome.storage.local.set({ [NATIVE_MEMORY_PRIVACY_MIGRATION_KEY]: { completedAt: Date.now(), scanned, updated } });
 }
 
+async function migrateExistingFavoritesSearchPrivacy() {
+  const state=await chrome.storage.local.get(FAVORITES_SEARCH_PRIVACY_MIGRATION_KEY);
+  if(state[FAVORITES_SEARCH_PRIVACY_MIGRATION_KEY])return;
+  const db=await openDb();let scanned=0,updated=0;
+  await new Promise((resolve,reject)=>{
+    const tx=db.transaction(STORE,'readwrite'),store=tx.objectStore(STORE);
+    const hasIndex=store.indexNames.contains('type');
+    const req=hasIndex?store.index('type').openCursor(IDBKeyRange.only('network')):store.openCursor();
+    req.onsuccess=()=>{
+      const cursor=req.result;if(!cursor)return;
+      const raw=cursor.value;
+      if(raw?.type==='network' && /\/multi_search\/?$/i.test(networkPathname(lorebookUrlFromEvent(raw)))) {
+        scanned++;
+        const applied=applyNetworkPayloadPrivacy(raw);
+        if(applied.changed){applied.event.id=raw.id;cursor.update(applied.event);updated++;}
+      }
+      cursor.continue();
+    };
+    tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);
+  });
+  await chrome.storage.local.set({[FAVORITES_SEARCH_PRIVACY_MIGRATION_KEY]:{completedAt:Date.now(),scanned,updated}});
+}
+
 async function migrateExistingNetworkPrivacy() {
   const state = await chrome.storage.local.get(NETWORK_PRIVACY_MIGRATION_KEY);
   if (state[NETWORK_PRIVACY_MIGRATION_KEY]) return;
@@ -1468,12 +1556,12 @@ async function migrateSettingsFor004() {
   }
 }
 
-chrome.runtime.onInstalled.addListener(() => { migrateExistingEvents().catch(() => {}); migrateExistingLorebookPrivacy().catch(() => {}); migrateExistingStateSnapshotPrivacy().catch(() => {}); migrateExistingDomTextPrivacy().catch(() => {}); migrateExistingNetworkPrivacy().catch(() => {}); migrateExistingRequestIdentifierPrivacy().catch(() => {}); migrateExistingNativeMemoryPrivacy().catch(() => {}); migrateExistingUrlPrivacy().catch(() => {}); migrateSettingsFor004().catch(() => {}); });
+chrome.runtime.onInstalled.addListener(() => { migrateExistingEvents().catch(() => {}); migrateExistingLorebookPrivacy().catch(() => {}); migrateExistingStateSnapshotPrivacy().catch(() => {}); migrateExistingDomTextPrivacy().catch(() => {}); migrateExistingNetworkPrivacy().catch(() => {}); migrateExistingRequestIdentifierPrivacy().catch(() => {}); migrateExistingNativeMemoryPrivacy().catch(() => {}); migrateExistingUrlPrivacy().catch(() => {}); migrateExistingFavoritesSearchPrivacy().catch(() => {}); migrateSettingsFor004().catch(() => {}); });
 migrateExistingEvents().catch(() => {});
 migrateExistingLorebookPrivacy().catch(() => {});
 migrateExistingStateSnapshotPrivacy().catch(() => {});
 migrateExistingDomTextPrivacy().catch(() => {});
-migrateExistingNetworkPrivacy().catch(() => {}); migrateExistingRequestIdentifierPrivacy().catch(() => {}); migrateExistingNativeMemoryPrivacy().catch(() => {}); migrateExistingUrlPrivacy().catch(() => {});
+migrateExistingNetworkPrivacy().catch(() => {}); migrateExistingRequestIdentifierPrivacy().catch(() => {}); migrateExistingNativeMemoryPrivacy().catch(() => {}); migrateExistingUrlPrivacy().catch(() => {}); migrateExistingFavoritesSearchPrivacy().catch(() => {});
 migrateSettingsFor004().catch(() => {});
 
 
