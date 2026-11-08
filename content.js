@@ -228,7 +228,10 @@
   function isPrivateIdentifierKey(k) { return PRIVATE_IDENTIFIER_KEY_RE.test(String(k || '').replace(/[-_]/g, '').toLowerCase()); }
   const PRIVATE_IDENTIFIER_VALUE_RE = /((?:[\"']?(?:x[-_])?(?:guest[-_]?user[-_]?id|guest[-_]?id|user[-_]?id|visitor[-_]?id|device[-_]?id|client[-_]?id|anon(?:ymous)?[-_]?id|install(?:ation)?[-_]?id|fingerprint[-_]?id)[\"']?)\s*[:=]\s*[\"']?)([A-Za-z0-9._~+/=-]+)/gi;
   const SECRET_KEY_RE = /(authorization|cookie|set-cookie|password|passwd|secret|access[_-]?token|refresh[_-]?token|id[_-]?token|session|jwt|csrf|xsrf|api[_-]?key|client[_-]?secret|p?_?psid)/i;
-  function isSecretKey(k) { return SECRET_KEY_RE.test(k) || isPrivateIdentifierKey(k); }
+  function isSecretKey(k) {
+    if (/^(?:typesenseSearchKey|x-typesense-api-key)$/i.test(String(k || ''))) return false;
+    return SECRET_KEY_RE.test(k) || isPrivateIdentifierKey(k);
+  }
   const JWT_RE = /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/g;
   const BEARER_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]{10,}/gi;
   const PSID_VALUE_RE = /\b(psid)([:=])([A-Za-z0-9_-]{8,})/gi;
@@ -282,7 +285,6 @@ function inspectorRedactUrlsInText(value) {
 
   function redactString(s) {
     if (typeof s !== 'string') return s;
-    s = s.replace(/(x-typesense-api-key\s*[:=]\s*[\"']?)[^\s&\"',}]+/gi, '$1[REDACTED]');
     return inspectorRedactUrlsInText(s.replace(JWT_RE, '[REDACTED_JWT]').replace(BEARER_RE, 'Bearer [REDACTED]').replace(URLENC_SECRET_RE, (m, p, k) => `${p}${k}=[REDACTED]`).replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`).replace(PRIVATE_IDENTIFIER_VALUE_RE, (m, prefix) => `${prefix}[REDACTED]`));
   }
 
@@ -693,10 +695,27 @@ function inspectorRedactUrlsInText(value) {
     if (!trackerErrorTimer) trackerErrorTimer = setTimeout(flushTrackerErrors, AGGREGATE_FLUSH_MS);
   }
 
-  function resourceAggregateKey(entry) {
-    let host = 'unknown';
-    try { host = new URL(entry.name, location.href).hostname; } catch (_) {}
-    return `${host}|${entry.initiatorType || 'other'}`;
+  function resourceSummaryInfo(entry, thirdParty) {
+    // The fetch/XHR bridge already records HTTP outcomes. Resource Timing is a
+    // second observation of much of that same traffic; ordinary timings are
+    // cheaper and clearer as grouped statistics, with slow outliers preserved.
+    let host = 'unknown', path = '';
+    try {
+      const u = new URL(entry.name, location.href);
+      host = u.hostname.toLowerCase(); path = u.pathname;
+    } catch (_) {}
+    const api = /^(?:prod|ts-lb)\.nd-api\.com$|(?:^|\.)recombee\.com$/.test(host) ||
+      (/(?:^|\.)spicychat\.ai$/.test(host) && /^\/(?:api|v\d+|users|chat|chats|conversations|multi_search|oauth2)(?:\/|$)/i.test(path));
+    return {
+      host,
+      category: thirdParty ? 'third-party' : (api ? 'api-timing' : 'static-or-app'),
+      endpointGroup: api ? normalizeWorkerEndpoint(entry.name) :
+        (/(?:^|\.)spicychat\.ai$/.test(host) ? normalizeWorkerEndpoint(entry.name) : `${host}/*`)
+    };
+  }
+
+  function resourceAggregateKey(info, entry) {
+    return `${info.category}|${info.endpointGroup}|${entry.initiatorType || 'other'}`;
   }
 
   function quantile(values, p) {
@@ -786,42 +805,45 @@ function inspectorRedactUrlsInText(value) {
     if (resourceAggregateTimer) { clearTimeout(resourceAggregateTimer); resourceAggregateTimer = null; }
     for (const x of resourceAggregates.values()) {
       emit({
-        type: 'performance', subtype: 'resource-summary', thirdParty: true,
-        host: x.host, initiatorType: x.initiatorType, requests: x.requests,
+        type: 'performance', subtype: 'resource-summary', thirdParty: x.category === 'third-party',
+        category: x.category, host: x.host, endpointGroup: x.endpointGroup,
+        initiatorType: x.initiatorType, requests: x.requests,
         totalDurationMs: Math.round(x.totalDurationMs * 10) / 10,
+        avgDurationMs: x.requests ? Math.round(x.totalDurationMs / x.requests * 10) / 10 : 0,
         maxDurationMs: Math.round(x.maxDurationMs * 10) / 10,
+        over500ms: x.over500ms, over1000ms: x.over1000ms,
         totalTransferSize: x.totalTransferSize, firstAt: x.firstAt, lastAt: x.lastAt
       });
     }
     resourceAggregates.clear();
   }
 
-  function aggregateResource(entry) {
+  function aggregateResource(entry, info) {
     const now = Date.now();
-    const key = resourceAggregateKey(entry);
-    let host = 'unknown';
-    try { host = new URL(entry.name, location.href).hostname; } catch (_) {}
-    const x = resourceAggregates.get(key) || { host, initiatorType: entry.initiatorType || null, requests: 0, totalDurationMs: 0, maxDurationMs: 0, totalTransferSize: 0, firstAt: now, lastAt: now };
+    const key = resourceAggregateKey(info, entry);
+    const duration = Number(entry.duration || 0);
+    const x = resourceAggregates.get(key) || {
+      ...info, initiatorType: entry.initiatorType || null, requests: 0,
+      totalDurationMs: 0, maxDurationMs: 0, totalTransferSize: 0,
+      over500ms: 0, over1000ms: 0, firstAt: now, lastAt: now
+    };
     x.requests++;
-    x.totalDurationMs += Number(entry.duration || 0);
-    x.maxDurationMs = Math.max(x.maxDurationMs, Number(entry.duration || 0));
+    x.totalDurationMs += duration;
+    x.maxDurationMs = Math.max(x.maxDurationMs, duration);
+    if (duration >= 500) x.over500ms++;
+    if (duration >= 1000) x.over1000ms++;
     x.totalTransferSize += Number(entry.transferSize || 0);
     x.lastAt = now;
     resourceAggregates.set(key, x);
     if (!resourceAggregateTimer) resourceAggregateTimer = setTimeout(flushResourceAggregates, AGGREGATE_FLUSH_MS);
   }
 
-  function importantResourceTiming(entry, thirdParty) {
+  function importantResourceTiming(entry, info) {
+    // API outliers remain individually useful; routine API timings already
+    // overlap fetch/XHR response records. Ordinary assets should never flood
+    // the event stream solely because a Long Task happened nearby.
     const duration = Number(entry.duration || 0);
-    const transfer = Number(entry.transferSize || 0);
-    let path = '';
-    try { path = new URL(entry.name, location.href).pathname; } catch (_) {}
-    const diagnosticallyImportant = /\/(?:chat|queue|cms\/banners|characters|conversations|users\/settings|oauth2\/token)(?:\/|$)/i.test(path);
-    const nearLag = recentLongTasks.some(x => Date.now() - x.ts <= 1500);
-    const generationWindow = pendingGenerationRenders.size > 0;
-    if (diagnosticallyImportant || nearLag || generationWindow) return true;
-    if (thirdParty) return duration >= 500 || transfer >= 100_000;
-    return duration >= 250 || transfer >= 50_000;
+    return duration >= (info.category === 'api-timing' ? 1500 : 1000);
   }
 
   function maybeProactiveClearResourceTimings() {
@@ -2552,15 +2574,14 @@ function inspectorRedactUrlsInText(value) {
           // should not force every static asset into individual events.
           const workerApi = !!workerGroup && /(?:nd-api\.com|recombee\.com|\/api\/|\/v\d+\/|\/multi_search)/i.test(workerGroup.endpointGroup);
           const workerOutlier = workerApi && Number(e.duration || 0) >= 1500;
-          if (workerGroup && !workerOutlier) {
-            aggregateWorkerResource(e, workerGroup);
+          const info = workerGroup ? null : resourceSummaryInfo(e, thirdParty);
+          const outlier = workerGroup ? workerOutlier : importantResourceTiming(e, info);
+          if (!outlier || (Date.now() < selfThrottleUntil && Number(e.duration || 0) < 3000)) {
+            if (!workerGroup) aggregateResource(e, info);
+            else aggregateWorkerResource(e, workerGroup);
             continue;
           }
-          if (!importantResourceTiming(e, thirdParty) || Date.now() < selfThrottleUntil) {
-            if (thirdParty) aggregateResource(e);
-            continue;
-          }
-          emit({ type: 'performance', subtype: 'resource', name: redactString(e.name), initiatorType: e.initiatorType, durationMs: Math.round(e.duration * 10) / 10, transferSize: e.transferSize || 0, encodedBodySize: e.encodedBodySize || 0, decodedBodySize: e.decodedBodySize || 0, startTimeMs: Math.round(e.startTime * 10) / 10, thirdParty, protocol: e.nextHopProtocol || null, workerRole: workerGroup?.workerRole || null, endpointGroup: workerGroup?.endpointGroup || null, interaction: interactionState() });
+          emit({ type: 'performance', subtype: 'resource', name: redactString(e.name), initiatorType: e.initiatorType, durationMs: Math.round(e.duration * 10) / 10, transferSize: e.transferSize || 0, encodedBodySize: e.encodedBodySize || 0, decodedBodySize: e.decodedBodySize || 0, startTimeMs: Math.round(e.startTime * 10) / 10, thirdParty, protocol: e.nextHopProtocol || null, workerRole: workerGroup?.workerRole || null, endpointGroup: workerGroup?.endpointGroup || info?.endpointGroup || null, interaction: interactionState() });
         }
       });
       resourceObserver.observe({ type: 'resource', buffered: true });

@@ -8,7 +8,7 @@ const SECRET_KEY_RE = /(authorization|cookie|set-cookie|password|passwd|secret|a
 function isSecretKey(k) {
   // These exact, Inspector-generated report fields contain only bounded counts,
   // timestamps and route categories — not session IDs, credentials or cookies.
-  if (k === 'pageStartupSessions' || k === 'pageSessionComparison') return false;
+  if (k === 'pageStartupSessions' || k === 'pageSessionComparison' || /^(?:typesenseSearchKey|x-typesense-api-key)$/i.test(String(k || ''))) return false;
   return k !== 'authInvalidToken' && (SECRET_KEY_RE.test(k) || isPrivateIdentifierKey(k));
 }
 const PSID_VALUE_RE = /\b(psid)([:=])([A-Za-z0-9_-]{8,})/gi;
@@ -59,7 +59,7 @@ function inspectorRedactUrlsInText(value) {
     ? inspectorSafeUrl(safe) : safe;
 }
 
-function redactExportString(value) { return inspectorRedactUrlsInText(String(value ?? '').replace(/(x-typesense-api-key\s*[:=]\s*[\"']?)[^\s&\"',}]+/gi, '$1[REDACTED]').replace(SECRET_VALUE_RE, '[REDACTED]').replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`).replace(PRIVATE_IDENTIFIER_VALUE_RE, (m, prefix) => `${prefix}[REDACTED]`)); }
+function redactExportString(value) { return inspectorRedactUrlsInText(String(value ?? '').replace(SECRET_VALUE_RE, '[REDACTED]').replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`).replace(PRIVATE_IDENTIFIER_VALUE_RE, (m, prefix) => `${prefix}[REDACTED]`)); }
 
 async function msg(data) { const res = await chrome.runtime.sendMessage(data); if (!res?.ok) throw new Error(res?.error || 'Request failed'); return res; }
 function esc(v) { return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -1292,7 +1292,7 @@ async function scanFullCaptureVersionSummary(db, total, button) {
     tx.onerror = () => reject(tx.error);
   });
   const summary = buildSummary(projected);
-  return { eventCount: total, firstTs, lastTs, durationMs: firstTs != null && lastTs != null ? Math.max(0,lastTs-firstTs) : 0, ...buildVersionDiagnostics(projected), quickDislike: summary.quickDislike, recommendationFeedback: summary.recommendationFeedback, nativeCharacterRating:summary.nativeCharacterRating, feedbackTransactionTimeline:summary.feedbackTransactionTimeline, apiEndpointInventory:summary.apiEndpointInventory, nativeMemoryProbe:summary.nativeMemoryProbe, messageBookmarkDiagnostics:summary.messageBookmarkDiagnostics, pageStartupSessions:summary.pageStartupSessions, pageStartupCost:summary.pageStartupCost, pageSessionComparison:summary.pageSessionComparison, lorebookOperations:summary.lorebookOperations, favoritesCoverage:summary.favoritesCoverage, inspectorWorkerActivity:summary.inspectorWorkerActivity, qolTraceAvailability:summary.qolTraceAvailability, rateLimits:summary.rateLimits, captureConfidence:summary.captureConfidence, performanceByContext:summary.performanceByContext, messageRemountPressure:summary.messageRemountPressure, diagnosticConsistencyWarnings: summary.diagnosticConsistencyWarnings, listingRefill: buildListingRefillDiagnostics(projected), captureHealth: summary.captureHealth, scrollAndInput: summary.scrollAndInput, longTaskAttribution: summary.longTaskAttribution, generationRender: buildGenerationRenderDiagnostics(projected), recentPerformance: buildRecentPerformanceComparison(projected), pageHotspots: buildPageInstanceHotspots(projected), pagePressureGrowth: buildPagePressureGrowthDiagnostics(projected), autoLagSpikes: projected.filter(e=>e.type==='performance'&&e.subtype==='auto-lag-spike').length, summary };
+  return { eventCount: total, firstTs, lastTs, durationMs: firstTs != null && lastTs != null ? Math.max(0,lastTs-firstTs) : 0, ...buildVersionDiagnostics(projected), quickDislike: summary.quickDislike, recommendationFeedback: summary.recommendationFeedback, nativeCharacterRating:summary.nativeCharacterRating, feedbackTransactionTimeline:summary.feedbackTransactionTimeline, apiEndpointInventory:summary.apiEndpointInventory, nativeMemoryProbe:summary.nativeMemoryProbe, messageBookmarkDiagnostics:summary.messageBookmarkDiagnostics, pageStartupSessions:summary.pageStartupSessions, pageStartupCost:summary.pageStartupCost, pageSessionComparison:summary.pageSessionComparison, lorebookOperations:summary.lorebookOperations, favoritesCoverage:summary.favoritesCoverage, inspectorWorkerActivity:summary.inspectorWorkerActivity, qolTraceAvailability:summary.qolTraceAvailability, rateLimits:summary.rateLimits, captureConfidence:summary.captureConfidence, performanceByContext:summary.performanceByContext, domRepetition:summary.domRepetition, messageRemountPressure:summary.messageRemountPressure, diagnosticConsistencyWarnings: summary.diagnosticConsistencyWarnings, listingRefill: buildListingRefillDiagnostics(projected), captureHealth: summary.captureHealth, scrollAndInput: summary.scrollAndInput, longTaskAttribution: summary.longTaskAttribution, generationRender: buildGenerationRenderDiagnostics(projected), recentPerformance: buildRecentPerformanceComparison(projected), pageHotspots: buildPageInstanceHotspots(projected), pagePressureGrowth: buildPagePressureGrowthDiagnostics(projected), autoLagSpikes: projected.filter(e=>e.type==='performance'&&e.subtype==='auto-lag-spike').length, summary };
 }
 
 
@@ -2129,6 +2129,8 @@ function buildPageStoragePressureDiagnostics(events) {
   const starts = events.filter(e=>e.type==='lifecycle' && e.subtype==='page-start').slice().sort((a,b)=>eventTs(a)-eventTs(b));
   const writes = events.filter(e=>e.type==='storage' && e.subtype==='localStorage-set');
   const removals = events.filter(e=>e.type==='storage' && e.subtype==='localStorage-remove');
+  const draftRemovalSummaries = events.filter(e=>e.type==='storage' && e.subtype==='sessionStorage-draft-remove-summary');
+  const draftRemovalSingles = events.filter(e=>e.type==='storage' && e.subtype==='sessionStorage-remove' && /(?:^|[.:])chatDraft:/i.test(String(e.key||'')));
   const xhr = events.filter(e=>e.type==='network' && e.subtype==='xhr-response');
   let maxFiveMinuteStarts=0, left=0;
   for (let right=0;right<starts.length;right++) {
@@ -2148,6 +2150,8 @@ function buildPageStoragePressureDiagnostics(events) {
   return {
     pageStarts:starts.length, maxFiveMinutePageStarts:maxFiveMinuteStarts,
     storageSetEvents:writes.length, storageRemoveEvents:removals.length,
+    sessionDraftRemovals:draftRemovalSingles.length + draftRemovalSummaries.reduce((n,e)=>n+(Number(e.removals)||0),0),
+    sessionDraftSummaryEvents:draftRemovalSummaries.length,
     xhrResponses:xhr.length,
     leadingWriteKeys:[...byKey].sort((a,b)=>b[1]-a[1]).slice(0,6).map(([key,count])=>({key,count})),
     interpretation:maxFiveMinuteStarts>=20 ? 'high-page-start-burst' : maxFiveMinuteStarts>=10 ? 'moderate-page-start-burst' : 'no-significant-page-start-burst',
@@ -2432,6 +2436,48 @@ function buildCoverageConfidenceDiagnostics(events,captureHealth) {
     topPages:[...byPage.values()].sort((a,b)=>b.skippedMutationRecords-a.skippedMutationRecords).slice(0,8),
     note:'Skipped records describe Inspector sampling, not missing application mutations in absolute terms. A lack of recorded throttling cannot establish complete coverage. Long Task and DOM comparisons must account for capture gaps.'};
 }
+
+function buildDomRepetitionDiagnostics(events) {
+  // Use Inspector's existing bounded topPatterns samples. Never rescan the DOM.
+  // Pattern totals are observations in summaries, not the total number of
+  // actual DOM operations or evidence that the site/QoL caused a Long Task.
+  const patterns = new Map();
+  let recordedBatches = 0, sampledPatterns = 0;
+  const persona = { attributeChanges: 0, childReplacements: 0, batches: 0 };
+  for (const event of events) {
+    if (event.type !== 'dom' || event.subtype !== 'mutation-batch') continue;
+    const samples = event.stats?.topPatterns;
+    if (!Array.isArray(samples) || !samples.length) continue;
+    recordedBatches++;
+    let personaBatch = false;
+    const route = routeLabel(event.pageUrl || event.url || '');
+    for (const sample of samples.slice(0, 12)) {
+      const pattern = String(sample?.value || sample?.pattern || '').slice(0, 180);
+      const count = Math.max(0, Math.floor(Number(sample?.count || 0)));
+      if (!pattern || !count) continue;
+      sampledPatterns += count;
+      const key = `${route}${pattern}`;
+      const row = patterns.get(key) || { route, pattern, count: 0, batches: 0 };
+      row.count += count;
+      row.batches++;
+      patterns.set(key, row);
+      if (/^\/personas(?:\/|$)/i.test(route) && /ds-persona-description-toggle/i.test(pattern)) {
+        personaBatch = true;
+        if (/@aria-expanded\b|@data-ds-expanded\b/i.test(pattern)) persona.attributeChanges += count;
+        if (/children\s*\+|children\s*-|childList|textContent/i.test(pattern)) persona.childReplacements += count;
+      }
+    }
+    if (personaBatch) persona.batches++;
+  }
+  return {
+    observedBatchesWithPatterns: recordedBatches,
+    sampledPatternOccurrences: sampledPatterns,
+    personaToggle: persona,
+    top: [...patterns.values()].sort((a, b) => b.count - a.count).slice(0, 12),
+    note: 'Counts are drawn from bounded mutation-batch top-pattern samples. They may omit mutations and are not unique user actions; repeated patterns are optimization leads, not causal attribution.'
+  };
+}
+
 function buildPerformanceContextDiagnostics(events,roleIndex=buildPageRoleIndex(events)) {
   // A network event can be stored before page-start. Seed routes from lifecycle
   // events instead of permanently treating the first event as the page type.
@@ -2441,7 +2487,9 @@ function buildPerformanceContextDiagnostics(events,roleIndex=buildPageRoleIndex(
     if(/worker$/.test(role||''))return 'worker';
     const route=routeLabel(url);
     if(/^\/(?:[a-z]{2}\/)?(?:chat|story)(?:\/|$)/i.test(route))return 'chat';
+    if(/^\/(?:rulebooks?|my-creations\/rulebooks)(?:\/|$)/i.test(route))return 'rulebook';
     if(/\/lorebook(?:\/|$)/i.test(route))return 'lorebook';
+    if(/^\/personas(?:\/|$)/i.test(route))return 'personas';
     if(/\/favorite-bots(?:\/|$)/i.test(route))return 'favorites';
     if(/^\/(?:my-creations|chatbot\/edit)(?:\/|$)/i.test(route))return 'creator';
     if(/^\/chats(?:\/|$)/i.test(route))return 'chat-list';
@@ -2558,6 +2606,96 @@ function buildFavoritesCoverageDiagnostics(events){
     coverage:'Latest saved-favorites count and largest observed native search may come from different browsing moments. Only a compatible account snapshot within 5 minutes BEFORE that request is compared. Typesense found is total matching hits, not page-returned hits. No unique omitted-ID verification or proof of deletion.'};
 }
 
+// INSPECTOR_V015_DISLIKE_TIMING_RULEBOOK_OVERLAY
+// Inspector 0.1.5 diagnostic addition: report-only computation, no new capture hooks.
+// All session attribution is derived from already recorded page-start and
+// fetch-response events. No IDs, URLs, messages or raw request bodies leave
+// this summary, and browser-observed HTTP acceptance is not native UI proof.
+function buildQolDislikeHelperLatency(events) {
+  const sessions = [];
+  const byPage = new Map();
+  const byTab = new Map();
+  const isDislikeHelperUrl = value => {
+    if (!value) return false;
+    try {
+      const u = new URL(String(value), 'https://spicychat.ai');
+      return /(?:^|\.)spicychat\.ai$/i.test(u.hostname) && u.searchParams.has('dsQuickDislike');
+    } catch (_) { return false; }
+  };
+  for (const e of events) {
+    if (e?.type !== 'lifecycle' || e.subtype !== 'page-start' || !e.pageId ||
+        !isDislikeHelperUrl(e.href || e.pageUrl || e.url)) continue;
+    const row = { pageId: e.pageId, tabId: Number.isInteger(e.tabId) ? e.tabId : null,
+      startTs: eventTs(e), firstPostTs: null, firstPostDurationMs: null,
+      firstPostStatus: null, postCount: 0 };
+    sessions.push(row);
+    byPage.set(row.pageId, row);
+    if (row.tabId !== null) {
+      const rows = byTab.get(row.tabId) || [];
+      rows.push(row);
+      byTab.set(row.tabId, rows);
+    }
+  }
+  for (const e of events) {
+    if (e?.type !== 'network' || e.subtype !== 'fetch-response' ||
+        String(e.method || '').toUpperCase() !== 'POST') continue;
+    // Use one page-level fetch layer, never count the duplicate browser
+    // webRequest response or the OPTIONS preflight as a second rating.
+    const endpoint = endpointUrl(e);
+    if (!/recombee\.com\/(?:[^?#]*\/)?ratings\//i.test(endpoint)) continue;
+    const row = byPage.get(e.pageId);
+    if (!row) continue;
+    const requestTs = Number(e.requestStartedAt);
+    const ts = Number.isFinite(requestTs) && requestTs >= row.startTs
+      ? requestTs : eventTs(e) - Math.max(0, Number(e.durationMs) || 0);
+    if (ts < row.startTs) continue;
+    row.postCount++;
+    if (row.firstPostTs === null || ts < row.firstPostTs) {
+      row.firstPostTs = ts;
+      row.firstPostStatus = Number(e.status) || 0;
+      row.firstPostDurationMs = Math.max(0, Number(e.durationMs) || 0);
+    }
+  }
+  const pct = (values, fraction) => {
+    if (!values.length) return null;
+    const sorted = values.slice().sort((a,b)=>a-b);
+    return Math.round(sorted[Math.max(0, Math.min(sorted.length - 1, Math.ceil((sorted.length - 1) * fraction)))]);
+  };
+  const postWaits = sessions.filter(x=>x.firstPostTs !== null)
+    .map(x=>Math.max(0, x.firstPostTs - x.startTs));
+  const postTimes = sessions.filter(x=>x.firstPostDurationMs !== null)
+    .map(x=>x.firstPostDurationMs);
+  const betweenSessionGaps = [];
+  for (const rows of byTab.values()) {
+    rows.sort((a,b)=>a.startTs-b.startTs);
+    for(let i=1;i<rows.length;i++) {
+      const prior = rows[i-1],next = rows[i];
+      if(prior.firstPostTs === null) continue;
+      const end = prior.firstPostTs + (prior.firstPostDurationMs || 0);
+      if(next.startTs >= end) betweenSessionGaps.push(next.startTs-end);
+    }
+  }
+  return {
+    workerPageStarts: sessions.length,
+    pagesWithObservedRatingPost: postWaits.length,
+    pagesWithoutObservedRatingPost: sessions.length - postWaits.length,
+    observedRatingHttp2xx: sessions.filter(x=>x.firstPostStatus >= 200 && x.firstPostStatus < 300).length,
+    multiplePostsOnSameWorkerPage: sessions.filter(x=>x.postCount > 1).length,
+    pageStartToRatingPost: {
+      samples: postWaits.length, medianMs: pct(postWaits,0.5), p95Ms: pct(postWaits,0.95), maxMs: pct(postWaits,1)
+    },
+    ratingRequestDuration: {
+      samples: postTimes.length, medianMs: pct(postTimes,0.5), p95Ms: pct(postTimes,0.95), maxMs: pct(postTimes,1)
+    },
+    betweenWorkerPageGaps: {
+      samples: betweenSessionGaps.length,
+      medianMs: pct(betweenSessionGaps,0.5), maxMs: pct(betweenSessionGaps,1),
+      over30s: betweenSessionGaps.filter(ms=>ms >= 30000).length
+    },
+    note: 'These are observed browser/page intervals, not QoL-internal stage timings. Hidden Settings timers, intentional pacing, inactive tabs and native UI loading cannot be distinguished here. A page without a captured POST is not necessarily a failed Dislike; a successful POST is not verification of a persisted native rating.'
+  };
+}
+
 function buildSummary(events) {
   const netResponses = events.filter(e => e.type === 'network' && /response$/.test(e.subtype || ''));
   const allErrors = events.filter(e => e.type === 'error' || (e.type === 'network' && e.status >= 400));
@@ -2587,6 +2725,17 @@ function buildSummary(events) {
     .slice(0, 8)
     .map(([source,x]) => ({ source, ...x, totalMs: Math.round(x.totalMs * 10) / 10 }));
   const thirdParty = events.filter(e => e.type === 'performance' && e.subtype === 'resource' && e.thirdParty);
+  const mainResourceSummaryEvents = events.filter(e => e.type === 'performance' && e.subtype === 'resource-summary');
+  const individualMainResources = events.filter(e => e.type === 'performance' && e.subtype === 'resource' && !e.workerRole);
+  const mainResourceTiming = {
+    summaryEvents: mainResourceSummaryEvents.length,
+    aggregateTimingObservations: mainResourceSummaryEvents.reduce((n, e) => n + (Number(e.requests) || 0), 0),
+    individualTimingObservations: individualMainResources.length,
+    apiTimingObservations: mainResourceSummaryEvents.filter(e => e.category === 'api-timing').reduce((n, e) => n + (Number(e.requests) || 0), 0),
+    staticTimingObservations: mainResourceSummaryEvents.filter(e => e.category === 'static-or-app').reduce((n, e) => n + (Number(e.requests) || 0), 0),
+    thirdPartyTimingObservations: mainResourceSummaryEvents.filter(e => e.thirdParty === true).reduce((n, e) => n + (Number(e.requests) || 0), 0),
+    note:'Aggregated Resource Timing observations are not unique HTTP requests. Individual slow outliers are stored separately, and fetch/XHR status events may describe the same requests.'
+  };
   const workerResourceSummaryEvents = events.filter(e => e.type === 'performance' && e.subtype === 'worker-resource-summary');
   const workerResourceGroups = new Map();
   for (const e of workerResourceSummaryEvents) {
@@ -2658,7 +2807,9 @@ function buildSummary(events) {
   const rateLimits = buildRateLimitDiagnostics(events);
   const captureConfidence = buildCoverageConfidenceDiagnostics(events,buildCaptureHealthDiagnostics(events));
   const performanceByContext = buildPerformanceContextDiagnostics(events,pageRoleIndex);
+  const domRepetition = buildDomRepetitionDiagnostics(events);
   const severeFreezeTimeline = buildSevereFreezeTimeline(events,pageRoleIndex);
+  const qolDislikeHelperLatency = buildQolDislikeHelperLatency(events);
 
   const statusZeroLikelyNavigation = netResponses.filter(e => e.status === 0 && /navigation|hidden|abort|unload/i.test(e.statusZeroHint || '')).length;
 
@@ -3000,7 +3151,9 @@ function buildSummary(events) {
     rateLimits,
     captureConfidence,
     performanceByContext,
+    domRepetition,
     severeFreezeTimeline,
+    qolDislikeHelperLatency,
     counterDriver,
     qolTrace,
     dailyMessageLimits: {
@@ -3020,6 +3173,7 @@ function buildSummary(events) {
     longAnimationFrameBlockingMs: Math.round(longAnimationFrames.reduce((n,e)=>n+(e.blockingDurationMs||0),0)*10)/10,
     topLongAnimationFrameScripts,
     thirdPartyResources: thirdParty.length,
+    mainResourceTiming,
     workerResources,
     nsfwSignals: nsfw,
     models: [...models].slice(0,20),
@@ -3075,6 +3229,11 @@ function renderOverview() {
   if(s.rateLimits?.http429){const r=s.rateLimits;extra.push(`<div><strong>Rate limits:</strong> ${r.http429} HTTP 429 response(s), codes ${Object.entries(r.byErrorCode).map(([k,v])=>`${esc(k)} ×${v}`).join(', ')}. <em>SC-001-5201 / “Too many requests” is not automatically a daily message cap.</em></div>`);}
   if(s.severeFreezeTimeline?.top?.length){const f=s.severeFreezeTimeline,near=f.top[0].nearbyQolFeatures||[];extra.push(`<div><strong>Severe Long Task windows:</strong> ${f.count} task(s) ≥1s; worst ${f.top[0].durationMs.toLocaleString()}ms on ${esc(f.top[0].pageContext)}, with ${f.top[0].nearbyDomBatches} nearby DOM batch(es), ${f.top[0].nearbyNetworkResponses} network response(s) and ${f.top[0].nearbyQolTraceEvents} QoL trace event(s)${near.length?` · observed QoL features ${near.map(x=>`${esc(x.feature)} ×${x.count}`).join(', ')}`:''}. <em>Nearby activity does not establish causation; detailed windows are in the export.</em></div>`);}
   if(s.performanceByContext?.groups?.length){const contexts=s.performanceByContext.groups.filter(x=>x.longTasks);if(contexts.length)extra.push(`<div><strong>Long Tasks by page context:</strong> ${contexts.map(x=>`${esc(x.context)} ${x.longTasks} / ${(x.longTaskMs/1000).toFixed(1)}s${x.longTaskMsPerObservedMinute!=null?` (${x.longTaskMsPerObservedMinute.toFixed(0)}ms per observed minute)`:''}`).join(' · ')}. <em>Time spans include possible idle periods; no QoL/native attribution is implied.</em></div>`);}
+  if(s.domRepetition?.personaToggle?.attributeChanges || s.domRepetition?.personaToggle?.childReplacements){const p=s.domRepetition.personaToggle;extra.push(`<div><strong>Persona toggle DOM repetition:</strong> ${p.attributeChanges.toLocaleString()} sampled attribute changes · ${p.childReplacements.toLocaleString()} sampled child changes across ${p.batches} mutation batch(es). <em>Source: bounded Inspector DOM patterns; this suggests checking idempotent UI updates, not a proven cause of lag.</em></div>`);}
+  if (s.qolDislikeHelperLatency?.workerPageStarts) {
+    const d=s.qolDislikeHelperLatency, w=d.pageStartToRatingPost, r=d.ratingRequestDuration, g=d.betweenWorkerPageGaps;
+    extra.push(`<div><strong>QoL Dislike helper timing:</strong> ${d.pagesWithObservedRatingPost}/${d.workerPageStarts} helper page(s) had a captured rating POST · median page-start → POST ${w.medianMs ?? '—'}ms · median POST ${r.medianMs ?? '—'}ms · ${d.pagesWithoutObservedRatingPost} page(s) without a captured POST${g.over30s ? ` · ${g.over30s} gap(s) ≥30s between a prior POST and the next worker page` : ''}. <em>Observed intervals only; these do not isolate native UI wait or prove the saved rating. Additional details are in the export.</em></div>`);
+  }
   if (s.nativeCharacterRating) {
     const x=s.nativeCharacterRating;
     extra.push(`<div><strong>Native characterRating:</strong> ${x.confirmedByBrowserObserver} browser-observed event response(s) · ${x.successes} HTTP 2xx · ${x.failures} error(s) · ${x.uniqueBotIds} bot ID(s). ${!x.confirmedByBrowserObserver && x.resourceTimingObservations ? `Resource Timing saw ${x.resourceTimingObservations} request(s), but their HTTP outcomes were not captured.` : ''} <em>This is separate from the Recombee negative rating; it is not evidence of QoL's saved-history state.</em></div>`);
@@ -3099,7 +3258,7 @@ function renderOverview() {
   }
   if (s.pageStoragePressure?.pageStarts) {
     const p=s.pageStoragePressure;
-    extra.push(`<div><strong>Page/storage pressure:</strong> ${p.pageStarts} page starts (maximum ${p.maxFiveMinutePageStarts} within five minutes); ${p.storageSetEvents} localStorage writes, ${p.storageRemoveEvents} removals, ${p.xhrResponses} XHR response(s). Top normalized write keys: ${p.leadingWriteKeys.slice(0,4).map(k=>`${esc(k.key)} ×${k.count}`).join(', ')}. <em>These counts do not identify which extension or user action initiated the activity.</em></div>`);
+    extra.push(`<div><strong>Page/storage pressure:</strong> ${p.pageStarts} page starts (maximum ${p.maxFiveMinutePageStarts} within five minutes); ${p.storageSetEvents} localStorage writes, ${p.storageRemoveEvents} removals, ${p.xhrResponses} XHR response(s)${p.sessionDraftRemovals ? ` · ${p.sessionDraftRemovals.toLocaleString()} native chat-draft removals (${p.sessionDraftSummaryEvents} summarized burst(s))` : ''}. Top normalized write keys: ${p.leadingWriteKeys.slice(0,4).map(k=>`${esc(k.key)} ×${k.count}`).join(', ')}. <em>These counts do not identify which extension or user action initiated the activity.</em></div>`);
   }
   if (s.pageSessionComparison?.chatSessions) {
     const p=s.pageSessionComparison, busiest=p.topByGenerations?.[0], slowest=p.worstPerGeneration?.[0];
@@ -3211,6 +3370,7 @@ function renderOverview() {
   if (s.chatGenerationSummary.count) extra.push(`<div><strong>Chat generations:</strong> ${s.chatGenerationSummary.count} · classifier true ${s.chatGenerationSummary.nsfwTrue} / false ${s.chatGenerationSummary.nsfwFalse} · ${s.chatGenerationSummary.classifierFlips} flip(s) · avg ${(s.chatGenerationSummary.avgMs/1000).toFixed(1)}s. <em>Per-message classifier only.</em></div>`);
   if (s.generationRender?.count) { const g=s.generationRender; const buckets=(g.mountedMessageBuckets||[]).map(x=>`${x.label}: ${(x.avgLongTaskMs/1000).toFixed(2)}s avg`).join(', '); extra.push(`<div><strong>Post-generation render (${(g.windowMs/1000).toFixed(0)}s window):</strong> ${g.count} generation(s) · avg Long Task ${(g.avgLongTaskMs/1000).toFixed(2)}s · median ${(g.medianLongTaskMs/1000).toFixed(2)}s · p95 ${(g.p95LongTaskMs/1000).toFixed(2)}s · avg LoAF blocking ${(g.avgLoafBlockingMs/1000).toFixed(2)}s · ${g.generationsOver1sPostBlock} generation(s) with ≥1s post-response Long Tasks${g.medianResponseDomSignalMs!=null ? ` · median tentative DOM-change signal ${g.medianResponseDomSignalMs.toFixed(0)}ms` : ''}${g.missingResponseDomSignal ? ` · ${g.missingResponseDomSignal} generation(s) without confirmed DOM signal` : ''}${g.legacyFirstMessageDomSamples ? ` · ${g.legacyFirstMessageDomSamples} legacy/unverified DOM sample(s) excluded` : ''}${g.mountedMessageScaling ? ` · mounted-message slope ${g.mountedMessageScaling.slope.toFixed(1)} ms/msg (R² ${g.mountedMessageScaling.r2.toFixed(2)})` : ''}${buckets ? ` · by mounted size: ${esc(buckets)}` : ''}.</div>`); const routes=(g.routeSummaries||[]).map(r=>`${r.routeKind==='story'?'Story':'/chat'}: ${r.count} gen · ${(r.avgLongTaskMs/1000).toFixed(2)}s avg${r.maxMounted!=null?` · mounted ${r.minMounted}-${r.maxMounted}`:''}${r.mountedMessageScaling?` · slope ${r.mountedMessageScaling.slope.toFixed(1)} ms/msg`:''}`).join(' | '); if(routes) extra.push(`<div><strong>Generation render by route:</strong> ${esc(routes)}.</div>`); }
   if (s.generationRender?.replyTextObservations) { const g=s.generationRender;extra.push(`<div><strong>Exact reply text witness:</strong> ${g.replyTextObservations} reply container(s) with nonempty text and layout geometry · ${g.replyTextAfterResponseSamples} observed after response${g.medianReplyTextObservedMs!=null?` (median ${g.medianReplyTextObservedMs.toFixed(0)}ms)`:''} · ${g.replyTextAlreadyPresentAtResponse} already present at response. <em>Observation is not first paint or verified screen visibility. Content is not saved.</em></div>`); }
+  if (s.mainResourceTiming?.aggregateTimingObservations) { const r=s.mainResourceTiming;extra.push(`<div><strong>Page resource timing:</strong> ${r.aggregateTimingObservations.toLocaleString()} ordinary timing observation(s) in ${r.summaryEvents} aggregate event(s) · ${r.apiTimingObservations.toLocaleString()} API · ${r.staticTimingObservations.toLocaleString()} static/app · ${r.thirdPartyTimingObservations.toLocaleString()} third-party · ${r.individualTimingObservations} individual outlier(s). <em>These timings may describe the same requests as HTTP response events; they are not additional requests.</em></div>`); }
   if (s.workerResources?.requests) { const w=s.workerResources,top=(w.top||[]).slice(0,4).map(x=>`${x.workerRole} ${x.endpointGroup}: ${x.requests} timing(s) · avg ${x.avgDurationMs.toFixed(0)}ms · max ${x.maxDurationMs.toFixed(0)}ms`).join(' | '); extra.push(`<div><strong>QoL worker resources:</strong> ${w.requests.toLocaleString()} Resource Timing observation(s) across ${w.pagesWithSummary} page(s) in ${w.summaryEvents} summary event(s) · ${w.staticAssetTimingObservations} static/third-party timing(s), ${w.apiTimingObservations} API timing(s)${top?` · ${esc(top)}`:''}. <em>Timing observations can overlap observed HTTP responses; these are not unique requests.</em></div>`); }
   if (s.recentPerformance?.available) { const r=s.recentPerformance.recent,p=s.recentPerformance.previous,mins=s.recentPerformance.windowMs/60000; extra.push(`<div><strong>Recent performance:</strong> last ${mins.toFixed(0)}m Long Tasks ${(r.longTaskMs/1000).toFixed(1)}s vs prior ${(p.longTaskMs/1000).toFixed(1)}s${s.recentPerformance.longTaskRatio!=null ? ` (${s.recentPerformance.longTaskRatio.toFixed(1)}×)` : ''} · LoAF block ${(r.loafBlockingMs/1000).toFixed(1)}s vs ${(p.loafBlockingMs/1000).toFixed(1)}s · DOM ${r.domMutations.toLocaleString()} vs ${p.domMutations.toLocaleString()} · generations ${r.generations} vs ${p.generations}.</div>`); }
   if (s.autoLagSpikes?.count) extra.push(`<div><strong>Automatic lag spikes:</strong> ${s.autoLagSpikes.count} trigger(s) captured; each adds immediate + 10s page-pressure context with a 30s cooldown.</div>`);
@@ -3816,7 +3976,7 @@ function makeShareSafePseudonymizer() {
   };
   const uuid=/\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b/ig;
   const userId=/\bkp:[A-Za-z0-9._-]{10,}\b/g;
-  const identifierKeys=/^(?:id|botid|characterid|lorebookid|userid|creator_user_id|conversationid|messageid|pageid|sessionid|workerSessionId|traceSessionId|requestId|driverTarget|itemId|character_id|conversation_id|alt_message_id)$/i;
+  const identifierKeys=/^(?:id|botid|characterid|lorebookid|userid|creator_user_id|conversationid|messageid|pageid|sessionid|workerSessionId|traceSessionId|requestId|driverTarget|itemId|character_id|conversation_id|alt_message_id|jobId|bulkRunId|runId|helperSessionId)$/i;
   const labelKeys=/^(?:name|creator_username|displayName|username|creatorName|botName|lorebookName|characterName)$/i;
   function transform(value,key='',depth=0) {
     if(depth>24)return '[MAX_DEPTH]';

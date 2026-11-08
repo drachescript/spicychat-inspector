@@ -10,12 +10,38 @@
   let requestSeq = 0;
   let lastPageHideAt = 0;
   const storageBursts = new Map();
+  let draftRemovals = null;
+  const DRAFT_REMOVAL_SUMMARY_MS = 5000;
+
+  function flushDraftRemovals(reason = 'interval') {
+    const s = draftRemovals;
+    if (!s) return;
+    draftRemovals = null;
+    if (s.timer) clearTimeout(s.timer);
+    emit({ type: 'storage', subtype: 'sessionStorage-draft-remove-summary',
+      key: 'spicychat.chatDraft:*', removals: s.count,
+      uniqueKeys: s.keys.size, uniqueKeysCapped: s.keys.size >= 100,
+      firstAt: s.firstAt, lastAt: s.lastAt, windowMs: Math.max(0, s.lastAt - s.firstAt),
+      reason, privacyNote: 'chat-draft-identifiers-omitted' });
+  }
+
+  function noteDraftRemoval(key) {
+    const now = Date.now();
+    if (!draftRemovals) draftRemovals = { count: 0, firstAt: now, lastAt: now,
+      keys: new Set(), timer: setTimeout(flushDraftRemovals, DRAFT_REMOVAL_SUMMARY_MS) };
+    draftRemovals.count++;
+    draftRemovals.lastAt = now;
+    if (draftRemovals.keys.size < 100) draftRemovals.keys.add(String(key));
+  }
 
   const PRIVATE_IDENTIFIER_KEY_RE = /^(?:x)?(?:guestuserid|guestid|userid|visitorid|deviceid|clientid|anonymousid|anonid|installationid|installid|fingerprintid)$/;
   function isPrivateIdentifierKey(k) { return PRIVATE_IDENTIFIER_KEY_RE.test(String(k || '').replace(/[-_]/g, '').toLowerCase()); }
   const PRIVATE_IDENTIFIER_VALUE_RE = /((?:[\"']?(?:x[-_])?(?:guest[-_]?user[-_]?id|guest[-_]?id|user[-_]?id|visitor[-_]?id|device[-_]?id|client[-_]?id|anon(?:ymous)?[-_]?id|install(?:ation)?[-_]?id|fingerprint[-_]?id)[\"']?)\s*[:=]\s*[\"']?)([A-Za-z0-9._~+/=-]+)/gi;
   const SECRET_KEY_RE = /(authorization|cookie|set-cookie|password|passwd|secret|access[_-]?token|refresh[_-]?token|id[_-]?token|session|jwt|csrf|xsrf|api[_-]?key|client[_-]?secret|p?_?psid)/i;
-  function isSecretKey(k) { return SECRET_KEY_RE.test(k) || isPrivateIdentifierKey(k); }
+  function isSecretKey(k) {
+    if (/^(?:typesenseSearchKey|x-typesense-api-key)$/i.test(String(k || ''))) return false;
+    return SECRET_KEY_RE.test(k) || isPrivateIdentifierKey(k);
+  }
   const INTEREST_RE = /(sfw|nsfw|safe|safety|moder|filter|restrict|flag|feature|experiment|model|engine|provider|token|context|prompt|memory|lore|generation|temperature|top[_-]?[pk]|preset|queue|rate|limit|image|error|warning|status)/i;
   const JWT_RE = /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/g;
   const BEARER_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]{10,}/gi;
@@ -520,11 +546,28 @@
       recordStorageSet(label, String(k), v);
       return set.apply(this, arguments);
     };
-    proto.removeItem = function(k) { const label = labelFor(this); flushStorageBurst(`${label}::${k}`); emit({ type: 'storage', subtype: `${label}-remove`, key: k }); return remove.apply(this, arguments); };
-    proto.clear = function() { for (const id of [...storageBursts.keys()]) if (id.startsWith(`${labelFor(this)}::`)) flushStorageBurst(id); emit({ type: 'storage', subtype: `${labelFor(this)}-clear` }); return clear.apply(this, arguments); };
+    proto.removeItem = function(k) {
+      const label = labelFor(this);
+      flushStorageBurst(`${label}::${k}`);
+      const result = remove.apply(this, arguments);
+      if (label === 'sessionStorage' && /(?:^|[.:])chatDraft:/i.test(String(k))) noteDraftRemoval(k);
+      else emit({ type: 'storage', subtype: `${label}-remove`, key: k });
+      return result;
+    };
+    proto.clear = function() {
+      const label = labelFor(this);
+      for (const id of [...storageBursts.keys()]) if (id.startsWith(`${label}::`)) flushStorageBurst(id);
+      if (label === 'sessionStorage') flushDraftRemovals('storage-cleared');
+      emit({ type: 'storage', subtype: `${label}-clear` });
+      return clear.apply(this, arguments);
+    };
     try { Object.defineProperty(proto, '__sciPatched', { value: true }); } catch (_) {}
   }
   patchStoragePrototype();
+  addEventListener('pagehide', () => flushDraftRemovals('pagehide'), true);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushDraftRemovals('hidden');
+  }, true);
 
   function snapshotStorage(storage) {
     const out = {};

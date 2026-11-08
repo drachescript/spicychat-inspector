@@ -34,7 +34,10 @@ const PRIVATE_IDENTIFIER_KEY_RE = /^(?:x)?(?:guestuserid|guestid|userid|visitori
 function isPrivateIdentifierKey(k) { return PRIVATE_IDENTIFIER_KEY_RE.test(String(k || '').replace(/[-_]/g, '').toLowerCase()); }
 const PRIVATE_IDENTIFIER_VALUE_RE = /((?:[\"']?(?:x[-_])?(?:guest[-_]?user[-_]?id|guest[-_]?id|user[-_]?id|visitor[-_]?id|device[-_]?id|client[-_]?id|anon(?:ymous)?[-_]?id|install(?:ation)?[-_]?id|fingerprint[-_]?id)[\"']?)\s*[:=]\s*[\"']?)([A-Za-z0-9._~+/=-]+)/gi;
 const SECRET_KEY_RE = /(authorization|cookie|set-cookie|password|passwd|secret|auth[_-]?token|access[_-]?token|refresh[_-]?token|id[_-]?token|session|jwt|csrf|xsrf|api[_-]?key|client[_-]?secret|p?_?psid)/i;
-function isSecretKey(k) { return k !== 'authInvalidToken' && (SECRET_KEY_RE.test(k) || isPrivateIdentifierKey(k)); }
+function isSecretKey(k) {
+  if (/^(?:typesenseSearchKey|x-typesense-api-key)$/i.test(String(k || ''))) return false;
+  return k !== 'authInvalidToken' && (SECRET_KEY_RE.test(k) || isPrivateIdentifierKey(k));
+}
 const JWT_RE = /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/g;
 const BEARER_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]{10,}/gi;
 const PSID_VALUE_RE = /\b(psid)([:=])([A-Za-z0-9_-]{8,})/gi;
@@ -331,7 +334,6 @@ function inspectorRedactUrlsInText(value) {
 
 function redactString(s) {
   if (typeof s !== 'string') return s;
-  s = s.replace(/(x-typesense-api-key\s*[:=]\s*[\"']?)[^\s&\"',}]+/gi, '$1[REDACTED]');
   return inspectorRedactUrlsInText(s.replace(JWT_RE, '[REDACTED_JWT]').replace(BEARER_RE, 'Bearer [REDACTED]').replace(URLENC_SECRET_RE, (m, p, k) => `${p}${k}=[REDACTED]`).replace(PSID_VALUE_RE, (m, key, sep) => `${key}${sep}[REDACTED]`).replace(PRIVATE_IDENTIFIER_VALUE_RE, (m, prefix) => `${prefix}[REDACTED]`));
 }
 
@@ -1301,6 +1303,7 @@ async function migrateExistingRequestIdentifierPrivacy() {
   await chrome.storage.local.set({ [REQUEST_IDENTIFIER_PRIVACY_MIGRATION_KEY]: { completedAt: Date.now(), scanned, updated } });
 }
 
+
 // Change only affected URL-bearing values. Unlike the bounded capture sanitizer,
 // the historical migration must not shorten unrelated arrays or body objects.
 function applyStoredUrlPrivacy(event) {
@@ -1563,7 +1566,6 @@ migrateExistingStateSnapshotPrivacy().catch(() => {});
 migrateExistingDomTextPrivacy().catch(() => {});
 migrateExistingNetworkPrivacy().catch(() => {}); migrateExistingRequestIdentifierPrivacy().catch(() => {}); migrateExistingNativeMemoryPrivacy().catch(() => {}); migrateExistingUrlPrivacy().catch(() => {}); migrateExistingFavoritesSearchPrivacy().catch(() => {});
 migrateSettingsFor004().catch(() => {});
-
 
 if (chrome.tabs?.onRemoved) chrome.tabs.onRemoved.addListener(tabId => { tabPageRoles.delete(tabId); });
 
