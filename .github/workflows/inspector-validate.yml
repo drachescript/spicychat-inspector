@@ -1,0 +1,102 @@
+name: Inspector Validate and Package
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inspector-validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out Inspector
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Check JavaScript syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in ./*.js; do
+            node --check "$file"
+          done
+
+      - name: Validate manifest, referenced files and test ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import re
+          import zipfile
+          from pathlib import Path
+
+          root = Path.cwd()
+          manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+          version = manifest.get("version", "")
+          assert re.fullmatch(r"\d+\.\d+\.\d+", version), f"Invalid version: {version}"
+          assert manifest.get("manifest_version") == 3, "Expected Manifest V3"
+          required = {
+              "manifest.json", "background.js", "bridge.js",
+              "content.js", "popup.js", "popup.html",
+              "inspector.js", "inspector.html", "changelog.js",
+              "changelog.html", "ui.css", "Icon.png", "CHANGELOG.md",
+          }
+          referenced = {
+              manifest.get("background", {}).get("service_worker"),
+              manifest.get("action", {}).get("default_popup"),
+          }
+          for entry in manifest.get("content_scripts", []):
+              referenced.update(entry.get("js", []))
+              referenced.update(entry.get("css", []))
+          for entry in manifest.get("web_accessible_resources", []):
+              referenced.update(entry.get("resources", []))
+          referenced.update(manifest.get("icons", {}).values())
+          for html in root.glob("*.html"):
+              data = html.read_text(encoding="utf-8")
+              for asset in re.findall(r"""(?:src|href)\s*=\s*["']([^"']+)["']""", data):
+                  if asset.startswith(("https:", "http:", "mailto:", "#", "data:", "//")):
+                      continue
+                  referenced.add(asset)
+          for file in required | referenced:
+              assert isinstance(file, str) and file and not Path(file).is_absolute(), f"Bad asset path: {file}"
+              assert ".." not in Path(file).parts and "\\" not in file, f"Unsafe asset path: {file}"
+              assert (root / file).is_file(), f"Missing Inspector asset: {file}"
+
+          files = sorted(
+              [p for p in root.iterdir() if p.is_file() and
+               (p.suffix in {".js", ".html", ".css", ".png", ".svg"} or
+                p.name in {"manifest.json", "CHANGELOG.md"})],
+              key=lambda p: p.name,
+          )
+          output = root / "dist" / f"SpicyChat-Inspector-v{version}.zip"
+          output.parent.mkdir(exist_ok=True)
+          with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+              for file in files:
+                  archive.write(file, file.name)
+          with zipfile.ZipFile(output) as archive:
+              assert archive.testzip() is None, "Corrupt ZIP"
+              assert (required | referenced) <= set(archive.namelist()), "Incomplete ZIP"
+          print(f"Inspector {version}: validated {len(referenced)} references; packaged {len(files)} files")
+          PY
+
+      - name: Upload test ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpicyChat-Inspector
+          path: dist/SpicyChat-Inspector-v*.zip
+          if-no-files-found: error
+          retention-days: 30
