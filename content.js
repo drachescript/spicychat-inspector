@@ -1,6 +1,12 @@
 (() => {
   const INSPECTOR_VERSION = (() => { try { return chrome.runtime.getManifest().version || 'unknown'; } catch (_) { return 'unknown'; } })();
   const PAGE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  // The main collector and the additive Driver-support probe are two IIFEs in
+  // the same content-script world. Link their shutdowns by this *instance-local*
+  // object, not a recurring runtime API call. Old and new instances keep their
+  // own object references, so reload notifications cannot stop a fresh probe.
+  const contentLifetime = { invalidated: false, stopCore: null, stopDriver: null };
+  try { window.__SCI_INSPECTOR_CONTENT_LIFETIME_V1__ = contentLifetime; } catch (_) {}
   // Firefox Android supports recording, but browser Long Task/LoAF APIs may be missing.
   // Keep collection bounded even when a busy chat generates thousands of mutations/traces.
   const IS_FIREFOX_ANDROID = /Android/i.test(navigator.userAgent) && /(?:Firefox|Fennec)/i.test(navigator.userAgent);
@@ -13,6 +19,7 @@
   function initialPageRole() {
     try {
       const u = new URL(location.href);
+      if (u.pathname === '/chats' && u.searchParams.get('ds-research-export') === '1') return 'qol-research-export';
       if (u.searchParams.get('dsQolBotStatusWorker') === '1') return 'qol-bot-status-worker';
       if (u.searchParams.get('dsQolRecommendationWorker') === '1' || u.searchParams.get('dsQuickDislike') === '1') return 'qol-recommendation-worker';
       if (u.searchParams.get('dsQuickLessLike') === '1' || u.searchParams.get('dsQolQuickDislikeWorker') === '1' || u.searchParams.get('dsQolQuickLessLikeWorker') === '1') return 'qol-recommendation-worker';
@@ -36,6 +43,7 @@
   const INSPECTOR_SESSION_ID = `sci-${PAGE_ID}`;
   const IDLE_AFTER_MS = 60_000;
   let settings = null;
+  let extensionContextInvalidated = false;
   let domObserver = null;
   let domQueue = [];
   let domSamplePatterns = new Set();
@@ -91,6 +99,72 @@
   let qolLastTraceTs = 0;
   let qolTraceCheckSerial = 0;
   const QOL_TRACE_CHECK_DELAY_MS = 8_000;
+  // Optional, passive Research Export diagnostics: reuse the existing DOM
+  // observer; never inspect message content or install a second observer.
+  let researchPhase = 'not-observed';
+  let researchPhaseAt = 0;
+  let researchLastPhaseEmitAt = 0;
+  let researchLastStatusAt = 0;
+  let researchNextReadAt = 0;
+
+  function researchContext() {
+    if (PAGE_ROLE !== 'qol-research-export') return null;
+    return { phase: researchPhase, phaseObservedAt: researchPhaseAt || null,
+      lastStatusAt: researchLastStatusAt || null,
+      coverage: settings?.captureDom ? 'existing-dom-observer-sampled' : 'dom-capture-disabled',
+      attribution: 'progress-phase-proximity-only' };
+  }
+
+  function isResearchStatusMutation(m) {
+    if (PAGE_ROLE !== 'qol-research-export' || m?.type !== 'childList') return false;
+    const target = m.target;
+    // The exporter writes textContent directly to its own <pre role=status>.
+    // Inspect only this exact element; no ancestor walks or subtree scans.
+    return target?.nodeType === Node.ELEMENT_NODE && target.tagName === 'PRE' &&
+      target.parentElement?.id === 'ds-bulk-research-panel' && target.getAttribute('role') === 'status';
+  }
+
+  function classifyResearchStatus(text) {
+    const value = String(text || '').slice(0, 180).toLowerCase();
+    if (value.startsWith('finding ') || value.startsWith('scanning ')) return 'discovery';
+    if (value.startsWith('conversation ')) return 'conversation-processing';
+    if (value.startsWith('rebuilding ') || value.startsWith('reusing ')) return 'checkpoint-reuse';
+    if (value.startsWith('saving and verifying ')) return 'archive-save-verify';
+    if (value.startsWith('checking download ')) return 'download-permission';
+    if (value.startsWith('starting a fresh ')) return 'fresh-start';
+    if (value.startsWith('export finished')) return 'finished';
+    if (value.startsWith('stopped') || value.startsWith('bot scan stopped')) return 'stopped';
+    if (value.includes('cancelled')) return 'cancelled';
+    return 'other';
+  }
+
+  function observeResearchStatus(m) {
+    domStats.totalMutations++;
+    domStats.qolRelated++;
+    domStats.qolOwned++;
+    domStats.researchStatusMutations++;
+    bump(domStats.patterns, 'qol research export status update [aggregated]');
+    bump(domStats.targets, 'pre[role=status]#ds-bulk-research-panel');
+    const now = Date.now();
+    researchLastStatusAt = now;
+    // A long-running export can update this tens of thousands of times.
+    // Classify no more than once per second; never capture the log text.
+    if (now < researchNextReadAt) return;
+    researchNextReadAt = now + 1000;
+    const next = classifyResearchStatus(m.target.textContent);
+    if (next === researchPhase) return;
+    const previous = researchPhase;
+    researchPhase = next;
+    researchPhaseAt = now;
+    // Long exports can switch phase on every conversation. Report at most
+    // once per five seconds, except archive/terminal state transitions.
+    if (now - researchLastPhaseEmitAt < 5000 &&
+        !['archive-save-verify','finished','stopped','cancelled'].includes(next)) return;
+    researchLastPhaseEmitAt = now;
+    emit({ type:'performance', subtype:'research-export-phase', phase:next,
+      previousPhase:previous, observation:'progress-text-classification',
+      note:'Progress UI proximity only; not a measured export phase duration.' });
+  }
 
   function interactionPerfContext(at = Date.now()) {
     const scroll = activeScrollSample;
@@ -488,15 +562,69 @@ function inspectorRedactUrlsInText(value) {
     return false;
   }
 
+  function isInvalidatedContextError(error) {
+    return /extension context invalidated|context invalidated/i.test(String(error?.message || error || ''));
+  }
+
+  // A content script already injected into a tab can outlive a Chrome extension
+  // reload. It cannot reconnect to the new extension context; quietly stop all
+  // expensive collectors until the tab is refreshed. Do not send any event from
+  // this path because the background runtime is already unavailable.
+  function stopInvalidatedContext() {
+    if (extensionContextInvalidated) return;
+    extensionContextInvalidated = true;
+    contentLifetime.invalidated = true;
+    settings = { ...(settings || {}), recording: false, captureQolInternals: false };
+    try { stopDomObserver(); } catch (_) {}
+    try { stopPerformanceObservers(); } catch (_) {}
+    try { stopPressureSampling(); } catch (_) {}
+    try { stopQolPresence(); } catch (_) {}
+    for (const timer of [idleTimer, domTimer, eventBatchTimer, driverHeartbeatTimer,
+      trackerErrorTimer, resourceAggregateTimer, workerResourceAggregateTimer]) {
+      if (timer != null) { clearTimeout(timer); clearInterval(timer); }
+    }
+    idleTimer = domTimer = eventBatchTimer = driverHeartbeatTimer = null;
+    trackerErrorTimer = resourceAggregateTimer = workerResourceAggregateTimer = null;
+    eventQueue.length = 0;
+    domQueue.length = 0;
+    activeQolOperations.clear();
+    try { contentLifetime.stopDriver?.(); } catch (_) {}
+  }
+  contentLifetime.stopCore = stopInvalidatedContext;
+
+  function contextAvailable() {
+    if (extensionContextInvalidated) return false;
+    try {
+      if (!chrome?.runtime?.id) { stopInvalidatedContext(); return false; }
+      return true;
+    } catch (_) {
+      stopInvalidatedContext();
+      return false;
+    }
+  }
+
   function directSend(payload) {
-    try { return chrome.runtime.sendMessage({ type: 'SCI_EVENT', event: payload }).catch(() => {}); } catch (_) { return null; }
+    if (!contextAvailable()) return null;
+    try {
+      return chrome.runtime.sendMessage({ type: 'SCI_EVENT', event: payload }).catch(error => {
+        if (isInvalidatedContextError(error)) stopInvalidatedContext();
+      });
+    } catch (error) {
+      if (isInvalidatedContextError(error)) stopInvalidatedContext();
+      return null;
+    }
   }
 
   function flushEventQueue() {
     if (eventBatchTimer) { clearTimeout(eventBatchTimer); eventBatchTimer = null; }
+    if (!contextAvailable()) return;
     if (!eventQueue.length) return;
     const batch = eventQueue.splice(0, EVENT_BATCH_MAX * 4);
-    try { chrome.runtime.sendMessage({ type: 'SCI_EVENT_BATCH', events: batch }).catch(() => {}); } catch (_) {}
+    try {
+      chrome.runtime.sendMessage({ type: 'SCI_EVENT_BATCH', events: batch }).catch(error => {
+        if (isInvalidatedContextError(error)) stopInvalidatedContext();
+      });
+    } catch (error) { if (isInvalidatedContextError(error)) stopInvalidatedContext(); }
     if (eventQueue.length) eventBatchTimer = setTimeout(flushEventQueue, 0);
   }
 
@@ -528,6 +656,7 @@ function inspectorRedactUrlsInText(value) {
   }
 
   function queuePayload(payload) {
+    if (!contextAvailable()) return;
     noteInspectorEventRate();
     if (isCriticalInspectorEvent(payload)) {
       flushEventQueue();
@@ -543,6 +672,7 @@ function inspectorRedactUrlsInText(value) {
   }
 
   function emit(event) {
+    if (extensionContextInvalidated) return;
     if (!settings?.recording && event.type !== 'marker' && event.type !== 'marker-context' && event.pinned !== true) return;
     try {
       const pageUrl = redactString(location.href);
@@ -930,8 +1060,10 @@ function inspectorRedactUrlsInText(value) {
   }
 
   function injectBridge() {
+    if (!contextAvailable()) return;
     const script = document.createElement('script');
-    script.src = chrome.runtime.getURL('bridge.js');
+    try { script.src = chrome.runtime.getURL('bridge.js'); }
+    catch (error) { if (isInvalidatedContextError(error)) stopInvalidatedContext(); return; }
     script.dataset.sciPageId = PAGE_ID;
     (document.documentElement || document.head || document.body).appendChild(script);
     script.onload = () => script.remove();
@@ -1052,6 +1184,7 @@ function inspectorRedactUrlsInText(value) {
   function makeDomStats() {
     return {
       totalMutations: 0, detailedChanges: 0, qolRelated: 0, qolOwned: 0, noOp: 0,
+      researchStatusMutations: 0,
       formattingSwapsCoalesced: 0, mobileSkippedMutationRecords: 0, mobileChildListOnly: IS_FIREFOX_ANDROID,
       budgetSkippedMutationRecords: 0, budgetExceededCallbacks: 0, recordLimitCallbacks: 0,
       messageNodesAdded: 0, messageNodesRemoved: 0, observerCallbacks: 0,
@@ -1539,7 +1672,7 @@ function inspectorRedactUrlsInText(value) {
     };
   }
   function samplePagePressure(reason = 'periodic', extra = {}) {
-    if (!settings?.capturePerformance) return null;
+    if (!settings?.recording || !settings?.capturePerformance) return null;
     lastPressureSampleAt = Date.now();
     const now = Date.now();
     // Generation stress tests can request three snapshots per reply. Reuse
@@ -1581,14 +1714,19 @@ function inspectorRedactUrlsInText(value) {
     return snapshot;
   }
   function startPressureSampling() {
-    if (pressureTimer) return;
+    if (pressureTimer || !settings?.recording || !settings?.capturePerformance) return;
     pressureTimer = setInterval(() => {
-      if (!settings?.capturePerformance) return;
+      if (!settings?.recording || !settings?.capturePerformance) return;
       const now = Date.now();
       const interval = document.hidden ? PRESSURE_HIDDEN_MS : PRESSURE_VISIBLE_MS;
       if (now - lastPressureSampleAt >= interval) samplePagePressure(document.hidden ? 'periodic-hidden' : 'periodic-visible');
     }, 30_000);
     setTimeout(() => samplePagePressure('startup'), 3000);
+  }
+  function stopPressureSampling() {
+    if (!pressureTimer) return;
+    clearInterval(pressureTimer);
+    pressureTimer = null;
   }
 
   function captureMutation(m) {
@@ -1784,7 +1922,7 @@ function inspectorRedactUrlsInText(value) {
     return !!(wrapper?.classList?.contains('ds-native-format-dialogue-fix'));
   }
   function startDomObserver() {
-    if (domObserver || !settings?.captureDom || isQolWorkerPage()) return;
+    if (domObserver || !settings?.recording || !settings?.captureDom || isQolWorkerPage()) return;
     const begin = () => {
       if (!document.documentElement || domObserver) return;
       domObserver = new MutationObserver(mutations => {
@@ -1823,6 +1961,7 @@ function inspectorRedactUrlsInText(value) {
             break;
           }
           const m = mutations[i];
+          if (isResearchStatusMutation(m)) { observeResearchStatus(m); continue; }
           if (isKnownDialogueFormattingSwap(m)) {
             formattingSwaps++;
             continue;
@@ -1907,6 +2046,7 @@ function inspectorRedactUrlsInText(value) {
     const flushStarted = performance.now();
     const stats = {
       totalMutations: domStats.totalMutations,
+      researchStatusMutations: domStats.researchStatusMutations,
       formattingSwapsCoalesced: domStats.formattingSwapsCoalesced,
       mobileSkippedMutationRecords: domStats.mobileSkippedMutationRecords,
       budgetSkippedMutationRecords: domStats.budgetSkippedMutationRecords,
@@ -2313,6 +2453,7 @@ function inspectorRedactUrlsInText(value) {
     return !!(settings?.recording && settings?.captureQolInternals);
   }
   function onQolMessage(data, transport) {
+    if (extensionContextInvalidated) return;
     if (!qolInternalsEnabled()) return;
     if (!looksLikeQolTelemetry(data)) return;
     try {
@@ -2552,7 +2693,7 @@ function inspectorRedactUrlsInText(value) {
 
   function startPerformanceObservers() {
     stopPerformanceObservers();
-    if (!settings?.capturePerformance || !window.PerformanceObserver) return;
+    if (!settings?.recording || !settings?.capturePerformance || !window.PerformanceObserver) return;
     configureResourceTimingBuffer();
     if (IS_FIREFOX_ANDROID) {
       const supported = PerformanceObserver.supportedEntryTypes || [];
@@ -2594,7 +2735,7 @@ function inspectorRedactUrlsInText(value) {
           noteLongTaskSpike(e);
           const entryStartTs = Math.round((performance.timeOrigin + e.startTime) * 10) / 10;
           const entryEndTs = Math.round((entryStartTs + e.duration) * 10) / 10;
-          emit(enrichBridgeEvent({ type: 'performance', subtype: 'long-task', durationMs: Math.round(e.duration * 10) / 10, startTimeMs: Math.round(e.startTime * 10) / 10, entryStartTs, entryEndTs }));
+          emit(enrichBridgeEvent({ type: 'performance', subtype: 'long-task', durationMs: Math.round(e.duration * 10) / 10, startTimeMs: Math.round(e.startTime * 10) / 10, entryStartTs, entryEndTs, ...(researchContext() ? {researchExport:researchContext()} : {}) }));
         }
       });
       longTaskObserver.observe({ type: 'longtask', buffered: true });
@@ -2636,6 +2777,7 @@ function inspectorRedactUrlsInText(value) {
               renderStartMs: Math.round((e.renderStart || 0) * 10) / 10,
               styleAndLayoutStartMs: Math.round((e.styleAndLayoutStart || 0) * 10) / 10,
               scripts,
+              ...(researchContext() ? {researchExport:researchContext()} : {}),
               inputCorrelation:interactionPerfContext(Math.round(performance.timeOrigin + (e.startTime || 0))),
               attribution: classifyLoafScripts(scripts),
               interaction: interactionState()
@@ -2657,7 +2799,7 @@ function inspectorRedactUrlsInText(value) {
     if (errorCaptureInstalled) return;
     errorCaptureInstalled = true;
     window.addEventListener('error', e => {
-      if (!settings?.captureErrors) return;
+      if (!settings?.recording || !settings?.captureErrors) return;
       const target = e.target;
       if (target && target !== window && target.nodeType === Node.ELEMENT_NODE) {
         const src = target.currentSrc || target.src || target.href || '';
@@ -2676,7 +2818,7 @@ function inspectorRedactUrlsInText(value) {
       emit({ type: 'error', subtype: 'window-error', message, filename, line: e.lineno || null, col: e.colno || null, error, interaction: interactionState() });
     }, true);
     window.addEventListener('unhandledrejection', e => {
-      if (!settings?.captureErrors) return;
+      if (!settings?.recording || !settings?.captureErrors) return;
       emit({ type: 'error', subtype: 'unhandled-rejection', reason: redactString(e.reason?.stack || String(e.reason || '')), interaction: interactionState() });
     });
   }
@@ -2696,6 +2838,9 @@ function inspectorRedactUrlsInText(value) {
   window.addEventListener('message', e => {
     if (e.source !== window || !e.data) return;
     if (e.data.source === BRIDGE_SOURCE && e.data.pageId === PAGE_ID) {
+      // The page bridge remains installed for the lifetime of the document, but
+      // expensive correlation/render bookkeeping must sleep when recording is off.
+      if (!settings?.recording) return;
       const event = enrichBridgeEvent(e.data.event || {});
       beginGenerationRenderWindow(event);
       if (event.type === 'network') handleBridgeNetworkEvent(event);
@@ -2744,9 +2889,9 @@ function inspectorRedactUrlsInText(value) {
           driverTarget: m.target ?? null,
           driverLabel: m.label ?? null,
           driverPath: m.path ?? null,
-          driverNumber: Number.isFinite(Number(m.number)) ? Number(m.number) : null,
-          driverAttempt: Number.isFinite(Number(m.attempt)) ? Number(m.attempt) : null,
-          driverDurationMs: Number.isFinite(Number(m.durationMs)) ? Number(m.durationMs) : null,
+          driverNumber: m.number != null && m.number !== '' && Number.isFinite(Number(m.number)) ? Number(m.number) : null,
+          driverAttempt: m.attempt != null && m.attempt !== '' && Number.isFinite(Number(m.attempt)) ? Number(m.attempt) : null,
+          driverDurationMs: m.durationMs != null && m.durationMs !== '' && Number.isFinite(Number(m.durationMs)) ? Number(m.durationMs) : null,
           driverHref: m.href ? redactString(String(m.href)).slice(0, 500) : null,
           interaction: interactionState()
         });
@@ -2761,6 +2906,14 @@ function inspectorRedactUrlsInText(value) {
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type !== 'SCI_COMMAND') return;
+    if (message.command === 'qol-trace-status') {
+      // Read-only, on-demand status. A successful command is not proof QoL paired.
+      sendResponse({ok:true, recording:!!settings?.recording, traceEnabled:qolInternalsEnabled(),
+        traceLevel:effectiveQolTraceLevel(), handshakeResponses:qolHandshakeResponses,
+        traceEventsSeen:qolTracesSeen, lastTraceAgeMs:qolLastTraceTs ? Date.now()-qolLastTraceTs : null,
+        qolVersion:passiveQolIdentity()?.version||null });
+      return;
+    }
     if (message.command === 'snapshot-html') { htmlSnapshot(); sendResponse({ ok: true }); return; }
     if (message.command === 'request-qol-trace' && qolInternalsEnabled()) {
       announceInspectorToQol('manual-request'); requestQolMetrics('manual-request');
@@ -2772,6 +2925,7 @@ function inspectorRedactUrlsInText(value) {
   });
 
   chrome.runtime.sendMessage({ type: 'SCI_GET_SETTINGS' }).then(res => {
+    if (!contextAvailable()) return;
     settings = res?.settings || { recording: true, captureDom: true, capturePerformance: true, captureErrors: true, captureQolInternals: false };
     injectBridge(); startDomObserver(); startPerformanceObservers(); installErrorCapture(); startPressureSampling();
     emit({type:'performance',subtype:'qol-trace-capture-config',enabled:qolInternalsEnabled(),traceLevel:effectiveQolTraceLevel(),qolIdentity:passiveQolIdentity()});
@@ -2785,39 +2939,73 @@ function inspectorRedactUrlsInText(value) {
     if (isQolWorkerPage()) emit({ type: 'performance', subtype: 'worker-capture-profile', workerRole: PAGE_ROLE, domObserver: false, resourceTiming: 'aggregated-with-outliers', interaction: interactionState() });
     emit({ type: 'lifecycle', subtype: 'network-connectivity', connectivity: connectionState(), interaction: interactionState() });
     setTimeout(() => captureLightweightStateSnapshot('page-start', false, false).catch(() => {}), 1200);
-  }).catch(() => {
+  }).catch(error => {
+    if (isInvalidatedContextError(error) || !contextAvailable()) {
+      stopInvalidatedContext();
+      return;
+    }
     settings = { recording: true, captureDom: true, capturePerformance: true, captureErrors: true, captureQolInternals: false };
     injectBridge(); startDomObserver(); startPerformanceObservers(); installErrorCapture(); startPressureSampling();
   });
 
   chrome.storage.onChanged.addListener((changes, area) => {
+    if (extensionContextInvalidated) return;
     if (area !== 'local' || !changes.sci_settings) return;
     const wasQolInternals = qolInternalsEnabled();
-    const wasRecording = settings?.recording !== false;
-    const nextSettings = { ...(settings || {}), ...(changes.sci_settings.newValue || {}) };
+    const previousSettings = settings || {};
+    const wasRecording = previousSettings.recording !== false;
+    const wasDomCapture = !!previousSettings.captureDom;
+    const wasPerformanceCapture = !!previousSettings.capturePerformance;
+    const nextSettings = { ...previousSettings, ...(changes.sci_settings.newValue || {}) };
     if (wasRecording && nextSettings.recording === false) flushTransientAggregates('recording-stopped');
     settings = nextSettings;
     if (wasQolInternals !== qolInternalsEnabled()) {
       qolTracesSeen=0; qolHandshakeResponses=0; qolLastTraceTs=0; qolHandshakeRequests=0; qolTraceCheckSerial++;
       emit({type:'performance',subtype:'qol-trace-capture-config',enabled:qolInternalsEnabled(),traceLevel:effectiveQolTraceLevel(),qolIdentity:passiveQolIdentity()});
     }
-    if (!settings.capturePerformance) finishScrollSample('capture-disabled');
-    if (settings.captureDom) startDomObserver(); else stopDomObserver();
-    startPerformanceObservers();
+    const recordingChanged = wasRecording !== (settings.recording !== false);
+    const performanceChanged = !!nextSettings.capturePerformance !== wasPerformanceCapture;
+    const domChanged = !!nextSettings.captureDom !== wasDomCapture;
+    if (recordingChanged || performanceChanged || domChanged) {
+      if (!settings.recording || !settings.capturePerformance) finishScrollSample('capture-disabled');
+      if (recordingChanged || domChanged) {
+        if (settings.recording && settings.captureDom) startDomObserver(); else stopDomObserver();
+      }
+      if (recordingChanged || performanceChanged) {
+        if (settings.recording && settings.capturePerformance) {
+          startPerformanceObservers();
+          startPressureSampling();
+        } else {
+          stopPerformanceObservers();
+          stopPressureSampling();
+        }
+      }
+    }
     const nowQolInternals = qolInternalsEnabled();
+    const traceLevelChanged = String(previousSettings.qolTraceLevel || 'off') !== String(settings.qolTraceLevel || 'off');
     if (nowQolInternals) {
       startQolPresence();
-      announceInspectorToQol('settings-change');
-      setTimeout(() => requestQolMetrics('settings-change'), 100);
-    } else {
+      if (!wasQolInternals || traceLevelChanged) {
+        announceInspectorToQol('settings-change');
+        setTimeout(() => { if (qolInternalsEnabled()) requestQolMetrics('settings-change'); }, 100);
+      }
+    } else if (wasQolInternals) {
       stopQolPresence();
-      // If detailed tracing was active, send one explicit OFF handshake so QoL
-      // stops immediately instead of waiting for its peer TTL to expire.
-      if (wasQolInternals) announceInspectorToQol('settings-change-off');
+      // Notify QoL once to stop tracing, even if the Inspector recording is paused.
+      announceInspectorToQol('settings-change-off');
       activeQolOperations.clear();
       completedQolOperations.length = 0;
       recentQol.length = 0;
     }
+  });
+
+  // The compatibility heartbeat detects reloads even while recording is off.
+  // An old content script must not call getManifest() on an invalidated runtime;
+  // checking the runtime ID is enough here and avoids another Chrome API call.
+  // Do not stop a healthy instance that hears a notice from a stale script.
+  window.addEventListener('sci:extension-context-invalidated', () => {
+    if (contextAvailable()) return;
+    stopInvalidatedContext();
   });
 })();
 
@@ -2863,6 +3051,64 @@ function inspectorRedactUrlsInText(value) {
   let storyNetSeq = 0;
   let recording = false;
   let lastStorySampleAt = 0;
+  let storyMountedSampledAt = 0;
+  let storyMountedRoute = '';
+  let cachedStoryMounted = null;
+  let heartbeatTimer = null;
+  let stopped = false;
+  // Capture our main collector's lifetime object once. If another extension
+  // instance is injected later, it cannot redirect this old probe's callbacks.
+  const contentLifetime = (() => {
+    try { return window.__SCI_INSPECTOR_CONTENT_LIFETIME_V1__ || null; }
+    catch (_) { return null; }
+  })();
+  let inspectorVersion = 'unknown';
+  try { inspectorVersion = chrome.runtime.getManifest().version || 'unknown'; } catch (_) {}
+
+  function stopStaleHeartbeat() {
+    if (stopped) return;
+    stopped = true;
+    recording = false;
+    if (heartbeatTimer != null) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+    requests.clear();
+    chainCounts.clear();
+    // Never delete markers belonging to a newer Inspector instance.
+    try {
+      const el = root();
+      if (el?.getAttribute(ATTR.instance) === instanceId) {
+        for (const name of Object.values(ATTR)) el.removeAttribute(name);
+      }
+    } catch (_) {}
+    if (contentLifetime?.stopCore) {
+      try { contentLifetime.stopCore(); } catch (_) {}
+    } else {
+      try { window.dispatchEvent(new Event('sci:extension-context-invalidated')); } catch (_) {}
+    }
+  }
+  if (contentLifetime) {
+    contentLifetime.stopDriver = stopStaleHeartbeat;
+    if (contentLifetime.invalidated) stopStaleHeartbeat();
+  }
+
+  function liveExtensionContext() {
+    if (stopped) return false;
+    try {
+      // Do not call getManifest() or any runtime method from the 5-second
+      // heartbeat. After an extension reload, Chrome can remove runtime or
+      // make its methods throw even when this old content script still exists.
+      // Version was cached once during startup. Actual message failures are
+      // handled by the normal sendMessage rejection paths.
+      const runtime = typeof chrome === 'undefined' ? null : chrome.runtime;
+      if (!runtime?.id) {
+        stopStaleHeartbeat();
+        return false;
+      }
+      return true;
+    } catch (_) {
+      stopStaleHeartbeat();
+      return false;
+    }
+  }
 
   function root() { return document.documentElement || null; }
   function norm(v) { return String(v == null ? '' : v).replace(/\s+/g, ' ').trim(); }
@@ -2909,17 +3155,22 @@ function inspectorRedactUrlsInText(value) {
   }
 
   async function readRecording() {
+    if (!liveExtensionContext()) return false;
     let next = null;
     try {
       const response = await chrome.runtime.sendMessage({ type: 'SCI_GET_SETTINGS' });
       if (response?.ok && response.settings) next = !!response.settings.recording;
-    } catch (_) {}
+    } catch (error) {
+      if (/extension context invalidated|context invalidated/i.test(String(error?.message || error || ''))) stopStaleHeartbeat();
+    }
+    if (stopped) return false;
     if (next == null) {
       try {
         const stored = await chrome.storage.local.get(SETTINGS_KEY);
         next = !!stored?.[SETTINGS_KEY]?.recording;
       } catch (_) { next = false; }
     }
+    if (stopped) return false;
     recording = !!next;
     return recording;
   }
@@ -2928,20 +3179,40 @@ function inspectorRedactUrlsInText(value) {
     const el = root();
     if (!el) return;
     try {
-      if (value == null || value === '') el.removeAttribute(name);
-      else el.setAttribute(name, String(value));
+      if (value == null || value === '') {
+        if (el.hasAttribute(name)) el.removeAttribute(name);
+      } else if (el.getAttribute(name) !== String(value)) {
+        el.setAttribute(name, String(value));
+      }
     } catch (_) {}
   }
 
+  function cachedStoryMountedMessages(now = Date.now()) {
+    if (!isStoryRoute()) {
+      storyMountedRoute = '';
+      cachedStoryMounted = null;
+      storyMountedSampledAt = 0;
+      return null;
+    }
+    if (storyMountedRoute !== location.pathname || now - storyMountedSampledAt >= STORY_SAMPLE_MS) {
+      cachedStoryMounted = storyMountedMessages();
+      storyMountedSampledAt = now;
+      storyMountedRoute = location.pathname;
+    }
+    return cachedStoryMounted;
+  }
+
   function publishHeartbeat() {
+    if (!liveExtensionContext()) return;
     const el = root();
     if (!el) return;
-    const mounted = storyMountedMessages();
+    const now = Date.now();
+    const mounted = cachedStoryMountedMessages(now);
     setAttr(ATTR.present, '1');
     setAttr(ATTR.ready, '1');
     setAttr(ATTR.recording, recording ? '1' : '0');
-    setAttr(ATTR.version, chrome.runtime.getManifest().version || 'unknown');
-    setAttr(ATTR.heartbeat, Date.now());
+    setAttr(ATTR.version, inspectorVersion);
+    setAttr(ATTR.heartbeat, now);
     setAttr(ATTR.heartbeatSeq, ++heartbeatSeq);
     setAttr(ATTR.instance, instanceId);
     setAttr(ATTR.storyMounted, mounted == null ? null : mounted);
@@ -2955,7 +3226,7 @@ function inspectorRedactUrlsInText(value) {
   }
 
   function emit(event) {
-    if (!recording) return;
+    if (!recording || !liveExtensionContext()) return;
     try {
       chrome.runtime.sendMessage({
         type: 'SCI_EVENT',
@@ -2966,14 +3237,18 @@ function inspectorRedactUrlsInText(value) {
           pageUrl: location.href,
           inspectorAddon: 'driver-support-v2'
         }
-      }).catch(() => {});
-    } catch (_) {}
+      }).catch(error => {
+        if (/extension context invalidated|context invalidated/i.test(String(error?.message || error || ''))) stopStaleHeartbeat();
+      });
+    } catch (error) {
+      if (/extension context invalidated|context invalidated/i.test(String(error?.message || error || ''))) stopStaleHeartbeat();
+    }
   }
 
   function emitStoryPressure(now = Date.now()) {
     if (!recording || !isStoryRoute() || now - lastStorySampleAt < STORY_SAMPLE_MS) return;
     lastStorySampleAt = now;
-    const mountedMessages = storyMountedMessages();
+    const mountedMessages = cachedStoryMountedMessages(now);
     if (!Number.isFinite(mountedMessages)) return;
     let domElements = null;
     let resourceEntries = null;
@@ -3074,25 +3349,28 @@ function inspectorRedactUrlsInText(value) {
   }
 
   window.addEventListener('message', event => {
-    if (event.source !== window || !event.data || event.data.source !== BRIDGE_SOURCE) return;
+    if (stopped || event.source !== window || !event.data || event.data.source !== BRIDGE_SOURCE) return;
     try { handleBridgeNetwork(event.data.event || {}); } catch (_) {}
   }, true);
 
   try {
     chrome.storage.onChanged.addListener((changes, area) => {
-      if (area !== 'local' || !changes?.[SETTINGS_KEY]) return;
+      if (stopped || area !== 'local' || !changes?.[SETTINGS_KEY]) return;
       recording = !!changes[SETTINGS_KEY].newValue?.recording;
       publishHeartbeat();
     });
   } catch (_) {}
 
-  async function tick() {
-    await readRecording();
+  function tick() {
+    if (!liveExtensionContext()) return;
     publishHeartbeat();
     emitStoryPressure();
   }
 
-  tick().catch(() => {});
-  setInterval(() => tick().catch(() => {}), HEARTBEAT_MS);
+  // Read the initial state once. Subsequent changes arrive via storage.onChanged;
+  // 5-second Driver-compatible heartbeats do not wake the service worker for
+  // another settings request on every tab.
+  readRecording().then(tick).catch(() => tick());
+  heartbeatTimer = setInterval(tick, HEARTBEAT_MS);
 })();
 /* </SCI_DRIVER_SUPPORT_V2> */

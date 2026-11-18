@@ -915,16 +915,34 @@ function summary(e) {
     }
     return e.subtype || 'DOM change';
   }
-  if (e.type === 'qol') return `${e.subtype || 'telemetry'}${e.feature ? ` · ${e.feature}` : ''}${e.operation ? ` · ${e.operation}` : ''}${e.module ? ` · ${e.module}` : ''}`;
+  if (e.type === 'qol') {
+    const details = qolTraceReasonFields(e);
+    const duration = e.subtype === 'operation-end' && Number.isFinite(e.durationMs) ? ` · ${Math.round(e.durationMs*10)/10}ms wall` : '';
+    return `${e.subtype || 'telemetry'}${e.feature ? ` · ${e.feature}` : ''}${e.operation ? ` · ${e.operation}` : ''}${e.module ? ` · ${e.module}` : ''}${duration}${details.trigger ? ` · trigger ${details.trigger}` : ''}${details.reason ? ` · reason ${details.reason}` : ''}${details.phase ? ` · phase ${details.phase}` : ''}`;
+  }
   if (e.type === 'state') return e.subtype || 'state snapshot';
   if (e.type === 'storage') {
     if (e.subtype === 'chatDraft-write-burst') return `chatDraft burst · ${e.writes || 0} write(s) / ${Math.round(Number(e.durationMs || 0))} ms${e.unchangedWrites ? ` · ${e.unchangedWrites} unchanged` : ''}`;
+    if (e.subtype === 'localStorage-draft-activity-summary') return `chatDraft localStorage · ${e.writes || 0} write(s), ${e.removals || 0} removal(s) · ${Math.round(Number(e.windowMs || 0))} ms`;
     return `${e.subtype || ''} ${e.key || ''}`.trim();
   }
   if (e.type === 'driver' && e.subtype === 'heartbeat-summary') return `Driver heartbeat summary · scheduler ${e.schedulerHeartbeats || 0} · Inspector ${e.inspectorProbeHeartbeats || 0}`;
   return e.subtype || e.type || 'event';
 }
-function isInteresting(e) { if (e.type === 'marker' || e.type === 'marker-context' || e.type === 'error' || e.type === 'qol') return true; if (e.signals?.length) return true; try { return INTEREST_RE.test(JSON.stringify(e)); } catch (_) { return false; } }
+function isInteresting(e) {
+  if (e.type === 'qol') {
+    // A display-only noise filter: never discard, merge, or alter raw QoL events.
+    const subtype=String(e.subtype||'');
+    if (/error|failed|failure|warning|trace-aggregate|setting-change|route-change|performance-mode-change|worker.*(?:crash|replace|lost)/i.test(subtype)) return true;
+    if (e.outcome && /error|fail|timeout|cancel|rate-limit/i.test(String(e.outcome))) return true;
+    if (Number(e.durationMs||0)>=50) return true;
+    if (subtype==='operation-end' && /archive|export|save|import|verify/i.test(`${e.feature||''} ${e.operation||''}`)) return true;
+    return false;
+  }
+  if (e.type === 'marker' || e.type === 'marker-context' || e.type === 'error') return true;
+  if (e.signals?.length) return true;
+  try { return INTEREST_RE.test(JSON.stringify(e)); } catch (_) { return false; }
+}
 function classFor(e) { if (e.type === 'marker' || e.type === 'marker-context') return 'marker'; if (e.type === 'error' && e.likelyNonCriticalTracker) return 'interesting'; if (e.type === 'error' || (e.type === 'network' && e.status >= 400)) return 'error'; if (e.type === 'performance' && (e.durationMs || 0) >= 1000) return 'slow'; if (isInteresting(e)) return 'interesting'; return ''; }
 
 function buildLongTaskAttributionDiagnostics(events) {
@@ -1226,10 +1244,11 @@ function compactVersionProjection(e) {
   if (e.type === 'lifecycle' && /^(page-show|page-hide|page-freeze|page-resume)$/.test(e.subtype || '')) return { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, persisted:e.persisted===true };
   if (e.type === 'performance' && e.subtype === 'page-pressure') return decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, pageUrl:e.pageUrl || e.url, reason:e.reason, pressureSampleMode:e.pressureSampleMode, pressureSamplerVersion:e.pressureSamplerVersion, pressureCacheDecision:e.pressureCacheDecision, cachedMeasurementAgeMs:e.cachedMeasurementAgeMs, relatedRequestId:e.relatedRequestId, generationResponseTs:e.generationResponseTs, backendDurationMs:e.backendDurationMs, spikeId:e.spikeId, domElements:e.domElements, mountedMessages:e.mountedMessages, mountedMessageKind:e.mountedMessageKind, jsHeapUsedBytes:e.jsHeapUsedBytes, jsHeapTotalBytes:e.jsHeapTotalBytes, resourceEntries:e.resourceEntries, resourceTimingCapacityHint:e.resourceTimingCapacityHint });
   if (e.type === 'performance' && e.subtype === 'resource-timing-buffer-full') return { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, pageUrl:e.pageUrl || e.url, configuredSize:e.configuredSize, resourceEntries:e.resourceEntries, clearAttempted:e.clearAttempted, cleared:e.cleared, clearError:e.clearError, occurrence:e.occurrence, suppressedSinceLast:e.suppressedSinceLast };
-  if (e.type === 'dom' && e.subtype === 'mutation-batch') return decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, pageUrl:e.pageUrl || e.url, stats:{ totalMutations:e.stats?.totalMutations||0, qolRelated:e.stats?.qolRelated||0, qolOwned:e.stats?.qolOwned||0, noOp:e.stats?.noOp||0, messageNodesAdded:e.stats?.messageNodesAdded||0, messageNodesRemoved:e.stats?.messageNodesRemoved||0, mountedMessages:e.stats?.mountedMessages, observerCallbacks:e.stats?.observerCallbacks||0, inspectorObserverMs:e.stats?.inspectorObserverMs||0, inspectorObserverWallMs:e.stats?.inspectorObserverWallMs, observerTimingContaminatedCallbacks:e.stats?.observerTimingContaminatedCallbacks||0, observerTimingContaminatedWallMs:e.stats?.observerTimingContaminatedWallMs||0, inspectorFlushMs:e.stats?.inspectorFlushMs||0, largeDomMode:e.stats?.largeDomMode===true, fastModeUsed:e.stats?.fastModeUsed===true, fastModeCallbacks:e.stats?.fastModeCallbacks||0, fastModeMutations:e.stats?.fastModeMutations||0, budgetSkippedMutationRecords:e.stats?.budgetSkippedMutationRecords||0, budgetExceededCallbacks:e.stats?.budgetExceededCallbacks||0, recordLimitCallbacks:e.stats?.recordLimitCallbacks||0, fastModeReasons:(e.stats?.fastModeReasons||[]).slice(0,6), maxObserverCallbackMs:e.stats?.maxObserverCallbackMs||0, observerCallbacksOver16ms:e.stats?.observerCallbacksOver16ms||0, observerCallbacksOver50ms:e.stats?.observerCallbacksOver50ms||0, topPatterns:(e.stats?.topPatterns||[]).slice(0,8) } });
-  if (e.type === 'performance' && (e.subtype === 'long-task' || e.subtype === 'long-animation-frame')) return decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, entryStartTs:e.entryStartTs, entryEndTs:e.entryEndTs, startTimeMs:e.startTimeMs, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, durationMs:e.durationMs||0, blockingDurationMs:e.blockingDurationMs||0, scripts:e.subtype==='long-animation-frame'?(e.scripts||[]).slice(0,3):undefined, inputCorrelation:e.inputCorrelation||null, attribution:e.attribution||null, pageUrl:e.pageUrl || e.url, url:e.url || e.pageUrl });
+  if (e.type === 'dom' && e.subtype === 'mutation-batch') return decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, pageUrl:e.pageUrl || e.url, stats:{ totalMutations:e.stats?.totalMutations||0, qolRelated:e.stats?.qolRelated||0, qolOwned:e.stats?.qolOwned||0, noOp:e.stats?.noOp||0, researchStatusMutations:e.stats?.researchStatusMutations||0, messageNodesAdded:e.stats?.messageNodesAdded||0, messageNodesRemoved:e.stats?.messageNodesRemoved||0, mountedMessages:e.stats?.mountedMessages, observerCallbacks:e.stats?.observerCallbacks||0, inspectorObserverMs:e.stats?.inspectorObserverMs||0, inspectorObserverWallMs:e.stats?.inspectorObserverWallMs, observerTimingContaminatedCallbacks:e.stats?.observerTimingContaminatedCallbacks||0, observerTimingContaminatedWallMs:e.stats?.observerTimingContaminatedWallMs||0, inspectorFlushMs:e.stats?.inspectorFlushMs||0, largeDomMode:e.stats?.largeDomMode===true, fastModeUsed:e.stats?.fastModeUsed===true, fastModeCallbacks:e.stats?.fastModeCallbacks||0, fastModeMutations:e.stats?.fastModeMutations||0, budgetSkippedMutationRecords:e.stats?.budgetSkippedMutationRecords||0, budgetExceededCallbacks:e.stats?.budgetExceededCallbacks||0, recordLimitCallbacks:e.stats?.recordLimitCallbacks||0, fastModeReasons:(e.stats?.fastModeReasons||[]).slice(0,6), maxObserverCallbackMs:e.stats?.maxObserverCallbackMs||0, observerCallbacksOver16ms:e.stats?.observerCallbacksOver16ms||0, observerCallbacksOver50ms:e.stats?.observerCallbacksOver50ms||0, topPatterns:(e.stats?.topPatterns||[]).slice(0,8) } });
+  if (e.type === 'performance' && (e.subtype === 'long-task' || e.subtype === 'long-animation-frame')) return decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, entryStartTs:e.entryStartTs, entryEndTs:e.entryEndTs, startTimeMs:e.startTimeMs, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, durationMs:e.durationMs||0, blockingDurationMs:e.blockingDurationMs||0, researchExport:e.researchExport||null, scripts:e.subtype==='long-animation-frame'?(e.scripts||[]).slice(0,3):undefined, inputCorrelation:e.inputCorrelation||null, attribution:e.attribution||null, pageUrl:e.pageUrl || e.url, url:e.url || e.pageUrl });
   if (e.type === 'performance' && (e.subtype === 'generation-response-dom-signal' || e.subtype === 'generation-reply-text-observed' || e.subtype === 'generation-first-message-dom' || e.subtype === 'auto-lag-spike' || e.subtype === 'generation-followup-skipped-late')) return decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, pageUrl:e.pageUrl || e.url, relatedRequestId:e.relatedRequestId, generationResponseTs:e.generationResponseTs, latencyMs:e.latencyMs, signalKind:e.signalKind, signalConfidence:e.signalConfidence, renderSignalVersion:e.renderSignalVersion,
     phase:e.phase, textChars:e.textChars, hasLayoutBox:e.hasLayoutBox, exactReplyIdMatched:e.exactReplyIdMatched, observation:e.observation, paintConfirmed:e.paintConfirmed, mountedMessagesAtResponse:e.mountedMessagesAtResponse, mountedMessages:e.mountedMessages, mountedDelta:e.mountedDelta, mountedMessageKind:e.mountedMessageKind, generationContentAdded:e.generationContentAdded===true, matchedReplyId:e.matchedReplyId===true, priorMessageReinserted:e.priorMessageReinserted===true, spikeId:e.spikeId, rollingWindowMs:e.rollingWindowMs, rollingLongTaskMs:e.rollingLongTaskMs, longTaskCount:e.longTaskCount, worstLongTaskMs:e.worstLongTaskMs, reason:e.reason, intendedDelayMs:e.intendedDelayMs, actualDelayMs:e.actualDelayMs, latenessMs:e.latenessMs, coalescedCount:e.coalescedCount });
+  if (e.type === 'performance' && e.subtype === 'research-export-phase') return {type:e.type,subtype:e.subtype,ts:e.ts,pageId:e.pageId,pageRole:e.pageRole||null,pageUrl:e.pageUrl||e.url,phase:e.phase,previousPhase:e.previousPhase,observation:e.observation};
   if (e.type === 'performance' && e.subtype === 'resource') return decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, name:e.name, durationMs:e.durationMs||0, transferSize:e.transferSize||0, encodedBodySize:e.encodedBodySize||0, thirdParty:e.thirdParty===true });
   if (e.type === 'performance' && e.subtype === 'resource-summary') return { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, host:e.host, initiatorType:e.initiatorType, requests:e.requests||0, totalDurationMs:e.totalDurationMs||0, maxDurationMs:e.maxDurationMs||0, totalTransferSize:e.totalTransferSize||0 };
   if (e.type === 'performance' && e.subtype === 'worker-resource-summary') return { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, pageRole:e.pageRole||null, workerRole:e.workerRole, endpointGroup:e.endpointGroup, initiatorType:e.initiatorType, requests:e.requests||0, totalDurationMs:e.totalDurationMs||0, avgDurationMs:e.avgDurationMs||0, medianDurationMs:e.medianDurationMs||0, p95DurationMs:e.p95DurationMs||0, maxDurationMs:e.maxDurationMs||0, over500ms:e.over500ms||0, over1000ms:e.over1000ms||0, totalTransferSize:e.totalTransferSize||0, firstAt:e.firstAt, lastAt:e.lastAt };
@@ -1241,7 +1260,10 @@ function compactVersionProjection(e) {
   if (e.type === 'performance' && (e.subtype === 'qol-trace-link-status' || e.subtype === 'qol-trace-capture-config')) return {type:e.type,subtype:e.subtype,ts:e.ts,pageId:e.pageId,status:e.status,enabled:e.enabled,traceLevel:e.traceLevel,handshakes:e.handshakes,received:e.received,lastTraceAgeMs:e.lastTraceAgeMs,handshakeResponses:e.handshakeResponses,qolIdentity:e.qolIdentity,reason:e.reason};
   if (e.type === 'performance' && e.subtype === 'inspector-self-throttle') return { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, reason:e.reason, durationMs:e.durationMs||0, queuedEvents:e.queuedEvents||0, eventsThisSecond:e.eventsThisSecond||0, observerWallMs:e.observerWallMs||0, mutationRecords:e.mutationRecords||0 };
   if (e.type === 'lifecycle' && /^(network-offline|network-online)$/.test(e.subtype || '')) return { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, tabId:e.tabId, pageUrl:e.pageUrl||e.url };
-  if (e.type === 'storage') return { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, key:e.key, writes:e.writes, valueLength:e.valueLength, lastValueLength:e.lastValueLength };
+  if (e.type === 'storage') return { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, key:e.key, storage:e.storage,
+    writes:e.writes, suppressedWrites:e.suppressedWrites, removals:e.removals, uniqueKeys:e.uniqueKeys,
+    firstAt:e.firstAt, lastAt:e.lastAt, windowMs:e.windowMs, maxValueLength:e.maxValueLength,
+    valueLength:e.valueLength, lastValueLength:e.lastValueLength };
   if (e.type === 'error') return decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, message:e.message, reason:e.reason, likelyNonCriticalTracker:e.likelyNonCriticalTracker===true, resourceUrl:e.resourceUrl, trackerHost:e.trackerHost, occurrences:e.occurrences||0, sampleResourceUrl:e.sampleResourceUrl });
   if (e.type === 'marker' || e.type === 'marker-context') return { type:e.type, subtype:e.subtype, ts:e.ts, id:e.id, label:e.label, pageId:e.pageId, pageUrl:e.pageUrl||e.url, captureWindow:e.captureWindow, relatedMarkerTs:e.relatedMarkerTs, recentContext:Array.isArray(e.recentContext)?new Array(e.recentContext.length):undefined };
   if (e.type === 'driver') return decorateCompactProjection(e, {
@@ -1292,7 +1314,7 @@ async function scanFullCaptureVersionSummary(db, total, button) {
     tx.onerror = () => reject(tx.error);
   });
   const summary = buildSummary(projected);
-  return { eventCount: total, firstTs, lastTs, durationMs: firstTs != null && lastTs != null ? Math.max(0,lastTs-firstTs) : 0, ...buildVersionDiagnostics(projected), quickDislike: summary.quickDislike, recommendationFeedback: summary.recommendationFeedback, nativeCharacterRating:summary.nativeCharacterRating, feedbackTransactionTimeline:summary.feedbackTransactionTimeline, apiEndpointInventory:summary.apiEndpointInventory, nativeMemoryProbe:summary.nativeMemoryProbe, messageBookmarkDiagnostics:summary.messageBookmarkDiagnostics, pageStartupSessions:summary.pageStartupSessions, pageStartupCost:summary.pageStartupCost, pageSessionComparison:summary.pageSessionComparison, lorebookOperations:summary.lorebookOperations, favoritesCoverage:summary.favoritesCoverage, inspectorWorkerActivity:summary.inspectorWorkerActivity, qolTraceAvailability:summary.qolTraceAvailability, rateLimits:summary.rateLimits, captureConfidence:summary.captureConfidence, performanceByContext:summary.performanceByContext, domRepetition:summary.domRepetition, messageRemountPressure:summary.messageRemountPressure, diagnosticConsistencyWarnings: summary.diagnosticConsistencyWarnings, listingRefill: buildListingRefillDiagnostics(projected), captureHealth: summary.captureHealth, scrollAndInput: summary.scrollAndInput, longTaskAttribution: summary.longTaskAttribution, generationRender: buildGenerationRenderDiagnostics(projected), recentPerformance: buildRecentPerformanceComparison(projected), pageHotspots: buildPageInstanceHotspots(projected), pagePressureGrowth: buildPagePressureGrowthDiagnostics(projected), autoLagSpikes: projected.filter(e=>e.type==='performance'&&e.subtype==='auto-lag-spike').length, summary };
+  return { eventCount: total, firstTs, lastTs, durationMs: firstTs != null && lastTs != null ? Math.max(0,lastTs-firstTs) : 0, ...buildVersionDiagnostics(projected), quickDislike: summary.quickDislike, recommendationFeedback: summary.recommendationFeedback, nativeCharacterRating:summary.nativeCharacterRating, feedbackTransactionTimeline:summary.feedbackTransactionTimeline, apiEndpointInventory:summary.apiEndpointInventory, nativeMemoryProbe:summary.nativeMemoryProbe, messageBookmarkDiagnostics:summary.messageBookmarkDiagnostics, pageStartupSessions:summary.pageStartupSessions, pageStartupCost:summary.pageStartupCost, pageSessionComparison:summary.pageSessionComparison, lorebookOperations:summary.lorebookOperations, favoritesCoverage:summary.favoritesCoverage, inspectorWorkerActivity:summary.inspectorWorkerActivity, qolTraceAvailability:summary.qolTraceAvailability,     rateLimits:summary.rateLimits, researchExport:summary.researchExport, captureConfidence:summary.captureConfidence, performanceByContext:summary.performanceByContext, domRepetition:summary.domRepetition, messageRemountPressure:summary.messageRemountPressure, diagnosticConsistencyWarnings: summary.diagnosticConsistencyWarnings, listingRefill: buildListingRefillDiagnostics(projected), captureHealth: summary.captureHealth, scrollAndInput: summary.scrollAndInput, longTaskAttribution: summary.longTaskAttribution, generationRender: buildGenerationRenderDiagnostics(projected), recentPerformance: buildRecentPerformanceComparison(projected), pageHotspots: buildPageInstanceHotspots(projected), pagePressureGrowth: buildPagePressureGrowthDiagnostics(projected), autoLagSpikes: projected.filter(e=>e.type==='performance'&&e.subtype==='auto-lag-spike').length, summary };
 }
 
 
@@ -1459,6 +1481,7 @@ function buildRecommendationFeedbackDiagnostics(events, roleIndex = buildPageRol
   const medianAttempts=attemptCounts.length ? median(attemptCounts) : 0;
 
   const preflights = events.filter(e => e.type==='network' && isNetworkRequestEvent(e) && String(e.method || '').toUpperCase()==='OPTIONS' && isRatingEndpoint(e) && (e.browserObserver===true || e.pageId==='browser-webrequest'));
+  const recommendationWorkerPages = roleIndex.workerPages.filter(x=>x.role==='qol-recommendation-worker');
   const workerAttempts = physicalAttempts.filter(x=>x.workerRole==='qol-recommendation-worker');
   const workerTransactions = transactions.filter(x=>x.workerRole==='qol-recommendation-worker');
   const workerLatencies = workerAttempts.map(x=>Number(x.durationMs)).filter(Number.isFinite);
@@ -1489,7 +1512,7 @@ function buildRecommendationFeedbackDiagnostics(events, roleIndex = buildPageRol
     if(!perfByPage.has(pageId)) perfByPage.set(pageId,{pageId,tabId:role?.tabId??e.tabId??null,kind:role?.kind||null,firstTs:eventTs(e),lastTs:eventTs(e),longTasks:0,longTaskMs:0,longAnimationFrames:0,loafBlockingMs:0,domMin:null,domMax:null,heapMin:null,heapMax:null,observerCallbacks:0,inspectorObserverMs:0});
     const x=perfByPage.get(pageId); x.firstTs=Math.min(x.firstTs,eventTs(e)); x.lastTs=Math.max(x.lastTs,eventTs(e)); return x;
   };
-  for(const seed of roleIndex.workerPages){
+  for(const seed of recommendationWorkerPages){
     if(!perfByPage.has(seed.pageId)) perfByPage.set(seed.pageId,{pageId:seed.pageId,tabId:seed.tabId??null,kind:seed.kind||null,firstTs:seed.startTs||0,lastTs:seed.startTs||0,longTasks:0,longTaskMs:0,longAnimationFrames:0,loafBlockingMs:0,domMin:null,domMax:null,heapMin:null,heapMax:null,observerCallbacks:0,inspectorObserverMs:0});
   }
   for(const e of events){
@@ -1541,7 +1564,7 @@ function buildRecommendationFeedbackDiagnostics(events, roleIndex = buildPageRol
     ratingSuccesses:transactions.filter(x=>x.ok).length,
     ratingFailures:transactions.filter(x=>!x.ok && x.failures>0).length,
     ratingNoResponse:transactions.filter(x=>!x.ok && x.failures===0).length,
-    workerPages:roleIndex.workerPages.length,
+    workerPages:recommendationWorkerPages.length,
     jobCount:jobs.length,
     jobs,
     workerRatingActions:workerTransactions.length,
@@ -1658,15 +1681,38 @@ function buildCounterDriverDiagnostics(events) {
   const heartbeatSummaries = logical.filter(e => e.subtype === 'heartbeat-summary');
   const schedulerHeartbeats = heartbeatSummaries.reduce((n,e)=>n+(Number(e.schedulerHeartbeats)||0),0);
   const inspectorProbeHeartbeats = heartbeatSummaries.reduce((n,e)=>n+(Number(e.inspectorProbeHeartbeats)||0),0);
-  const nums = arr => arr.map(e => Number(e.driverNumber)).filter(Number.isFinite);
+  const nums = arr => arr.filter(e=>e.driverNumber!==null && e.driverNumber!==undefined && e.driverNumber!=='')
+    .map(e => Number(e.driverNumber)).filter(Number.isFinite);
   const sendNums = nums(sends), confirmNums = nums(confirms);
   const sendCountByNumber = {};
   for (const n of sendNums) sendCountByNumber[n] = (sendCountByNumber[n] || 0) + 1;
   const retriedNumbers = Object.entries(sendCountByNumber).filter(([,n])=>n>1).map(([n,count])=>({number:Number(n),attempts:count})).sort((a,b)=>a.number-b.number);
-  const lastConfirmed = confirmNums.length ? Math.max(...confirmNums) : null;
+  // Never treat missing/null numeric markers as counter #0, or spread a
+  // 100,000+ event endurance run into function arguments.
+  const lastConfirmed = confirmNums.length ? confirmNums.reduce((n,v)=>Math.max(n,v),-Infinity) : null;
+  let observedChat200 = 0;
+  const observedChat429 = [];
+  for (const e of events) {
+    if (!isChatSuccessResponse(e) && !(e.type==='network' && /response$/.test(e.subtype||'') &&
+      String(e.method||'').toUpperCase()==='POST' && Number(e.status)===429 && /(?:^|\/)chat$/.test(endpointLabel(e)))) continue;
+    if (Number(e.status)>=200 && Number(e.status)<300) observedChat200++;
+    else observedChat429.push({ ts:eventTs(e), requestFingerprint:e.requestFingerprint||null, errorCode:e.errorCode||e.body?.errorCode||null });
+  }
+  observedChat429.sort((a,b)=>a.ts-b.ts);
+  const substantiveDriverMarkers = logical.filter(e=>!['heartbeat-summary','inspector-probe-heartbeat'].includes(String(e.subtype||''))).length;
+  const closeLimitPairs=[];
+  for (let i=1;i<observedChat429.length;i++) {
+    const a=observedChat429[i-1], b=observedChat429[i];
+    const gapMs=b.ts-a.ts;
+    if (gapMs>=0 && gapMs<=2*60*60*1000) closeLimitPairs.push({firstAt:a.ts,lastAt:b.ts,gapMs,
+      sameRequestFingerprint:!!(a.requestFingerprint && a.requestFingerprint===b.requestFingerprint)});
+  }
 
   return {
     rawEvents: raw.length,
+    observedChat200, observedChat429:observedChat429.length,
+    recentChat429:observedChat429.slice(-12), closeLimitPairs:closeLimitPairs.slice(-12),
+    driverTelemetryStatus:substantiveDriverMarkers?'observed':observedChat200>=500?'missing-during-generation-workload':'not-observed',
     logicalEvents: logical.length,
     mirroredDuplicates,
     orphanMirrors: orphanMirrors.length,
@@ -1708,7 +1754,8 @@ function buildDiagnosticConsistencyWarnings(events, facts) {
   const rawClears=events.filter(e=>e.type==='performance'&&e.subtype==='resource-timing-buffer-full'&&e.cleared===true).length;
   if((facts.captureHealth?.resourceTimingBufferClears||0)!==rawClears) push('resource-timing-clear-count-mismatch',rawClears,facts.captureHealth?.resourceTimingBufferClears||0,'Capture health clear count must reflect successful clear events.');
   const roleIndex=facts.pageRoleIndex || buildPageRoleIndex(events);
-  if((facts.recommendationFeedback?.workerPages||0)!==roleIndex.workerPages.length) push('recommendation-worker-page-count-mismatch',roleIndex.workerPages.length,facts.recommendationFeedback?.workerPages||0,'Recommendation worker count must match persistent page-role detection.');
+  const recommendationPageCount=roleIndex.workerPages.filter(x=>x.role==='qol-recommendation-worker').length;
+  if((facts.recommendationFeedback?.workerPages||0)!==recommendationPageCount) push('recommendation-worker-page-count-mismatch',recommendationPageCount,facts.recommendationFeedback?.workerPages||0,'Recommendation worker count must match recommendation-only page-role detection (not Bot Backup, Bot Status, or other helpers).');
   const browserRatingPosts=events.filter(e=>e.type==='network'&&isNetworkRequestEvent(e)&&e.browserObserver===true&&String(e.method||'').toUpperCase()==='POST'&&/\/spicychat-prod\/ratings\/?$/i.test(endpointLabel(e))&&Number(requestBodyOf(e)?.rating)===-1).length;
   if(browserRatingPosts>0 && (facts.recommendationFeedback?.ratingPosts||0)!==browserRatingPosts) push('rating-post-count-mismatch',browserRatingPosts,facts.recommendationFeedback?.ratingPosts||0,'When browser-level rating observation is available, canonical physical POST count should match it.');
   const r=facts.recommendationFeedback;
@@ -1716,7 +1763,7 @@ function buildDiagnosticConsistencyWarnings(events, facts) {
   const d=facts.counterDriver;
   if(d && d.rawEvents && d.logicalEvents+d.mirroredDuplicates!==d.rawEvents) push('driver-dedupe-total-mismatch',d.rawEvents,d.logicalEvents+d.mirroredDuplicates,'Counter Driver raw markers must partition into canonical logical events plus mirrored duplicates.');
   const qt=facts.qolTrace;
-  if(qt?.sequenceGaps>0) push('qol-trace-sequence-gap',0,qt.sequenceGaps,'QoL Trace sequence numbers indicate one or more detailed trace events were not observed. High-level Inspector capture remains usable, but QoL operation accounting may be incomplete.');
+  if(qt?.sequenceGaps>0 && !qt?.sequenceCoverage?.knownCoalesced) push('qol-trace-sequence-coverage',0,qt.sequenceGaps,'Unobserved QoL sequence positions; these can reflect filtering, trace limits, or delivery loss. No mechanism can be inferred from position gaps alone.');
   return warnings;
 }
 
@@ -1838,12 +1885,55 @@ function qolOutcomeIsError(value) {
   return !!(outcome && /^(?:fail(?:ed|ure)?|error|exception|timeout|timed-out|abort(?:ed)?|cancel(?:led|ed)?|rejected)$/i.test(outcome));
 }
 
+// Read-only v2 trace attribution. Only stable, bounded diagnostic labels are
+// allowed into aggregates: never echo freeform values, URLs, IDs or page text.
+// Missing trigger/reason is reported as missing, not guessed from timing.
+function safeQolAttributionLabel(value) {
+  if (typeof value !== 'string') return null;
+  const label = value.trim().toLowerCase();
+  if (!label || label.length > 90 || !/^[a-z][a-z0-9_.:-]*(?: [a-z][a-z0-9_.:-]*){0,2}$/.test(label)) return null;
+  if (/(?:^|[._:-])(?:[a-f0-9]{16,}|[0-9]{8,}|auth|secret|token|password|sessionid|userid|chatid|botid)(?:$|[._:-])/.test(label)) return null;
+  return label;
+}
+function qolTraceReasonFields(event) {
+  const payload = event?.payload && typeof event.payload === 'object' ? event.payload : {};
+  const result = payload.result && typeof payload.result === 'object' ? payload.result : {};
+  const resultMeta = result.meta && typeof result.meta === 'object' ? result.meta : {};
+  const payloadMeta = payload.meta && typeof payload.meta === 'object' ? payload.meta : {};
+  const eventMeta = event?.meta && typeof event.meta === 'object' ? event.meta : {};
+  const sources = [eventMeta, payloadMeta, resultMeta, result, payload];
+  const label = keys => {
+    for (const source of sources) for (const key of keys) {
+      const value = safeQolAttributionLabel(source[key]);
+      if (value) return value;
+    }
+    return null;
+  };
+  const timing = keys => {
+    for (const source of [resultMeta, result, eventMeta, payloadMeta, payload, event]) for (const key of keys) {
+      const value = source?.[key];
+      const number = typeof value === 'number' ? value : null;
+      if (number !== null && Number.isFinite(number) && number >= 0 && number <= 86400000) return Math.round(number * 10) / 10;
+    }
+    return null;
+  };
+  return {trigger:label(['trigger','triggerReason','source','scheduleSource','triggerSource']),
+    reason:label(['reason','dirtyReason','skipReason','cause']),
+    phase:label(['phase','stage','step']),
+    activeMs:timing(['activeMs','durationActiveMs','activeProcessingMs']),
+    synchronousCallMs:timing(['initialSyncCallMs','synchronousCallMs','syncMs']),
+    queueDelayMs:timing(['queueDelayMs','waitMs','queueWaitMs'])};
+}
+
 function buildQolTraceDiagnostics(events) {
   const qRaw = events.filter(e => e.type === 'qol');
   const q = dedupeQolDiagnosticEvents(qRaw);
   if (!q.length) return {
     events:0, explicitTraceEvents:0, protocols:[], sequenceGaps:0, sequenceGapEvents:0,
-    operations:{count:0,totalMs:0,slow50:0,slow200:0,slow1000:0,top:[]},
+    sequenceCoverage:{unobservedPositions:0,streams:0,knownCoalesced:0,sourceAggregationReports:0},
+    traceVolume:{topFamilies:[],rawQolEvents:0,deduplicatedQolEvents:0,repetitiveFamilies:0},
+    operations:{count:0,totalMs:0,slow50:0,slow200:0,slow1000:0,top:[],
+      attribution:{directTriggers:0,inheritedTriggers:0,missingTriggers:0,explicitReasons:0,missingReasons:0,topReasons:[],slowExamples:[]}},
     scheduler:{events:0,deferred:0,coalesced:0,skipped:0,ran:0,queueDelaySamples:0,avgQueueDelayMs:0,p95QueueDelayMs:0},
     storage:{events:0,reads:0,writes:0,totalMs:0,top:[]}, network:{events:0,completed:0,errors:0,totalMs:0,top:[]},
     workers:{events:0,starts:0,ready:0,jobs:0,heartbeats:0,throttled:0,restarts:0,closed:0,top:[]},
@@ -1869,6 +1959,31 @@ function buildQolTraceDiagnostics(events) {
   const sequence = computeFinalQolSequenceGaps(q);
   const sequenceGaps = sequence.missing;
   const sequenceGapEvents = sequence.gapRuns;
+  // Source sequence numbers can intentionally skip due to QoL-side aggregation,
+  // Inspector sampling, or capture boundaries. A hole alone never proves loss.
+  const families = new Map(), coalescedByStream = new Map();
+  for (const e of q) {
+    const family = `${e.subtype || 'unknown'}${e.feature ? ` · ${e.feature}` : ''}`;
+    families.set(family, (families.get(family) || 0) + 1);
+    if (e.subtype === 'trace-aggregate') {
+      const total = Number(e.payload?.coalescedTotal);
+      if (Number.isFinite(total) && total >= 0) {
+        const key = `${e.pageId || ''}|${e.traceSessionId || e.qolSessionId || 'session'}`;
+        coalescedByStream.set(key, Math.max(coalescedByStream.get(key) || 0, total));
+      }
+    }
+  }
+  const knownCoalesced = [...coalescedByStream.values()].reduce((n, x) => n + x, 0);
+  const topRoutine = [...families.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8)
+    .map(([family, count]) => ({family, count}));
+  const sequenceCoverage = {
+    unobservedPositions:sequenceGaps,streams:sequence.streams,
+    knownCoalesced,sourceAggregationReports:q.filter(e=>e.subtype==='trace-aggregate').length,
+    explanation:'Sequence holes are unobserved positions, not proven dropped messages. QoL intentionally coalesces traces; capture filtering, recording boundaries and transport loss may also contribute. Known coalesced counts are cumulative source reports, not a one-for-one subtraction from sequence holes.'
+  };
+  const traceVolume = {topFamilies:topRoutine,rawQolEvents:qRaw.length,deduplicatedQolEvents:q.length,
+    repetitiveFamilies:topRoutine.filter(x=>x.count>=100).length,
+    note:'Routine trace events are summarized in this report, but preserved in raw exports for fidelity. Use Interesting only to focus the event list.'};
 
   const active = new Map();
   const spans = [];
@@ -1889,11 +2004,20 @@ function buildQolTraceDiagnostics(events) {
       const explicitDuration = Number(e.durationMs ?? e.payload?.durationMs);
       const durationMs = Number.isFinite(explicitDuration) ? Math.max(0, explicitDuration) : (start ? Math.max(0, endTs - (Number(start.sourceTs) || eventTs(start))) : null);
       const startTs = start ? (Number(start.sourceTs) || eventTs(start)) : (Number.isFinite(durationMs) ? endTs - durationMs : endTs);
+      const startedWith = qolTraceReasonFields(start);
+      const endedWith = qolTraceReasonFields(e);
       spans.push({
         pageId:e.pageId || start?.pageId || null, operationId:opId,
+        traceSessionId:e.traceSessionId || start?.traceSessionId || e.qolSessionId || start?.qolSessionId || '',
         parentOperationId:e.parentOperationId || start?.parentOperationId || null,
         feature:e.feature || start?.feature || 'unknown', module:e.module || start?.module || null,
         operation:e.operation || start?.operation || 'operation', startTs,endTs,durationMs,
+        trigger:startedWith.trigger || endedWith.trigger,
+        reason:endedWith.reason || startedWith.reason,
+        phase:endedWith.phase || startedWith.phase,
+        activeMs:endedWith.activeMs ?? startedWith.activeMs,
+        synchronousCallMs:endedWith.synchronousCallMs ?? startedWith.synchronousCallMs,
+        queueDelayMs:startedWith.queueDelayMs ?? endedWith.queueDelayMs,
         outcome:normalizedQolOutcome(e.outcome ?? e.payload?.outcome ?? e.payload?.result),
         counts:e.counts || e.payload?.counts || null
       });
@@ -1907,8 +2031,62 @@ function buildQolTraceDiagnostics(events) {
     const key = `${e.pageId||''}|${e.operationId||''}`;
     if (e.operationId && explicitIds.has(key)) continue;
     const endTs = eventTs(e), durationMs = Math.max(0,Number(e.durationMs)||0);
-    spans.push({pageId:e.pageId||null,operationId:e.operationId||null,parentOperationId:e.parentOperationId||null,feature:e.feature||'unknown',module:e.module||null,operation:e.operation||'operation',startTs:endTs-durationMs,endTs,durationMs,outcome:normalizedQolOutcome(e.outcome),counts:e.counts||null,profileOnly:true});
+    const context=qolTraceReasonFields(e);
+    spans.push({pageId:e.pageId||null,operationId:e.operationId||null,
+      traceSessionId:e.traceSessionId||e.qolSessionId||'',parentOperationId:e.parentOperationId||null,
+      feature:e.feature||'unknown',module:e.module||null,operation:e.operation||'operation',
+      startTs:endTs-durationMs,endTs,durationMs,...context,
+      outcome:normalizedQolOutcome(e.outcome),counts:e.counts||null,profileOnly:true});
   }
+
+  // Link child steps to a parent operation without representing a parent's
+  // trigger as the child's direct trigger. The grouping remains bounded and
+  // runs only while producing a report, never during page recording.
+  const completedById = new Map();
+  for (const op of spans) if (op.operationId) completedById.set(
+    `${op.pageId||''}|${op.traceSessionId||''}|${op.operationId}`, op);
+  const causeGroups = new Map();
+  let directTriggers = 0, inheritedTriggers = 0, missingTriggers = 0;
+  let explicitReasons = 0, missingReasons = 0;
+  for (const op of spans) {
+    if (!Number.isFinite(op.durationMs)) continue;
+    const parent = op.parentOperationId ? completedById.get(
+      `${op.pageId||''}|${op.traceSessionId||''}|${op.parentOperationId}`) : null;
+    const inherited = !op.trigger && parent?.trigger ? parent.trigger : null;
+    const trigger = op.trigger || inherited || null;
+    const source = op.trigger ? 'direct' : inherited ? 'parent' : 'not-provided';
+    if (source === 'direct') directTriggers++;
+    else if (source === 'parent') inheritedTriggers++;
+    else missingTriggers++;
+    if (op.reason) explicitReasons++; else missingReasons++;
+    op.reportingTrigger = trigger;
+    op.reportingTriggerSource = source;
+    const label = `${op.feature} · ${op.operation}`;
+    const key = JSON.stringify([label,trigger,op.reason,source]);
+    const row = causeGroups.get(key) || {feature:op.feature,operation:op.operation,
+      trigger:trigger||'not provided',reason:op.reason||'not provided',
+      triggerSource:source,runs:0,totalMs:0,maxMs:0,slow50:0,errors:0};
+    row.runs++; row.totalMs+=op.durationMs;
+    row.maxMs=Math.max(row.maxMs,op.durationMs);
+    if (op.durationMs>=50) row.slow50++;
+    if (qolOutcomeIsError(op.outcome)) row.errors++;
+    causeGroups.set(key,row);
+  }
+  const roundMs = value => Math.round(value*10)/10;
+  const topReasons = [...causeGroups.values()].sort((a,b)=>b.totalMs-a.totalMs||b.maxMs-a.maxMs)
+    .slice(0,12).map(row=>({...row,totalMs:roundMs(row.totalMs),maxMs:roundMs(row.maxMs)}));
+  const slowExamples = spans.filter(op=>Number.isFinite(op.durationMs) && op.durationMs>=50)
+    .sort((a,b)=>b.durationMs-a.durationMs).slice(0,12).map(op=>({
+      feature:op.feature,operation:op.operation,trigger:op.reportingTrigger||'not provided',
+      triggerSource:op.reportingTriggerSource,reason:op.reason||'not provided',
+      phase:op.phase||'not provided',outcome:op.outcome||'unknown',
+      durationMs:roundMs(op.durationMs),activeMs:op.activeMs,synchronousCallMs:op.synchronousCallMs,queueDelayMs:op.queueDelayMs,
+      scanned:Number(op.counts?.scanned||0),changed:Number(op.counts?.changed||0),
+      skipped:Number(op.counts?.skipped||0)
+    }));
+  const attribution = {directTriggers,inheritedTriggers,missingTriggers,
+    explicitReasons,missingReasons,topReasons,slowExamples,
+    interpretation:'Only directly published triggers/reasons are confirmed. Parent triggers are explicitly marked inherited; wall time may include asynchronous waiting and does not establish main-thread CPU use.'};
 
   const opGroups = new Map();
   for (const op of spans) {
@@ -1927,6 +2105,27 @@ function buildQolTraceDiagnostics(events) {
     errors:x.errors,scanned:x.scanned,changed:x.changed
   })).sort((a,b)=>b.totalMs-a.totalMs || b.maxMs-a.maxMs).slice(0,20);
   const operationTotalMs=spans.reduce((n,x)=>n+(Number.isFinite(x.durationMs)?x.durationMs:0),0);
+  const elapsedByStream = new Map();
+  let reportedActiveMs = 0, reportedSyncMs = 0, reportedQueueMs = 0;
+  let activeSamples = 0, syncSamples = 0, queueSamples = 0;
+  for (const op of spans) {
+    if (Number.isFinite(op.activeMs)) {activeSamples++;reportedActiveMs += op.activeMs;}
+    if (Number.isFinite(op.synchronousCallMs)) {syncSamples++;reportedSyncMs += op.synchronousCallMs;}
+    if (Number.isFinite(op.queueDelayMs)) {queueSamples++;reportedQueueMs += op.queueDelayMs;}
+    if (Number.isFinite(op.startTs) && Number.isFinite(op.endTs) && op.endTs >= op.startTs) {
+      const key = `${op.pageId || ''}|${op.traceSessionId || ''}`;
+      const rows = elapsedByStream.get(key) || [];
+      rows.push([op.startTs, op.endTs]); elapsedByStream.set(key, rows);
+    }
+  }
+  const timingSummary = {
+    spanWallSumMs:Math.round(operationTotalMs*10)/10,
+    unionElapsedPerStreamMs:Math.round([...elapsedByStream.values()].reduce((n, rows) => n+intervalUnionMs(rows),0)*10)/10,
+    activeSamples, reportedActiveSumMs:Math.round(reportedActiveMs*10)/10,
+    synchronousCallSamples:syncSamples,reportedSynchronousCallSumMs:Math.round(reportedSyncMs*10)/10,
+    queueSamples,reportedQueueDelaySumMs:Math.round(reportedQueueMs*10)/10,
+    interpretation:'Span wall-time sums double count nested and parallel operations; union elapsed avoids nested time within a page but sums independent tabs. QoL-reported active/synchronous/queue timings are non-additive measurements and not browser CPU time. Never subtract them to invent unmeasured CPU time.'
+  };
 
   const schedulerEvents = q.filter(e => e.category === 'scheduler' || /schedule|scheduler|defer|coalesce|queue|lane|idle-slice/i.test(`${e.subtype||''} ${e.operation||''}`));
   const queueDelays=schedulerEvents.map(e=>Number(e.queueDelayMs ?? e.payload?.queueDelayMs)).filter(Number.isFinite);
@@ -1978,10 +2177,14 @@ function buildQolTraceDiagnostics(events) {
   const longTasks=events.filter(e=>e.type==='performance'&&e.subtype==='long-task'&&Number.isFinite(Number(e.entryStartTs))&&Number.isFinite(Number(e.entryEndTs)));
   const byPage=new Map();for(const op of spans){if(!op.pageId||!Number.isFinite(op.startTs)||!Number.isFinite(op.endTs))continue;const a=byPage.get(op.pageId)||[];a.push(op);byPage.set(op.pageId,a);}for(const a of byPage.values())a.sort((x,y)=>x.startTs-y.startTs);
   let ltOverlapCount=0,totalOverlapMs=0;const overlapFeatures=new Map();
+  const overlapContext=new Map();
+  const stallExamples=[];
   for(const lt of longTasks){
     const list=byPage.get(lt.pageId)||[];
     const allIntervals=[];
     const featureIntervals=new Map();
+    const contextIntervals=new Map();
+    const candidates=[];
     for(const op of list){
       if(op.startTs>lt.entryEndTs)break;
       if(op.endTs<lt.entryStartTs)continue;
@@ -1989,20 +2192,40 @@ function buildQolTraceDiagnostics(events) {
       if(end<=start)continue;
       allIntervals.push([start,end]);
       const k=op.feature||'unknown';const a=featureIntervals.get(k)||[];a.push([start,end]);featureIntervals.set(k,a);
+      const key=JSON.stringify([op.feature,op.operation,op.reportingTrigger,op.reason,op.reportingTriggerSource]);
+      const intervals=contextIntervals.get(key)||[];intervals.push([start,end]);contextIntervals.set(key,intervals);
+      if(Number(lt.durationMs||0)>=200) candidates.push({feature:op.feature,operation:op.operation,
+        trigger:op.reportingTrigger||'not provided',triggerSource:op.reportingTriggerSource,
+        reason:op.reason||'not provided',overlapMs:Math.round((end-start)*10)/10});
     }
     if(allIntervals.length){
       ltOverlapCount++;
       totalOverlapMs+=intervalUnionMs(allIntervals);
       for(const [feature,intervals] of featureIntervals) overlapFeatures.set(feature,(overlapFeatures.get(feature)||0)+intervalUnionMs(intervals));
+      for(const [key,intervals] of contextIntervals) {
+        const row=overlapContext.get(key)||{context:JSON.parse(key),longTasks:0,overlapMs:0};
+        row.longTasks++;row.overlapMs+=intervalUnionMs(intervals);overlapContext.set(key,row);
+      }
+    }
+    if(Number(lt.durationMs||0)>=200 && candidates.length){
+      candidates.sort((a,b)=>b.overlapMs-a.overlapMs);
+      stallExamples.push({ts:eventTs(lt),durationMs:Math.round(Number(lt.durationMs||0)*10)/10,
+        candidateOperations:candidates.slice(0,3)});
     }
   }
+  stallExamples.sort((a,b)=>b.durationMs-a.durationMs);
+  const topTriggerOverlaps=[...overlapContext.values()].sort((a,b)=>b.overlapMs-a.overlapMs)
+    .slice(0,10).map(row=>({feature:row.context[0],operation:row.context[1],
+      trigger:row.context[2]||'not provided',reason:row.context[3]||'not provided',
+      triggerSource:row.context[4]||'not-provided',longTasks:row.longTasks,
+      overlapMs:Math.round(row.overlapMs*10)/10}));
   const overlapTop=[...overlapFeatures.entries()].sort((a,b)=>b[1]-a[1]).slice(0,10).map(([feature,ms])=>({feature,overlapMs:Math.round(ms*10)/10}));
 
   return {
     events:q.length,rawEvents:qRaw.length,deduplicatedEvents:Math.max(0,qRaw.length-q.length),explicitTraceEvents,protocols:[...protocolCounts.entries()].map(([protocol,count])=>({protocol,count})).sort((a,b)=>b.count-a.count),
-    sequenceGaps,sequenceGapEvents,sequenceStreams:sequence.streams,sequenceGapDetails:sequence.details,traceLevel,
+    sequenceGaps,sequenceGapEvents,sequenceStreams:sequence.streams,sequenceGapDetails:sequence.details,sequenceCoverage,traceVolume,traceLevel,
     traceBatches:{events:traceBatchEvents,maxBatchSize},
-    operations:{count:spans.length,totalMs:Math.round(operationTotalMs*10)/10,slow50:spans.filter(x=>(x.durationMs||0)>=50).length,slow200:spans.filter(x=>(x.durationMs||0)>=200).length,slow1000:spans.filter(x=>(x.durationMs||0)>=1000).length,top:topOps},
+    operations:{count:spans.length,totalMs:Math.round(operationTotalMs*10)/10,timingSummary,slow50:spans.filter(x=>(x.durationMs||0)>=50).length,slow200:spans.filter(x=>(x.durationMs||0)>=200).length,slow1000:spans.filter(x=>(x.durationMs||0)>=1000).length,top:topOps,attribution},
     scheduler,
     storage:{events:storageEvents.length,reads:storageReads,writes:storageWrites,totalMs:Math.round(storageTotalMs*10)/10,top:storageTop},
     network:{events:networkEvents.length,completed:networkEnds.length,errors:networkErrors,totalMs:Math.round(networkTotalMs*10)/10,top:networkTop},
@@ -2012,7 +2235,7 @@ function buildQolTraceDiagnostics(events) {
     performanceActions:q.filter(e=>e.category==='performance'||/performance-mode|quiet-(?:start|end)|pressure|startup-quiet|reply-quiet/i.test(e.subtype||'')).length,
     errorEvents:q.filter(e=>e.category==='error'||/error|failed|failure|exception/i.test(e.subtype||'')||e.outcome==='failed').length,
     backgroundEvents:q.filter(e=>e.category==='background'||e.module==='background'||e.payload?.origin==='background'||e.meta?.origin==='background').length,
-    longTaskCorrelation:{supported:longTasks.length>0,longTasksChecked:longTasks.length,longTasksOverlappingQol:ltOverlapCount,totalOverlapMs:Math.round(totalOverlapMs*10)/10,topFeatures:overlapTop}
+    longTaskCorrelation:{supported:longTasks.length>0,longTasksChecked:longTasks.length,longTasksOverlappingQol:ltOverlapCount,totalOverlapMs:Math.round(totalOverlapMs*10)/10,topFeatures:overlapTop,topTriggerOverlaps,stallExamples:stallExamples.slice(0,8)}
   };
 }
 
@@ -2131,6 +2354,10 @@ function buildPageStoragePressureDiagnostics(events) {
   const removals = events.filter(e=>e.type==='storage' && e.subtype==='localStorage-remove');
   const draftRemovalSummaries = events.filter(e=>e.type==='storage' && e.subtype==='sessionStorage-draft-remove-summary');
   const draftRemovalSingles = events.filter(e=>e.type==='storage' && e.subtype==='sessionStorage-remove' && /(?:^|[.:])chatDraft:/i.test(String(e.key||'')));
+  const localDraftActivity = events.filter(e=>e.type==='storage' && e.subtype==='localStorage-draft-activity-summary');
+  const localDraftWrites = localDraftActivity.reduce((n,e)=>n+Math.max(0,Number(e.writes)||0),0);
+  const localDraftRemovals = localDraftActivity.reduce((n,e)=>n+Math.max(0,Number(e.removals)||0),0);
+  const suppressedLocalWrites = events.reduce((n,e)=>e.type==='storage'&&e.subtype==='localStorage-write-burst' ? n+Math.max(0,Number(e.suppressedWrites??e.writes)||0) : n,0);
   const xhr = events.filter(e=>e.type==='network' && e.subtype==='xhr-response');
   let maxFiveMinuteStarts=0, left=0;
   for (let right=0;right<starts.length;right++) {
@@ -2138,18 +2365,25 @@ function buildPageStoragePressureDiagnostics(events) {
     maxFiveMinuteStarts=Math.max(maxFiveMinuteStarts,right-left+1);
   }
   const byKey=new Map();
+  const isDraftStorageKey = key => /(?:^|[.:])chatDraft:/i.test(String(key||''));
   const safeKey = key => String(key||'unknown')
     .replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/ig,':id')
     .replace(/\b[0-9a-f]{24,}\b/ig,':id')
     .replace(/^(isPartner_).+/i,'$1:id')
     .slice(0,70);
   for (const e of writes) {
-    const k=safeKey(e.key || e.storageKey);
+    const k=isDraftStorageKey(e.key || e.storageKey) ? 'spicychat.chatDraft:*' : safeKey(e.key || e.storageKey);
     byKey.set(k,(byKey.get(k)||0)+1);
   }
+  for (const e of localDraftActivity) byKey.set('spicychat.chatDraft:*', (byKey.get('spicychat.chatDraft:*')||0)+Math.max(0,Number(e.writes)||0));
   return {
     pageStarts:starts.length, maxFiveMinutePageStarts:maxFiveMinuteStarts,
-    storageSetEvents:writes.length, storageRemoveEvents:removals.length,
+    storageSetEvents:writes.length + suppressedLocalWrites + localDraftWrites,
+    storageRemoveEvents:removals.length + localDraftRemovals,
+    storageSetRecordEvents:writes.length, storageRemoveRecordEvents:removals.length,
+    localDraftWrites:localDraftWrites + writes.filter(e=>/(?:^|[.:])chatDraft:/i.test(String(e.key||''))).length,
+    localDraftRemovals:localDraftRemovals + removals.filter(e=>/(?:^|[.:])chatDraft:/i.test(String(e.key||''))).length,
+    localDraftSummaryEvents:localDraftActivity.length,
     sessionDraftRemovals:draftRemovalSingles.length + draftRemovalSummaries.reduce((n,e)=>n+(Number(e.removals)||0),0),
     sessionDraftSummaryEvents:draftRemovalSummaries.length,
     xhrResponses:xhr.length,
@@ -2696,6 +2930,61 @@ function buildQolDislikeHelperLatency(events) {
   };
 }
 
+function isResearchExportEvent(e) {
+  if (e?.pageRole === 'qol-research-export' || e?.researchExport) return true;
+  const url = String(e?.pageUrl || e?.url || e?.href || '');
+  try { const u = new URL(url); const flag=u.searchParams.get('ds-research-export'); return u.pathname === '/chats' && (flag === '1' || flag === '[REDACTED]'); }
+  catch (_) { return /(?:\?|&)ds-research-export=(?:1|\[REDACTED\])(?:&|$)/.test(url) && /\/chats/.test(url); }
+}
+function buildResearchExportDiagnostics(events) {
+  const pages = new Map();
+  const entry = e => {
+    const id = e.pageId || '(unknown)';
+    if (!pages.has(id)) pages.set(id, {pageId:id,progressMutations:0,
+      sampledDomBatches:0,phaseMarkers:0,phases:[],longTasks:0,longTaskMs:0,
+      worstLongTaskMs:0,severeLongTasks:0,topFreezes:[]});
+    return pages.get(id);
+  };
+  for (const e of events) {
+    if (!isResearchExportEvent(e)) continue;
+    const row = entry(e);
+    if (e.type === 'dom' && e.subtype === 'mutation-batch') {
+      row.sampledDomBatches++;
+      row.progressMutations += Number(e.stats?.researchStatusMutations)||0;
+      // Legacy recordings: topPatterns is a bounded, incomplete sample.
+      if (!e.stats?.researchStatusMutations) {
+        const legacy = (e.stats?.topPatterns || []).filter(p => /(?:^|\W)pre(?:\W|$).*children/i.test(String(p.value||p.pattern||'')));
+        row.legacyProgressPatternSamples = (row.legacyProgressPatternSamples||0) + legacy.reduce((n,p)=>n+(Number(p.count)||0),0);
+      }
+    }
+    if (e.type==='performance' && e.subtype==='research-export-phase') {
+      row.phaseMarkers++;
+      if (row.phases.length < 40) row.phases.push({ts:eventTs(e),phase:e.phase||'unknown'});
+    }
+    if (e.type==='performance' && e.subtype==='long-task') {
+      const ms = Number(e.durationMs)||0;
+      row.longTasks++;row.longTaskMs+=ms;row.worstLongTaskMs=Math.max(row.worstLongTaskMs,ms);
+      if (ms>=1000)row.severeLongTasks++;
+      if (ms>=500) {
+        row.topFreezes.push({ts:eventTs(e),durationMs:ms,phase:e.researchExport?.phase||'not-observed',
+          phaseObservedAt:e.researchExport?.phaseObservedAt||null,
+          source:'longtask-with-last-observed-progress-phase'});
+        row.topFreezes.sort((a,b)=>b.durationMs-a.durationMs);
+        if(row.topFreezes.length>8) row.topFreezes.length=8;
+      }
+    }
+  }
+  const result=[...pages.values()].map(r=>({...r,longTaskMs:Math.round(r.longTaskMs*10)/10}));
+  result.sort((a,b)=>b.worstLongTaskMs-a.worstLongTaskMs);
+  return {pages:result.length,progressMutations:result.reduce((n,r)=>n+r.progressMutations,0),
+    legacyProgressPatternSamples:result.reduce((n,r)=>n+(r.legacyProgressPatternSamples||0),0),
+    longTasks:result.reduce((n,r)=>n+r.longTasks,0),
+    severeLongTasks:result.reduce((n,r)=>n+r.severeLongTasks,0),
+    worstLongTaskMs:result[0]?.worstLongTaskMs||0,top:result.slice(0,8),
+    phaseAttribution:'Last observed progress phase is a temporal clue, not proof of where CPU time was spent. No QoL phase timings are measured without explicit telemetry.',
+    coverage:'DOM counts include processed samples only; legacy PRE-pattern samples are not exact and are reported separately.'};
+}
+
 function buildSummary(events) {
   const netResponses = events.filter(e => e.type === 'network' && /response$/.test(e.subtype || ''));
   const allErrors = events.filter(e => e.type === 'error' || (e.type === 'network' && e.status >= 400));
@@ -3153,6 +3442,7 @@ function buildSummary(events) {
     performanceByContext,
     domRepetition,
     severeFreezeTimeline,
+    researchExport: buildResearchExportDiagnostics(events),
     qolDislikeHelperLatency,
     counterDriver,
     qolTrace,
@@ -3223,7 +3513,11 @@ function renderOverview() {
     const f=s.favoritesCoverage;
     extra.push(`<div><strong>Favorites search coverage:</strong> ${f.accountFavoriteCount!=null?`${f.accountFavoriteCount.toLocaleString()} latest observed saved IDs · `:''}${f.nativeRequestedIds.toLocaleString()} IDs in the largest observed native search${f.nativeIndexedFound!=null?` · ${f.nativeIndexedFound.toLocaleString()} indexed hits reported`:''}${f.notIncludedInNativeQuery!=null?` · ${f.notIncludedInNativeQuery.toLocaleString()} IDs not present in that native request`:''}${f.smallBatchSearchesObserved?` · ${f.smallBatchSearchesObserved} small-batch search(es) observed`:''}. <em>${esc(f.coverage)}</em></div>`);
   }
+  if(s.researchExport?.pages){const r=s.researchExport;extra.push(`<div><strong>Research Export pressure:</strong> ${r.pages} exporter page(s) · ${r.progressMutations.toLocaleString()} processed progress updates${r.legacyProgressPatternSamples?` · ${r.legacyProgressPatternSamples.toLocaleString()} legacy PRE pattern samples`:''} · ${r.longTasks} Long Task(s), worst ${Math.round(r.worstLongTaskMs).toLocaleString()}ms${r.top[0]?.topFreezes?.[0]?` · last observed progress phase near worst freeze: ${esc(r.top[0].topFreezes[0].phase)}`:''}. <em>Progress stage is not CPU attribution; detailed page timelines are in the export. No new observers are used.</em></div>`);}
   if(s.qolTraceAvailability){const t=s.qolTraceAvailability;extra.push(`<div><strong>QoL trace availability:</strong> ${esc(t.state)} · ${t.configChecks} configuration checks (${t.enabledChecks} enabled, ${t.disabledChecks} disabled) · ${t.explicitTraceEvents} observed trace event(s)${t.latestLinkStatus?` · latest connection ${esc(t.latestLinkStatus)}`:''}. <em>${esc(t.recommendation)}</em></div>`);}
+  if ((s.severeFreezeTimeline?.count || 0) > 0 && !s.qolTraceAvailability?.explicitTraceEvents) {
+    extra.push(`<div><strong>Stutter attribution incomplete:</strong> ${s.severeFreezeTimeline.count} recorded Long Task(s) ≥1 second but no detailed QoL trace events were available. For the next targeted reproduction, enable <strong>Detailed QoL internals → Normal</strong> in Inspector's popup. <em>The freezes are real, but cannot be assigned to QoL or native SpicyChat from absent tracing; Normal is opt-in and Deep has greater overhead.</em></div>`);
+  }
   if(s.inspectorWorkerActivity?.workerPages){const w=s.inspectorWorkerActivity;extra.push(`<div><strong>Worker activity:</strong> ${w.workerPages} worker page(s) · ${w.browserObservedResponses.toLocaleString()} directly observed API responses · ${w.resourceTimingSummarizedRequests.toLocaleString()} Resource Timing aggregated requests. Most active: ${w.top.slice(0,3).map(x=>`${esc(x.role)} ${x.summaryRequests} resource timing(s), ${x.requestsObserved} API response(s)`).join(' | ')}. <em>These request layers may overlap; neither establishes unique bot checks or cache efficiency.</em></div>`);}
   if(s.captureConfidence){const c=s.captureConfidence;extra.push(`<div><strong>Capture coverage:</strong> ${esc(c.level)} · ${c.skippedMutationRecords.toLocaleString()} budget-skipped mutation record(s) · ${c.selfThrottleEvents} throttle notice(s) / ${(c.selfThrottleUnionMs/1000).toFixed(1)}s of page-lifecycle-bounded windows${c.selfThrottleAfterPageClose?` · ${c.selfThrottleAfterPageClose} notice(s) after page hide/freeze`:''} · ${c.resourceTimingBufferFullOccurrences} resource buffer-full occurrence(s). <em>Announced windows are not measured data loss; windows without observed page ends remain upper bounds.</em></div>`);}
   if(s.rateLimits?.http429){const r=s.rateLimits;extra.push(`<div><strong>Rate limits:</strong> ${r.http429} HTTP 429 response(s), codes ${Object.entries(r.byErrorCode).map(([k,v])=>`${esc(k)} ×${v}`).join(', ')}. <em>SC-001-5201 / “Too many requests” is not automatically a daily message cap.</em></div>`);}
@@ -3258,7 +3552,7 @@ function renderOverview() {
   }
   if (s.pageStoragePressure?.pageStarts) {
     const p=s.pageStoragePressure;
-    extra.push(`<div><strong>Page/storage pressure:</strong> ${p.pageStarts} page starts (maximum ${p.maxFiveMinutePageStarts} within five minutes); ${p.storageSetEvents} localStorage writes, ${p.storageRemoveEvents} removals, ${p.xhrResponses} XHR response(s)${p.sessionDraftRemovals ? ` · ${p.sessionDraftRemovals.toLocaleString()} native chat-draft removals (${p.sessionDraftSummaryEvents} summarized burst(s))` : ''}. Top normalized write keys: ${p.leadingWriteKeys.slice(0,4).map(k=>`${esc(k.key)} ×${k.count}`).join(', ')}. <em>These counts do not identify which extension or user action initiated the activity.</em></div>`);
+    extra.push(`<div><strong>Page/storage pressure:</strong> ${p.pageStarts} page starts (maximum ${p.maxFiveMinutePageStarts} within five minutes); ${p.storageSetEvents} localStorage writes, ${p.storageRemoveEvents} removals, ${p.xhrResponses} XHR response(s)${p.sessionDraftRemovals ? ` · ${p.sessionDraftRemovals.toLocaleString()} session chat-draft removals (${p.sessionDraftSummaryEvents} summarized burst(s))` : ''}${p.localDraftRemovals || p.localDraftWrites ? ` · local chat-draft ${p.localDraftWrites.toLocaleString()} writes / ${p.localDraftRemovals.toLocaleString()} removals (${p.localDraftSummaryEvents} summarized burst(s))` : ''}. Top normalized write keys: ${p.leadingWriteKeys.slice(0,4).map(k=>`${esc(k.key)} ×${k.count}`).join(', ')}. <em>These counts do not identify which extension or user action initiated the activity.</em></div>`);
   }
   if (s.pageSessionComparison?.chatSessions) {
     const p=s.pageSessionComparison, busiest=p.topByGenerations?.[0], slowest=p.worstPerGeneration?.[0];
@@ -3293,6 +3587,11 @@ function renderOverview() {
   }
   if (s.models.length) extra.push(`<div><strong>Models/engines seen:</strong> ${s.models.map(esc).join(', ')}</div>`);
   if (s.dailyMessageLimits?.count) extra.push(`<div><strong>Known SpicyChat daily-message limit:</strong> ${s.dailyMessageLimits.count} SC-001-5201 response(s). <em>Shown separately from generic Errors because this is an expected product limit, not a network failure.</em></div>`);
+  if (s.counterDriver?.driverTelemetryStatus==='missing-during-generation-workload') {
+    const d=s.counterDriver;
+    const close=d.closeLimitPairs?.length?` · ${d.closeLimitPairs.length} rate-limit pair(s) within two hours${d.closeLimitPairs.some(p=>p.sameRequestFingerprint)?' (at least one matching request fingerprint)':''}`:'';
+    extra.push(`<div><strong>Counter Driver evidence gap:</strong> ${d.observedChat200.toLocaleString()} successful native chat POST response(s) and ${d.observedChat429} chat 429 response(s) were observed, but no Counter Driver state-transition markers arrived${close}. <em>This does not establish that Counter initiated these requests, nor confirm numbered progress, cooldowns or retries. If this was a Counter run, check that Driver telemetry is enabled and emitted while Inspector is recording.</em></div>`);
+  }
   if (s.counterDriver?.logicalEvents) {
     const d=s.counterDriver;
     const retryText=d.retriedNumbers?.length?` · ${d.retriedNumbers.length} number(s) retried`:'';
@@ -3310,12 +3609,23 @@ function renderOverview() {
     const t=s.qolTrace, op=t.operations||{}, lc=t.longTaskCorrelation||{};
     const proto=(t.protocols||[]).map(x=>`${esc(x.protocol)} ×${x.count}`).join(', ');
     const top=op.top?.[0];
-    extra.push(`<div><strong>QoL Trace:</strong> ${t.explicitTraceEvents.toLocaleString()} detailed event(s) · ${op.count.toLocaleString()} operation span(s) / ${(op.totalMs/1000).toFixed(2)}s measured QoL work · slow ≥50ms ${op.slow50}, ≥200ms ${op.slow200}, ≥1s ${op.slow1000}${top?` · top ${esc(top.label)} ${(top.totalMs/1000).toFixed(2)}s across ${top.runs} run(s)`:''}${t.deduplicatedEvents?` · ${t.deduplicatedEvents.toLocaleString()} duplicate transport event(s) collapsed`:''}${t.sequenceGaps?` · <strong>${t.sequenceGaps} final missing sequence event(s)</strong>`:' · final sequence gaps 0'}${proto?` · protocol ${proto}`:''}.</div>`);
+    extra.push(`<div><strong>QoL Trace:</strong> ${t.explicitTraceEvents.toLocaleString()} detailed event(s) · ${op.count.toLocaleString()} operation span(s) · ${(op.totalMs/1000).toFixed(2)}s summed operation <em>wall time (not CPU; nested spans double count)</em> · slow ≥50ms ${op.slow50}, ≥200ms ${op.slow200}, ≥1s ${op.slow1000}${top?` · top ${esc(top.label)} ${(top.totalMs/1000).toFixed(2)}s summed wall across ${top.runs} run(s)`:''}${t.deduplicatedEvents?` · ${t.deduplicatedEvents.toLocaleString()} duplicate transport event(s) collapsed`:''}${t.sequenceGaps?` · ${t.sequenceGaps.toLocaleString()} unobserved trace sequence position(s) (not proven lost events)`:' · no internal sequence holes observed'}${proto?` · protocol ${proto}`:''}.</div>`);
+    if (op.timingSummary) {const x=op.timingSummary;if(x.unionElapsedPerStreamMs!=null)extra.push(`<div><strong>QoL timing interpretation:</strong> union elapsed per page/session ${(x.unionElapsedPerStreamMs/1000).toFixed(2)}s (may overlap between tabs)${x.activeSamples?` · ${x.activeSamples} QoL-reported active sample(s), ${(x.reportedActiveSumMs/1000).toFixed(2)}s summed`:''}${x.synchronousCallSamples?` · ${x.synchronousCallSamples} initial synchronous-call sample(s), ${(x.reportedSynchronousCallSumMs/1000).toFixed(2)}s summed`:''}${x.queueSamples?` · ${x.queueSamples} queue-delay sample(s), ${(x.reportedQueueDelaySumMs/1000).toFixed(2)}s summed`:''}. <em>QoL active and synchronous timings are estimates supplied by QoL, not a CPU profiler. Do not subtract them from wall time to infer CPU time.</em></div>`);}
+    if(t.sequenceCoverage?.unobservedPositions){const c=t.sequenceCoverage;extra.push(`<div><strong>Trace sequence coverage:</strong> ${c.unobservedPositions.toLocaleString()} unobserved position(s) across ${c.streams} stream(s); QoL reported at least ${c.knownCoalesced.toLocaleString()} cumulative coalesced trace(s) in ${c.sourceAggregationReports} aggregation report(s). <em>These totals do not match one-to-one, and sequence holes alone do not establish transport loss.</em></div>`);}
+    if(t.traceVolume?.topFamilies?.[0])extra.push(`<div><strong>Trace event volume:</strong> top families ${t.traceVolume.topFamilies.slice(0,5).map(x=>`${esc(x.family)} ×${x.count.toLocaleString()}`).join(' · ')}. <em>These routine events remain in raw exports; Interesting only hides routine noise from the UI.</em></div>`);
+    if (op.attribution && op.count) {
+      const a=op.attribution;
+      extra.push(`<div><strong>QoL trigger/reason coverage:</strong> direct triggers ${a.directTriggers}/${op.count} · inherited from parent ${a.inheritedTriggers} · missing triggers ${a.missingTriggers} · explicit reasons ${a.explicitReasons}/${op.count}. <em>Parent context is marked as inherited, not a confirmed direct trigger. Missing means QoL did not publish a usable diagnostic label.</em></div>`);
+      if (a.topReasons?.length) extra.push(`<div><strong>Top QoL work by trigger and reason (wall time):</strong> ${a.topReasons.slice(0,6).map(row=>`${esc(row.feature)} / ${esc(row.operation)} ← ${esc(row.trigger)}${row.triggerSource==='parent'?' (parent)':''} · reason ${esc(row.reason)} · ${row.runs} run(s), ${(row.totalMs/1000).toFixed(2)}s total, ${row.maxMs.toFixed(1)}ms max`).join(' | ')}.</div>`);
+      if (a.slowExamples?.length) extra.push(`<div><strong>Slowest QoL operations with attribution:</strong> ${a.slowExamples.slice(0,5).map(row=>`${esc(row.feature)} / ${esc(row.operation)} · ${row.durationMs.toFixed(1)}ms wall${Number.isFinite(row.activeMs)?` (${row.activeMs.toFixed(1)}ms QoL-reported active)`:''}${Number.isFinite(row.synchronousCallMs)?` · ${row.synchronousCallMs.toFixed(1)}ms reported initial synchronous call`:''}${Number.isFinite(row.queueDelayMs)?` · ${row.queueDelayMs.toFixed(1)}ms reported queue delay`:''} · trigger ${esc(row.trigger)}${row.triggerSource==='parent'?' (parent)':''} · reason ${esc(row.reason)} · phase ${esc(row.phase)} · outcome ${esc(row.outcome)}`).join(' | ')}. <em>Wall time is not CPU time. Timings and labels are only as complete as QoL's reported events.</em></div>`);
+    }
     if (t.scheduler?.events) extra.push(`<div><strong>QoL scheduler:</strong> ${t.scheduler.events} event(s) · deferred ${t.scheduler.deferred} · coalesced ${t.scheduler.coalesced} · skipped ${t.scheduler.skipped}${t.scheduler.queueDelaySamples?` · queue delay avg ${t.scheduler.avgQueueDelayMs.toFixed(1)}ms / p95 ${t.scheduler.p95QueueDelayMs.toFixed(1)}ms`:''}.</div>`);
     if (t.storage?.events) extra.push(`<div><strong>QoL storage trace:</strong> ${t.storage.events} event(s) · reads ${t.storage.reads} / writes ${t.storage.writes} · ${(t.storage.totalMs/1000).toFixed(2)}s measured${t.storage.top?.[0]?` · top ${esc(t.storage.top[0].backend)}:${esc(t.storage.top[0].key)} ${(t.storage.top[0].totalMs/1000).toFixed(2)}s`:''}.</div>`);
     if (t.network?.events) extra.push(`<div><strong>QoL network trace:</strong> ${t.network.completed} completed request(s) · ${t.network.errors} error(s) · ${(t.network.totalMs/1000).toFixed(2)}s measured request time${t.network.top?.[0]?` · top ${esc(t.network.top[0].feature)} ${esc(t.network.top[0].endpoint)}`:''}.</div>`);
     if (t.workers?.events) extra.push(`<div><strong>QoL workers:</strong> ${t.workers.events} trace event(s) · starts ${t.workers.starts} · ready ${t.workers.ready} · jobs ${t.workers.jobs} · throttled ${t.workers.throttled} · restarts ${t.workers.restarts} · closed ${t.workers.closed}.</div>`);
     if (lc.supported) extra.push(`<div><strong>Long Task ↔ explicit QoL span correlation:</strong> ${lc.longTasksOverlappingQol}/${lc.longTasksChecked} timestamped Long Task(s) overlapped QoL operation span(s), with ${(lc.totalOverlapMs/1000).toFixed(2)}s aggregate interval overlap${lc.topFeatures?.[0]?` · most overlap ${esc(lc.topFeatures[0].feature)} ${(lc.topFeatures[0].overlapMs/1000).toFixed(2)}s`:''}. <em>Overlap is correlation, not automatic proof of causation.</em></div>`);
+    if (lc.topTriggerOverlaps?.length) extra.push(`<div><strong>Long Task overlap by QoL trigger/reason:</strong> ${lc.topTriggerOverlaps.slice(0,5).map(row=>`${esc(row.feature)} / ${esc(row.operation)} ← ${esc(row.trigger)}${row.triggerSource==='parent'?' (parent)':''} · reason ${esc(row.reason)} · ${row.longTasks} task(s), ${row.overlapMs.toFixed(1)}ms interval overlap`).join(' | ')}. <em>Nested operation spans can overlap the same task; context-group totals must not be added together.</em></div>`);
+    if (lc.stallExamples?.length) extra.push(`<div><strong>Slow Long Task ↔ QoL context samples:</strong> ${lc.stallExamples.slice(0,4).map(row=>`${new Date(row.ts).toISOString()} · ${row.durationMs.toFixed(1)}ms task · ${row.candidateOperations.map(op=>`${esc(op.feature)} / ${esc(op.operation)} ← ${esc(op.trigger)} · ${esc(op.reason)} (${op.overlapMs.toFixed(1)}ms)`).join(', ')}`).join(' | ')}. <em>Matching times do not identify the executing script or prove causation.</em></div>`);
   }
   const vd = s.versionDiagnostics || {};
   if ((vd.qolVersions || []).length) {

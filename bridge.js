@@ -12,6 +12,40 @@
   const storageBursts = new Map();
   let draftRemovals = null;
   const DRAFT_REMOVAL_SUMMARY_MS = 5000;
+  // The native site writes/removes namespaced chatDraft keys repeatedly during
+  // generation. Count localStorage operations without storing per-conversation
+  // identifiers or sending a window message for each write/removal.
+  let localDraftActivity = null;
+  const LOCAL_DRAFT_SUMMARY_MS = 5000;
+  function flushLocalDraftActivity(reason = 'interval') {
+    const state = localDraftActivity;
+    if (!state) return;
+    localDraftActivity = null;
+    if (state.timer) clearTimeout(state.timer);
+    emit({ type: 'storage', subtype: 'localStorage-draft-activity-summary',
+      storage: 'localStorage', key: 'spicychat.chatDraft:*',
+      writes: state.writes, removals: state.removals,
+      uniqueKeys: state.keys.size, uniqueKeysCapped: state.keys.size >= 100,
+      firstAt: state.firstAt, lastAt: state.lastAt,
+      windowMs: Math.max(0, state.lastAt - state.firstAt),
+      maxValueLength: state.maxValueLength, reason,
+      privacyNote: 'chat-draft-identifiers-and-values-omitted' });
+  }
+  function noteLocalDraftActivity(key, kind, value) {
+    const now = Date.now();
+    if (!localDraftActivity) localDraftActivity = {
+      writes: 0, removals: 0, keys: new Set(), firstAt: now, lastAt: now,
+      maxValueLength: 0, timer: setTimeout(flushLocalDraftActivity, LOCAL_DRAFT_SUMMARY_MS)
+    };
+    const state = localDraftActivity;
+    if (kind === 'write') {
+      state.writes++;
+      state.maxValueLength = Math.max(state.maxValueLength, String(value ?? '').length);
+    } else state.removals++;
+    state.lastAt = now;
+    if (state.keys.size < 100) state.keys.add(String(key));
+  }
+  function isChatDraftKey(key) { return /(?:^|[.:])chatDraft:/i.test(String(key || '')); }
 
   function flushDraftRemovals(reason = 'interval') {
     const s = draftRemovals;
@@ -507,11 +541,15 @@
       writes: b.suppressed, suppressedWrites: b.suppressed, totalWritesIncludingInitial: b.suppressed + 1, windowMs,
       avgIntervalMs: b.suppressed ? Math.round((windowMs / b.suppressed) * 10) / 10 : null,
       lastValueLength: b.lastValueLength,
-      privacyNote: /^chatDraft:/i.test(b.key) ? 'draft-value-omitted' : null
+      privacyNote: isChatDraftKey(b.key) ? 'draft-value-omitted' : null
     });
   }
 
   function recordStorageSet(label, key, value) {
+    if (label === 'localStorage' && isChatDraftKey(key)) {
+      noteLocalDraftActivity(key, 'write', value);
+      return;
+    }
     const id = `${label}::${key}`;
     const now = Date.now();
     const existing = storageBursts.get(id);
@@ -524,7 +562,7 @@
       return;
     }
     if (existing) flushStorageBurst(id);
-    const omitDraftValue = /^chatDraft:/i.test(key);
+    const omitDraftValue = isChatDraftKey(key);
     emit({
       type: 'storage', subtype: `${label}-set`, key,
       value: isSecretKey(key) ? '[REDACTED]' : (omitDraftValue ? '[DRAFT_VALUE_OMITTED]' : redactString(String(value).slice(0, MAX_BODY))),
@@ -550,7 +588,8 @@
       const label = labelFor(this);
       flushStorageBurst(`${label}::${k}`);
       const result = remove.apply(this, arguments);
-      if (label === 'sessionStorage' && /(?:^|[.:])chatDraft:/i.test(String(k))) noteDraftRemoval(k);
+      if (label === 'sessionStorage' && isChatDraftKey(k)) noteDraftRemoval(k);
+      else if (label === 'localStorage' && isChatDraftKey(k)) noteLocalDraftActivity(k, 'remove');
       else emit({ type: 'storage', subtype: `${label}-remove`, key: k });
       return result;
     };
@@ -558,15 +597,22 @@
       const label = labelFor(this);
       for (const id of [...storageBursts.keys()]) if (id.startsWith(`${label}::`)) flushStorageBurst(id);
       if (label === 'sessionStorage') flushDraftRemovals('storage-cleared');
+      if (label === 'localStorage') flushLocalDraftActivity('storage-cleared');
       emit({ type: 'storage', subtype: `${label}-clear` });
       return clear.apply(this, arguments);
     };
     try { Object.defineProperty(proto, '__sciPatched', { value: true }); } catch (_) {}
   }
   patchStoragePrototype();
-  addEventListener('pagehide', () => flushDraftRemovals('pagehide'), true);
+  addEventListener('pagehide', () => {
+    flushDraftRemovals('pagehide');
+    flushLocalDraftActivity('pagehide');
+  }, true);
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') flushDraftRemovals('hidden');
+    if (document.visibilityState === 'hidden') {
+      flushDraftRemovals('hidden');
+      flushLocalDraftActivity('hidden');
+    }
   }, true);
 
   function snapshotStorage(storage) {
