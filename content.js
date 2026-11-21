@@ -1,8 +1,8 @@
 (() => {
   // Static source stamp: never call the runtime manifest API from an injected
   // page script. The runtime API can disappear after a hot extension reload.
-  const INSPECTOR_VERSION = '0.1.9';
-  const INSPECTOR_CONTENT_BUILD = 'sci-content-0.1.9-aggregate-mobile-20261120-r1';
+  const INSPECTOR_VERSION = '0.1.10';
+  const INSPECTOR_CONTENT_BUILD = 'sci-content-0.1.10-bridge-ios-20261121-r1';
   const PAGE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   // The main collector and the additive Driver-support probe are two IIFEs in
   // the same content-script world. Link their shutdowns by this *instance-local*
@@ -10,9 +10,13 @@
   // own object references, so reload notifications cannot stop a fresh probe.
   const contentLifetime = { invalidated: false, stopCore: null, stopDriver: null, version: INSPECTOR_VERSION, buildId: INSPECTOR_CONTENT_BUILD };
   try { window.__SCI_INSPECTOR_CONTENT_LIFETIME_V1__ = contentLifetime; } catch (_) {}
-  // Firefox Android supports recording, but browser Long Task/LoAF APIs may be missing.
-  // Keep collection bounded even when a busy chat generates thousands of mutations/traces.
+  // Firefox Android and iOS/WebKit extension hosts can lack Long Task/LoAF APIs.
+  // Use the same bounded collection path for both; this does not imply that
+  // Orion exposes all extension APIs or allows page-context script injection.
   const IS_FIREFOX_ANDROID = /Android/i.test(navigator.userAgent) && /(?:Firefox|Fennec)/i.test(navigator.userAgent);
+  const IS_IOS_WEBKIT = /(?:iPhone|iPad|iPod)/i.test(navigator.userAgent) ||
+    (/Macintosh/i.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+  const IS_MOBILE_LIGHTWEIGHT = IS_FIREFOX_ANDROID || IS_IOS_WEBKIT;
   const MOBILE_TRACE_EVENTS_PER_SECOND = 18;
   const MOBILE_TRACE_BATCH_LIMIT = 48;
   let mobileTraceSecond = 0;
@@ -253,8 +257,8 @@
   const LARGE_MUTATION_BATCH_THRESHOLD = 250;
   // A slow callback blocks the same thread as SpicyChat's renderer. Keep DOM
   // sampling bounded per callback; skipped records are reported as gaps, not 0s.
-  const DOM_CALLBACK_MAX_RECORDS = IS_FIREFOX_ANDROID ? 80 : 120;
-  const DOM_CALLBACK_BUDGET_MS = IS_FIREFOX_ANDROID ? 3 : 5;
+  const DOM_CALLBACK_MAX_RECORDS = IS_MOBILE_LIGHTWEIGHT ? 80 : 120;
+  const DOM_CALLBACK_BUDGET_MS = IS_MOBILE_LIGHTWEIGHT ? 3 : 5;
   const DOM_FAST_MODE_HOLD_MS = 30_000;
   let lastKnownDomElements = 0;
   let lastKnownMountedMessages = 0;
@@ -591,6 +595,7 @@ function inspectorRedactUrlsInText(value) {
     eventQueue.length = 0;
     domQueue.length = 0;
     activeQolOperations.clear();
+    if (bridgeHealthTimer) { clearTimeout(bridgeHealthTimer); bridgeHealthTimer = null; }
     try { contentLifetime.stopDriver?.(); } catch (_) {}
   }
   contentLifetime.stopCore = stopInvalidatedContext;
@@ -1062,14 +1067,69 @@ function inspectorRedactUrlsInText(value) {
     flushEventQueue();
   }
 
+  // Bridge health is separate from content-script health: Safari/Orion can
+  // allow a content script while preventing the injected MAIN-world bridge.
+  // Only one startup timeout is used; no recurring background checks.
+  let bridgeState = 'not-injected';
+  let bridgeLoadedAt = 0;
+  let bridgeAckAt = 0;
+  let bridgeHealthTimer = null;
+  function noteBridgeReady(method) {
+    if (bridgeAckAt) return;
+    bridgeAckAt = Date.now();
+    bridgeState = 'ready';
+    if (bridgeHealthTimer) { clearTimeout(bridgeHealthTimer); bridgeHealthTimer = null; }
+    emit({ type: 'lifecycle', subtype: 'inspector-bridge-health', stage: 'ready', method,
+      scriptLoaded: !!bridgeLoadedAt, elapsedMs: null });
+  }
   function injectBridge() {
-    if (!contextAvailable()) return;
+    if (!contextAvailable() || bridgeState !== 'not-injected') return;
     const script = document.createElement('script');
     try { script.src = chrome.runtime.getURL('bridge.js'); }
-    catch (error) { if (isInvalidatedContextError(error)) stopInvalidatedContext(); return; }
+    catch (error) {
+      if (isInvalidatedContextError(error)) stopInvalidatedContext();
+      else {
+        bridgeState = 'url-error';
+        emit({ type: 'error', subtype: 'inspector-bridge-health', stage: bridgeState,
+          reason: 'bridge-resource-url-unavailable' });
+      }
+      return;
+    }
     script.dataset.sciPageId = PAGE_ID;
-    (document.documentElement || document.head || document.body).appendChild(script);
-    script.onload = () => script.remove();
+    const startedAt = Date.now();
+    bridgeState = 'injected';
+    script.onload = () => {
+      bridgeLoadedAt = Date.now();
+      if (!bridgeAckAt) {
+        bridgeState = 'script-loaded';
+        // A ping distinguishes a script tag load from an active page bridge.
+        requestBridge('ping');
+      }
+      script.remove();
+    };
+    script.onerror = () => {
+      if (bridgeAckAt) return;
+      bridgeState = 'load-error';
+      if (bridgeHealthTimer) { clearTimeout(bridgeHealthTimer); bridgeHealthTimer = null; }
+      emit({ type: 'error', subtype: 'inspector-bridge-health', stage: bridgeState,
+        reason: 'bridge-script-blocked-or-unavailable' });
+      script.remove();
+    };
+    bridgeHealthTimer = setTimeout(() => {
+      bridgeHealthTimer = null;
+      if (bridgeAckAt || extensionContextInvalidated) return;
+      bridgeState = bridgeLoadedAt ? 'no-handshake' : 'no-load-confirmation';
+      emit({ type: 'error', subtype: 'inspector-bridge-health', stage: bridgeState,
+        reason: bridgeLoadedAt ? 'page-bridge-did-not-respond' : 'bridge-load-not-confirmed',
+        scriptLoaded: !!bridgeLoadedAt, elapsedMs: Date.now() - startedAt });
+    }, 2500);
+    try { (document.documentElement || document.head || document.body).appendChild(script); }
+    catch (_) {
+      bridgeState = 'injection-error';
+      if (bridgeHealthTimer) { clearTimeout(bridgeHealthTimer); bridgeHealthTimer = null; }
+      emit({ type: 'error', subtype: 'inspector-bridge-health', stage: bridgeState,
+        reason: 'bridge-script-append-failed' });
+    }
   }
 
   function connectionState() {
@@ -1188,7 +1248,7 @@ function inspectorRedactUrlsInText(value) {
     return {
       totalMutations: 0, detailedChanges: 0, qolRelated: 0, qolOwned: 0, noOp: 0,
       researchStatusMutations: 0,
-      formattingSwapsCoalesced: 0, mobileSkippedMutationRecords: 0, mobileChildListOnly: IS_FIREFOX_ANDROID,
+      formattingSwapsCoalesced: 0, mobileSkippedMutationRecords: 0, mobileChildListOnly: IS_MOBILE_LIGHTWEIGHT,
       budgetSkippedMutationRecords: 0, budgetExceededCallbacks: 0, recordLimitCallbacks: 0,
       messageNodesAdded: 0, messageNodesRemoved: 0, observerCallbacks: 0,
       inspectorObserverMs: 0, inspectorObserverWallMs: 0,
@@ -1206,7 +1266,8 @@ function inspectorRedactUrlsInText(value) {
   function isChatsRoute() { return /^\/chats(?:\/|$)/.test(location.pathname); }
   function domFastModeReason(mutations) {
     const count = mutations?.length || 0;
-    if (IS_FIREFOX_ANDROID) return 'firefox-android-lightweight';
+    if (IS_IOS_WEBKIT) return 'ios-webkit-lightweight';
+    if (IS_MOBILE_LIGHTWEIGHT) return 'firefox-android-lightweight';
     if (isLargeDomPressure()) return 'large-dom-pressure';
     if (Date.now() < domSlowObserverUntil) return 'recent-slow-observer';
     if (count >= LARGE_MUTATION_BATCH_THRESHOLD) return 'large-mutation-batch';
@@ -1216,7 +1277,7 @@ function inspectorRedactUrlsInText(value) {
   }
   function domDetailSampleCap() {
     if (Date.now() < selfThrottleUntil) return 0;
-    if (IS_FIREFOX_ANDROID) return 1;
+    if (IS_MOBILE_LIGHTWEIGHT) return 1;
     if (Date.now() < domFastModeUntil) return 2;
     if (currentHighDetailDomMode()) return isLargeDomPressure() ? 8 : DOM_DETAIL_SAMPLE_CAP;
     return isLargeDomPressure() ? 2 : 4;
@@ -1944,21 +2005,21 @@ function inspectorRedactUrlsInText(value) {
         const highFanout = mutations.some(m => m.type === 'childList' &&
           ((m.addedNodes?.length || 0) + (m.removedNodes?.length || 0)) > 48);
         const useFastCapture = !!fastReason || highFanout || !highDetail || mutations.length > 80 || Date.now() < selfThrottleUntil;
-        const fastBudget = { messageDescendantScans: IS_FIREFOX_ANDROID ? 2 : (highDetail ? 12 : 8), qolAncestorScans: IS_FIREFOX_ANDROID ? 2 : (highDetail ? 16 : 6) };
+        const fastBudget = { messageDescendantScans: IS_MOBILE_LIGHTWEIGHT ? 2 : (highDetail ? 12 : 8), qolAncestorScans: IS_MOBILE_LIGHTWEIGHT ? 2 : (highDetail ? 16 : 6) };
         let formattingSwaps = 0;
         const maxRecords = Math.min(mutations.length, DOM_CALLBACK_MAX_RECORDS);
-        const timeBudget = DOM_CALLBACK_BUDGET_MS + (highDetail && !IS_FIREFOX_ANDROID ? 2 : 0);
+        const timeBudget = DOM_CALLBACK_BUDGET_MS + (highDetail && !IS_MOBILE_LIGHTWEIGHT ? 2 : 0);
         if (mutations.length > maxRecords) {
           domStats.budgetSkippedMutationRecords += mutations.length - maxRecords;
           domStats.recordLimitCallbacks++;
-          if (IS_FIREFOX_ANDROID) domStats.mobileSkippedMutationRecords += mutations.length - maxRecords;
+          if (IS_MOBILE_LIGHTWEIGHT) domStats.mobileSkippedMutationRecords += mutations.length - maxRecords;
         }
         for (let i = 0; i < maxRecords; i++) {
           // Check elapsed time every fourth record, rather than inspecting a
           // giant burst to completion while chat rendering is stalled.
           if (i >= 4 && (i & 3) === 0 && performance.now() - observerStarted > timeBudget) {
             domStats.budgetSkippedMutationRecords += maxRecords - i;
-            if (IS_FIREFOX_ANDROID) domStats.mobileSkippedMutationRecords += maxRecords - i;
+            if (IS_MOBILE_LIGHTWEIGHT) domStats.mobileSkippedMutationRecords += maxRecords - i;
             domStats.budgetExceededCallbacks++;
             domSlowObserverUntil = Math.max(domSlowObserverUntil, Date.now() + 30_000);
             break;
@@ -2034,7 +2095,7 @@ function inspectorRedactUrlsInText(value) {
       // Lite diagnostics: track structural churn and a compact set of state/class
       // changes. Avoid character-data and Inspector/QoL ownership attributes so the
       // observer measures page pressure without becoming part of that pressure.
-      const observerOptions = IS_FIREFOX_ANDROID
+      const observerOptions = IS_MOBILE_LIGHTWEIGHT
         ? { subtree: true, childList: true }
         : { subtree: true, childList: true, attributes: true,
             attributeFilter: ['class','id','hidden','disabled','aria-hidden','aria-disabled','aria-expanded','aria-pressed','data-state','data-status','data-testid'] };
@@ -2221,8 +2282,8 @@ function inspectorRedactUrlsInText(value) {
       traceProtocol: data.protocol || payload?.protocol || null
     };
     // Cap normalization cost before creating/sanitizing hundreds of trace objects.
-    const limit = IS_FIREFOX_ANDROID ? MOBILE_TRACE_BATCH_LIMIT : 1000;
-    if (IS_FIREFOX_ANDROID && candidates.length > limit) mobileTraceDropped += candidates.length - limit;
+    const limit = IS_MOBILE_LIGHTWEIGHT ? MOBILE_TRACE_BATCH_LIMIT : 1000;
+    if (IS_MOBILE_LIGHTWEIGHT && candidates.length > limit) mobileTraceDropped += candidates.length - limit;
     return candidates.slice(0, limit).map((raw, index) => {
       const child = raw && typeof raw === 'object' ? raw : { type: 'trace-value', value: raw };
       const childData = {
@@ -2473,23 +2534,23 @@ function inspectorRedactUrlsInText(value) {
       const events=expandQolTelemetry(data, transport);
       const accepted = [];
       const now = Date.now();
-      if (IS_FIREFOX_ANDROID && now - mobileTraceSecond >= 1000) {
+      if (IS_MOBILE_LIGHTWEIGHT && now - mobileTraceSecond >= 1000) {
         mobileTraceSecond = now;
         mobileTraceAccepted = 0;
       }
       for (const event of events) {
         // Keep only a bounded sample of high-frequency trace data on mobile.
         // Privacy rules and the detailed-tracing setting still apply unchanged.
-        if (IS_FIREFOX_ANDROID && mobileTraceAccepted >= MOBILE_TRACE_EVENTS_PER_SECOND &&
+        if (IS_MOBILE_LIGHTWEIGHT && mobileTraceAccepted >= MOBILE_TRACE_EVENTS_PER_SECOND &&
             !/^(handshake|hello|presence|error|operation-failed)/.test(event.subtype || '')) {
           mobileTraceDropped++;
           continue;
         }
-        if (IS_FIREFOX_ANDROID) mobileTraceAccepted++;
+        if (IS_MOBILE_LIGHTWEIGHT) mobileTraceAccepted++;
         accepted.push(event);
         trackQolTelemetry(event);
       }
-      if (IS_FIREFOX_ANDROID && now - mobileTraceReportedAt >= 10000 && mobileTraceDropped) {
+      if (IS_MOBILE_LIGHTWEIGHT && now - mobileTraceReportedAt >= 10000 && mobileTraceDropped) {
         emit({ type: 'performance', subtype: 'mobile-trace-sampling',
           droppedEvents: mobileTraceDropped, batchLimit: MOBILE_TRACE_BATCH_LIMIT,
           maxEventsPerSecond: MOBILE_TRACE_EVENTS_PER_SECOND,
@@ -2510,7 +2571,7 @@ function inspectorRedactUrlsInText(value) {
     if (!qolInternalsEnabled()) return 'off';
     // Android requests normal (not deep) from QoL to avoid generating enormous
     // telemetry streams on a device already handling a busy chat.
-    if (IS_FIREFOX_ANDROID) return 'normal';
+    if (IS_MOBILE_LIGHTWEIGHT) return 'normal';
     const level = String(settings?.qolTraceLevel || 'deep').toLowerCase();
     return ['normal','deep'].includes(level) ? level : 'deep';
   }
@@ -2724,7 +2785,7 @@ function inspectorRedactUrlsInText(value) {
     stopPerformanceObservers();
     if (!settings?.recording || !settings?.capturePerformance || !window.PerformanceObserver) return;
     configureResourceTimingBuffer();
-    if (IS_FIREFOX_ANDROID) {
+    if (IS_MOBILE_LIGHTWEIGHT) {
       const supported = PerformanceObserver.supportedEntryTypes || [];
       emit({type:'performance',subtype:'mobile-browser-capabilities',
         longTaskSupported:supported.includes('longtask'),
@@ -2869,8 +2930,13 @@ function inspectorRedactUrlsInText(value) {
     if (e.data.source === BRIDGE_SOURCE && e.data.pageId === PAGE_ID) {
       // The page bridge remains installed for the lifetime of the document, but
       // expensive correlation/render bookkeeping must sleep when recording is off.
+      const rawBridgeEvent = e.data.event || {};
+      if (rawBridgeEvent.type === 'lifecycle' &&
+          (rawBridgeEvent.subtype === 'bridge-installed' || rawBridgeEvent.subtype === 'bridge-pong')) {
+        noteBridgeReady(rawBridgeEvent.subtype);
+      }
       if (!settings?.recording) return;
-      const event = enrichBridgeEvent(e.data.event || {});
+      const event = enrichBridgeEvent(rawBridgeEvent);
       beginGenerationRenderWindow(event);
       if (event.type === 'network') handleBridgeNetworkEvent(event);
       else if (event.type === 'storage') handleStorageEvent(event);
@@ -2937,9 +3003,14 @@ function inspectorRedactUrlsInText(value) {
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type !== 'SCI_COMMAND') return;
     if (message.command === 'inspector-build-status') {
+      // An on-demand ping is useful after recording is toggled on and never
+      // claims the page bridge is working before its reply arrives.
+      if (!bridgeAckAt && bridgeLoadedAt) requestBridge('ping');
       sendResponse({ ok: true, version: INSPECTOR_VERSION, contentBuildId: INSPECTOR_CONTENT_BUILD,
         pageInstanceId: INSPECTOR_SESSION_ID, contextActive: contextAvailable(),
-        recording: !!settings?.recording });
+        recording: !!settings?.recording, bridgeState,
+        bridgeScriptLoaded: !!bridgeLoadedAt,
+        bridgeLastAckAgeMs: bridgeAckAt ? Date.now() - bridgeAckAt : null });
       return;
     }
     if (message.command === 'qol-trace-status') {
@@ -2973,7 +3044,7 @@ function inspectorRedactUrlsInText(value) {
       setTimeout(() => announceInspectorToQol('startup-retry'), 1000);
       setTimeout(() => { announceInspectorToQol('startup-settled'); requestQolMetrics('startup-settled'); }, 3000);
     }
-    emit({ type: 'lifecycle', subtype: 'page-start', title: document.title, href: redactString(location.href), userAgent: navigator.userAgent, wasDiscarded: !!document.wasDiscarded, interaction: interactionState(), inspectorVersion: INSPECTOR_VERSION, contentScriptBuildId: INSPECTOR_CONTENT_BUILD, qolIdentity: passiveQolIdentity(), captureProfile: isQolWorkerPage() ? 'qol-worker-lite' : IS_FIREFOX_ANDROID ? 'firefox-android-lightweight' : 'adaptive-lite' });
+    emit({ type: 'lifecycle', subtype: 'page-start', title: document.title, href: redactString(location.href), userAgent: navigator.userAgent, wasDiscarded: !!document.wasDiscarded, interaction: interactionState(), inspectorVersion: INSPECTOR_VERSION, contentScriptBuildId: INSPECTOR_CONTENT_BUILD, qolIdentity: passiveQolIdentity(), captureProfile: isQolWorkerPage() ? 'qol-worker-lite' : IS_IOS_WEBKIT ? 'ios-webkit-lightweight' : IS_MOBILE_LIGHTWEIGHT ? 'firefox-android-lightweight' : 'adaptive-lite' });
     if (isQolWorkerPage()) emit({ type: 'performance', subtype: 'worker-capture-profile', workerRole: PAGE_ROLE, domObserver: false, resourceTiming: 'aggregated-with-outliers', interaction: interactionState() });
     emit({ type: 'lifecycle', subtype: 'network-connectivity', connectivity: connectionState(), interaction: interactionState() });
     setTimeout(() => captureLightweightStateSnapshot('page-start', false, false).catch(() => {}), 1200);
@@ -3102,8 +3173,8 @@ function inspectorRedactUrlsInText(value) {
   })();
   // Share the main collector's immutable source stamp; do not access runtime
   // manifest APIs from the Driver-support content-script probe.
-  const inspectorVersion = contentLifetime?.version || '0.1.8';
-  const inspectorBuildId = contentLifetime?.buildId || 'sci-content-0.1.8-context-20261119-r1';
+  const inspectorVersion = contentLifetime?.version || '0.1.10';
+  const inspectorBuildId = contentLifetime?.buildId || 'sci-content-0.1.10-bridge-ios-20261121-r1';
 
   function stopStaleHeartbeat() {
     if (stopped) return;

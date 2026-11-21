@@ -660,6 +660,10 @@
   window.addEventListener('message', e => {
     const d = e.data;
     if (e.source !== window || !d || d.source !== 'SPICYCHAT_INSPECTOR_CONTENT' || d.pageId !== PAGE_ID) return;
+    if (d.command === 'ping') {
+      emit({ type: 'lifecycle', subtype: 'bridge-pong' });
+      return;
+    }
     if (d.command === 'snapshot-state') snapshotState(d.payload || {});
   });
 

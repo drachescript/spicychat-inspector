@@ -79,8 +79,14 @@ $('#checkInspectorBuild')?.addEventListener('click', async () => {
     const liveVersion = String(info.version || 'unknown');
     const liveBuild = String(info.contentBuildId || 'unavailable');
     const match = liveVersion === manifestVersion;
+    const bridgeState = String(info.bridgeState || 'not-reported');
+    const bridgeNote = bridgeState === 'ready' ? 'Page bridge responding' :
+      bridgeState === 'script-loaded' || bridgeState === 'injected' ? 'Page bridge not confirmed yet; check again shortly' :
+      bridgeState === 'not-injected' ? 'Page bridge not started' :
+      `Page bridge: ${bridgeState} (recording may be incomplete)`;
     if (result) result.textContent = `Installed v${manifestVersion} · Active tab v${liveVersion} · Build ${liveBuild}` +
-      (match ? ' (version matches)' : ' (version differs — refresh this SpicyChat tab)');
+      (match ? ' (version matches)' : ' (version differs — refresh this SpicyChat tab)') +
+      ` · ${bridgeNote}`;
   } catch (error) {
     if (result) result.textContent = 'No matching Inspector script in this tab. Open/refresh a SpicyChat tab, then retry. ' +
       String(error?.message || error);

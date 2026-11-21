@@ -1,3 +1,11 @@
+## 0.1.10
+
+- Added an on-demand, privacy-safe page-bridge health indicator to the existing popup build check. Distinguishes an active content script from a page bridge that actually replies, rather than treating a loaded script tag as proof of working capture.
+- Added one-shot, bounded bridge startup diagnostics: resource URL/injection errors, load failures, missing confirmations and successful bridge handshakes. A short ping confirms the isolated-world to page-world message path; no background polling, new permissions or captured page content.
+- Extended the existing bounded mobile trace/DOM path to iOS WebKit (including Orion environments where Firefox-style extension injection is supported). Labels such sessions `ios-webkit-lightweight` without claiming compatibility is guaranteed.
+- Preserved normal desktop capture, existing Firefox Android handling, the Driver support heartbeat contract, QoL tracing and privacy limits.
+- **Orion limitation:** this update improves visibility into what fails but cannot make unsupported Orion extension APIs work. iOS device testing is still necessary.
+
 ## 0.1.9
 
 - Fixed full-history QoL Normal-mode aggregate summaries showing `0` items despite recorded source `trace-aggregate` payload rows. The compact full-capture projection now preserves bounded, privacy-safe routine summary rows (type, feature, name, count, optional aggregate wall time) and cumulative coalesced counts. These summaries are not individual observed spans or CPU time.
