@@ -1219,6 +1219,38 @@ function decorateCompactProjection(e, out) {
   return out;
 }
 
+// Keep numeric routine-summary rows for full-history diagnostics. Raw QoL payloads
+// are not copied into this compact projection: only fixed, bounded structural
+// labels and counts. This restores aggregate totals without retaining chat text,
+// URLs, credentials, worker IDs or arbitrary operation metadata.
+function compactQolAggregatePayload(payload) {
+  if (!payload || typeof payload !== 'object') return undefined;
+  const rows = Array.isArray(payload.rows) ? payload.rows.slice(0, 250) : [];
+  const clean = [];
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    const count = Number(row.count);
+    if (!Number.isSafeInteger(count) || count <= 0 || count > 10000000) continue;
+    const type = safeQolAttributionLabel(row.type) || 'other';
+    const feature = safeQolAttributionLabel(row.feature) || 'qol';
+    // Operation names can contain more than three words. Keep safe static
+    // labels; never propagate endpoints, URLs, identifiers or user text.
+    const rawName = typeof row.name === 'string' ? row.name.trim().toLowerCase() : '';
+    const name = rawName.length <= 100 &&
+      /^[a-z][a-z0-9_.:-]*(?: [a-z][a-z0-9_.:-]*){0,7}$/.test(rawName) &&
+      !/(?:^|[._:-])(?:[a-f0-9]{16,}|[0-9]{8,}|auth|secret|token|password|sessionid|userid|chatid|botid)(?:$|[._:-])/.test(rawName)
+      ? rawName : 'event';
+    const item = {type:type.slice(0,80), feature:feature.slice(0,80), name:name.slice(0,100), count};
+    const total = Number(row.wallMsTotal);
+    if (Number.isFinite(total) && total >= 0 && total <= 864000000) item.wallMsTotal = total;
+    clean.push(item);
+  }
+  const result = { rows: clean };
+  const coalesced = Number(payload.coalescedTotal);
+  if (Number.isSafeInteger(coalesced) && coalesced >= 0) result.coalescedTotal = coalesced;
+  return result;
+}
+
 function compactVersionProjection(e) {
   if (e.type === 'qol') return decorateCompactProjection(e, {
     type:e.type, subtype:e.subtype, ts:e.ts, sourceTs:e.sourceTs, receivedAt:e.receivedAt, pageId:e.pageId, tabId:e.tabId, pageUrl:e.pageUrl||e.url,
@@ -1229,7 +1261,7 @@ function compactVersionProjection(e) {
     monoMs:e.monoMs, durationMs:e.durationMs, queueDelayMs:e.queueDelayMs, lane:e.lane, priority:e.priority, outcome:e.outcome, status:e.status,
     storageKey:e.storageKey, storageBackend:e.storageBackend, approxBytes:e.approxBytes, records:e.records, settingName:e.settingName,
     counts:e.counts, meta:e.meta,
-    payload:e.payload && typeof e.payload==='object' ? {
+    payload:e.subtype === 'trace-aggregate' ? compactQolAggregatePayload(e.payload) : e.payload && typeof e.payload==='object' ? {
       qolVersion:e.payload.qolVersion, protocolVersion:e.payload.protocolVersion, reason:e.payload.reason, traceLevel:e.payload.traceLevel,
       endpoint:e.payload.endpoint, requestedUrl:e.payload.requestedUrl, durationMs:e.payload.durationMs, status:e.payload.status, ok:e.payload.ok,
       outcome:e.payload.outcome, counts:e.payload.counts, probeStatus:e.payload.probeStatus, count:e.payload.count, added:e.payload.added, removed:e.payload.removed, updated:e.payload.updated, changed:e.payload.changed, baseline:e.payload.baseline, httpStatus:e.payload.httpStatus, key:e.payload.key, storageKey:e.payload.storageKey, backend:e.payload.backend,
@@ -1931,6 +1963,7 @@ function buildQolTraceDiagnostics(events) {
   if (!q.length) return {
     events:0, explicitTraceEvents:0, protocols:[], sequenceGaps:0, sequenceGapEvents:0,
     sequenceCoverage:{unobservedPositions:0,streams:0,knownCoalesced:0,sourceAggregationReports:0},
+    sourceAggregates:{reports:0,reportedItems:0,operationItems:0,networkItems:0,otherItems:0,wallMsReported:0,top:[]},
     traceVolume:{topFamilies:[],rawQolEvents:0,deduplicatedQolEvents:0,repetitiveFamilies:0},
     operations:{count:0,totalMs:0,slow50:0,slow200:0,slow1000:0,top:[],
       attribution:{directTriggers:0,inheritedTriggers:0,missingTriggers:0,explicitReasons:0,missingReasons:0,topReasons:[],slowExamples:[]}},
@@ -1974,6 +2007,39 @@ function buildQolTraceDiagnostics(events) {
     }
   }
   const knownCoalesced = [...coalescedByStream.values()].reduce((n, x) => n + x, 0);
+  // QoL v0.2.87 Normal summarizes short successful operations and requests.
+  // The rows are source-reported summaries, NOT reconstructed individual
+  // spans; their wall-time totals are never treated as CPU or Long Task time.
+  const aggregateFamilies = new Map();
+  let aggregateItems = 0, aggregateOps = 0, aggregateNetworks = 0, aggregateWallMs = 0;
+  const aggregateReports = q.filter(e => e.subtype === 'trace-aggregate');
+  for (const event of aggregateReports) {
+    const rows = Array.isArray(event.payload?.rows) ? event.payload.rows.slice(0,250) : [];
+    for (const row of rows) {
+      if (!row || typeof row !== 'object') continue;
+      const count = Number(row.count);
+      if (!Number.isSafeInteger(count) || count <= 0 || count > 10000000) continue;
+      const type = String(row.type || 'other').slice(0,80);
+      const feature = String(row.feature || 'qol').slice(0,80);
+      const name = String(row.name || 'event').slice(0,100);
+      aggregateItems += count;
+      if (type === 'operation-summary' || type === 'operation-end' || type === 'operation-start') aggregateOps += count;
+      else if (type === 'network-summary' || /^network[-_:]/.test(type)) aggregateNetworks += count;
+      const wallMs = Number(row.wallMsTotal);
+      if (Number.isFinite(wallMs) && wallMs >= 0) aggregateWallMs += wallMs;
+      const key = JSON.stringify([type,feature,name]);
+      aggregateFamilies.set(key,(aggregateFamilies.get(key)||0)+count);
+    }
+  }
+  const sourceAggregates = {
+    reports:aggregateReports.length, reportedItems:aggregateItems,
+    operationItems:aggregateOps, networkItems:aggregateNetworks,
+    otherItems:Math.max(0,aggregateItems-aggregateOps-aggregateNetworks),
+    wallMsReported:Math.round(aggregateWallMs*10)/10,
+    top:[...aggregateFamilies.entries()].sort((a,b)=>b[1]-a[1]).slice(0,8)
+      .map(([key,count])=>{const [type,feature,name]=JSON.parse(key);return {type,feature,name,count};}),
+    note:'QoL-side aggregate rows represent routine operations or requests not individually transmitted in Normal mode. Source wall-time totals are not CPU time; aggregates must not be added to reconstructed Long Task duration.'
+  };
   const topRoutine = [...families.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8)
     .map(([family, count]) => ({family, count}));
   const sequenceCoverage = {
@@ -2170,7 +2236,7 @@ function buildQolTraceDiagnostics(events) {
   for(const e of workerEvents){
     const text=`${e.subtype||''} ${e.operation||''}`.toLowerCase();
     if(/create|start|spawn/.test(text))workers.starts++;if(/ready/.test(text))workers.ready++;if(/job|item|request/.test(text))workers.jobs++;if(/heartbeat/.test(text))workers.heartbeats++;if(/throttl|background-delay|timer-gap/.test(text))workers.throttled++;if(/restart|replace/.test(text))workers.restarts++;if(/close|closed|stop|complete/.test(text))workers.closed++;
-    const label=e.feature||e.payload?.workerType||e.workerSessionId||'worker'; const x=workerGroups.get(label)||{label,events:0,jobs:0,throttled:0,restarts:0};x.events++;if(/job|item|request/.test(text))x.jobs++;if(/throttl|background-delay|timer-gap/.test(text))x.throttled++;if(/restart|replace/.test(text))x.restarts++;workerGroups.set(label,x);
+    const label=e.feature||e.payload?.workerType||e.workerGroup||'worker'; const x=workerGroups.get(label)||{label,events:0,jobs:0,throttled:0,restarts:0};x.events++;if(/job|item|request/.test(text))x.jobs++;if(/throttl|background-delay|timer-gap/.test(text))x.throttled++;if(/restart|replace/.test(text))x.restarts++;workerGroups.set(label,x);
   }
   workers.top=[...workerGroups.values()].sort((a,b)=>b.events-a.events).slice(0,10);
 
@@ -2223,7 +2289,7 @@ function buildQolTraceDiagnostics(events) {
 
   return {
     events:q.length,rawEvents:qRaw.length,deduplicatedEvents:Math.max(0,qRaw.length-q.length),explicitTraceEvents,protocols:[...protocolCounts.entries()].map(([protocol,count])=>({protocol,count})).sort((a,b)=>b.count-a.count),
-    sequenceGaps,sequenceGapEvents,sequenceStreams:sequence.streams,sequenceGapDetails:sequence.details,sequenceCoverage,traceVolume,traceLevel,
+    sequenceGaps,sequenceGapEvents,sequenceStreams:sequence.streams,sequenceGapDetails:sequence.details,sequenceCoverage,sourceAggregates,traceVolume,traceLevel,
     traceBatches:{events:traceBatchEvents,maxBatchSize},
     operations:{count:spans.length,totalMs:Math.round(operationTotalMs*10)/10,timingSummary,slow50:spans.filter(x=>(x.durationMs||0)>=50).length,slow200:spans.filter(x=>(x.durationMs||0)>=200).length,slow1000:spans.filter(x=>(x.durationMs||0)>=1000).length,top:topOps,attribution},
     scheduler,
@@ -3611,6 +3677,7 @@ function renderOverview() {
     const top=op.top?.[0];
     extra.push(`<div><strong>QoL Trace:</strong> ${t.explicitTraceEvents.toLocaleString()} detailed event(s) · ${op.count.toLocaleString()} operation span(s) · ${(op.totalMs/1000).toFixed(2)}s summed operation <em>wall time (not CPU; nested spans double count)</em> · slow ≥50ms ${op.slow50}, ≥200ms ${op.slow200}, ≥1s ${op.slow1000}${top?` · top ${esc(top.label)} ${(top.totalMs/1000).toFixed(2)}s summed wall across ${top.runs} run(s)`:''}${t.deduplicatedEvents?` · ${t.deduplicatedEvents.toLocaleString()} duplicate transport event(s) collapsed`:''}${t.sequenceGaps?` · ${t.sequenceGaps.toLocaleString()} unobserved trace sequence position(s) (not proven lost events)`:' · no internal sequence holes observed'}${proto?` · protocol ${proto}`:''}.</div>`);
     if (op.timingSummary) {const x=op.timingSummary;if(x.unionElapsedPerStreamMs!=null)extra.push(`<div><strong>QoL timing interpretation:</strong> union elapsed per page/session ${(x.unionElapsedPerStreamMs/1000).toFixed(2)}s (may overlap between tabs)${x.activeSamples?` · ${x.activeSamples} QoL-reported active sample(s), ${(x.reportedActiveSumMs/1000).toFixed(2)}s summed`:''}${x.synchronousCallSamples?` · ${x.synchronousCallSamples} initial synchronous-call sample(s), ${(x.reportedSynchronousCallSumMs/1000).toFixed(2)}s summed`:''}${x.queueSamples?` · ${x.queueSamples} queue-delay sample(s), ${(x.reportedQueueDelaySumMs/1000).toFixed(2)}s summed`:''}. <em>QoL active and synchronous timings are estimates supplied by QoL, not a CPU profiler. Do not subtract them from wall time to infer CPU time.</em></div>`);}
+    if(t.sourceAggregates?.reports){const a=t.sourceAggregates;extra.push(`<div><strong>QoL Normal-mode aggregates:</strong> ${a.reportedItems.toLocaleString()} source-reported summarized event(s) across ${a.reports} aggregation report(s) · ${a.operationItems.toLocaleString()} operation item(s) · ${a.networkItems.toLocaleString()} network item(s)${a.top?.[0]?` · top ${esc(a.top[0].feature)} / ${esc(a.top[0].name)} (${a.top[0].count.toLocaleString()})`:''}. <em>These were summarized by QoL, not individually observed spans or CPU measurements; detailed span counts above intentionally exclude them.</em></div>`);}
     if(t.sequenceCoverage?.unobservedPositions){const c=t.sequenceCoverage;extra.push(`<div><strong>Trace sequence coverage:</strong> ${c.unobservedPositions.toLocaleString()} unobserved position(s) across ${c.streams} stream(s); QoL reported at least ${c.knownCoalesced.toLocaleString()} cumulative coalesced trace(s) in ${c.sourceAggregationReports} aggregation report(s). <em>These totals do not match one-to-one, and sequence holes alone do not establish transport loss.</em></div>`);}
     if(t.traceVolume?.topFamilies?.[0])extra.push(`<div><strong>Trace event volume:</strong> top families ${t.traceVolume.topFamilies.slice(0,5).map(x=>`${esc(x.family)} ×${x.count.toLocaleString()}`).join(' · ')}. <em>These routine events remain in raw exports; Interesting only hides routine noise from the UI.</em></div>`);
     if (op.attribution && op.count) {

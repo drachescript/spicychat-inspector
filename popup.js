@@ -1,3 +1,5 @@
+// UI only: the installed manifest version is distinct from the live tab's
+// source-stamped content-script version, checked on demand below.
 const manifestVersion = chrome.runtime.getManifest().version;
 document.querySelector('#version') && (document.querySelector('#version').textContent = `v${manifestVersion}`);
 const $ = s => document.querySelector(s);
@@ -58,10 +60,31 @@ $('#checkQolConnection')?.addEventListener('click', async () => {
     if (!info.recording) status('Inspector recording is paused.');
     else if (!info.traceEnabled) status('QoL tracing is off; enable Detailed QoL internals for a targeted test.');
     else if (info.traceEventsSeen > 0) status(`QoL traces received: ${info.traceEventsSeen}. Level: ${info.traceLevel}.`);
-    else if (info.handshakeResponses > 0) status('QoL handshake received, but no operation traces yet.');
+    else if (info.handshakeResponses > 0) status('QoL connected; no individual traces yet. Normal mode may summarize short operations.');
     else status('No QoL handshake or operation trace observed in this tab yet.');
   } catch (error) { status(String(error?.message || error), true); }
   finally { button.disabled = false; }
+});
+
+// Read-only, on-demand check against the actual content script in the active tab.
+$('#checkInspectorBuild')?.addEventListener('click', async () => {
+  const button = $('#checkInspectorBuild');
+  const result = $('#inspectorBuildResult');
+  button.disabled = true;
+  if (result) result.textContent = 'Checking the active tab…';
+  try {
+    const response = await msg({ type: 'SCI_ACTIVE_COMMAND', command: 'inspector-build-status' });
+    const info = response?.result;
+    if (!info?.ok) throw new Error(info?.error || 'Active tab has no responding Inspector content script.');
+    const liveVersion = String(info.version || 'unknown');
+    const liveBuild = String(info.contentBuildId || 'unavailable');
+    const match = liveVersion === manifestVersion;
+    if (result) result.textContent = `Installed v${manifestVersion} · Active tab v${liveVersion} · Build ${liveBuild}` +
+      (match ? ' (version matches)' : ' (version differs — refresh this SpicyChat tab)');
+  } catch (error) {
+    if (result) result.textContent = 'No matching Inspector script in this tab. Open/refresh a SpicyChat tab, then retry. ' +
+      String(error?.message || error);
+  } finally { button.disabled = false; }
 });
 
 // Snapshot HTML remains a supported automatic diagnostic action.
@@ -76,6 +99,55 @@ $('#snapshotHtml')?.addEventListener('click', async () => {
     const message = String(error?.message || error);
     status(/Receiving end does not exist|Could not establish connection/i.test(message)
       ? 'Open a SpicyChat tab and try again.' : message, true);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+// User-initiated recovery for tabs still holding an invalidated content-script
+// context after an extension reload. Never automatically navigate or refresh tabs.
+// Chrome's existing SpicyChat host permissions are enough; no new permissions.
+$('#refreshSpicyChatTabs')?.addEventListener('click', async () => {
+  const button = $('#refreshSpicyChatTabs');
+  button.disabled = true;
+  try {
+    const tabs = await chrome.tabs.query({
+      url: ['https://spicychat.ai/*', 'https://*.spicychat.ai/*']
+    });
+    const targets = [];
+    let skipped = 0;
+    for (const tab of tabs) {
+      if (!Number.isInteger(tab?.id)) continue;
+      let url;
+      try { url = new URL(tab.url); } catch (_) { skipped++; continue; }
+      if (url.protocol !== 'https:' ||
+          (url.hostname !== 'spicychat.ai' && !url.hostname.endsWith('.spicychat.ai'))) continue;
+      // Do not awaken sleeping/discarded tabs or interrupt the export workflow.
+      if (tab.discarded || tab.status === 'loading' ||
+          (url.pathname === '/chats' && url.searchParams.get('ds-research-export') === '1')) {
+        skipped++;
+        continue;
+      }
+      targets.push(tab.id);
+    }
+    if (!targets.length) {
+      status(skipped ? `No eligible tabs to refresh (${skipped} left alone).` : 'No open SpicyChat tabs found.');
+      return;
+    }
+    const notice = `Refresh ${targets.length} open SpicyChat tab${targets.length === 1 ? '' : 's'}?\n\n` +
+      'Unsaved messages and editor drafts in those tabs may be lost. Save them first.\n' +
+      (skipped ? `${skipped} export, loading or discarded tab${skipped === 1 ? '' : 's'} will be left alone.\n` : '') +
+      '\nThis does not clear Brave’s stored extension error history.';
+    if (!window.confirm(notice)) return;
+    // User confirmed; do not silently retry failures or reload unrelated tabs.
+    const results = await Promise.allSettled(targets.map(id => chrome.tabs.reload(id)));
+    const refreshed = results.filter(result => result.status === 'fulfilled').length;
+    const failed = results.length - refreshed;
+    status(`Refreshed ${refreshed} SpicyChat tab${refreshed === 1 ? '' : 's'}.` +
+      (skipped ? ` ${skipped} left alone.` : '') +
+      (failed ? ` ${failed} failed.` : ''), failed > 0);
+  } catch (error) {
+    status(`Could not refresh tabs: ${String(error?.message || error)}`, true);
   } finally {
     button.disabled = false;
   }

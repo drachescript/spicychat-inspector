@@ -1,3 +1,31 @@
+## 0.1.9
+
+- Fixed full-history QoL Normal-mode aggregate summaries showing `0` items despite recorded source `trace-aggregate` payload rows. The compact full-capture projection now preserves bounded, privacy-safe routine summary rows (type, feature, name, count, optional aggregate wall time) and cumulative coalesced counts. These summaries are not individual observed spans or CPU time.
+- Display aggregate report counts even if a report contains no valid rows; do not silently hide the existence of a diagnostic collection issue.
+- Firefox build: explicitly declare `browser_specific_settings.gecko_android` (Firefox for Android 142+) alongside the existing Firefox desktop ID/data-collection declaration. Keep the Firefox event-page background conversion; Firefox Android cannot use the Chrome MV3 service worker.
+- Added package-time verification of the Firefox Android manifest declaration and a viewport setting for the mobile Inspector viewer. Chrome/Brave runtime manifest, permissions, and background worker remain unchanged apart from version.
+- Updated content-script version/build marker and Firefox mobile development/signing notes. Real Firefox Android device testing and AMO signing are still required; source tests alone are not proof of live Android compatibility.
+
+## 0.1.8
+
+- Removed all direct `chrome.runtime.getManifest()` invocations from injected `content.js`, including the Driver-support startup probe. The extension version and a unique content-script build ID are now static in the source; stale runtime contexts cannot throw from those lookups.
+- Added a read-only **Check Inspector build in active tab** popup control. It returns the version and build identifier from the actual responding tab without polling or new permissions. An old, unmatched, or missing script is reported instead of being mistaken for a current one.
+- Included the content-script build ID in the normal `page-start` diagnostic and the on-demand QoL connection response for easier version attribution.
+- Chrome and Firefox build BAT files now delete their own temporary staging folders after a successful verified ZIP build. The scripts retain old final ZIPs/history and do not delete user data.
+- Existing QoL protocol v2 tracing, privacy filtering, Driver support, observer limits, extension-context shutdown and recording storage are unchanged.
+- **Known limitation:** errors emitted by an already-stale injected script or previously retained in Brave cannot be retroactively suppressed. An exact active-tab build check is the reliable way to verify what is running.
+
+## 0.1.7
+
+- Added a confirmation-gated popup action to refresh previously open SpicyChat tabs after an Inspector extension reload. It excludes discarded/loading tabs and Research Export pages; no automatic reloads or new permissions. This replaces stale injected scripts but does not clear Brave’s retained extension-error history.
+
+- Aligned Inspector with QoL v0.2.87 diagnostic protocol v2: send canonical v2 requests on one transport, correctly unsubscribe QoL when Detailed QoL internals is disabled, retain v1 fallback only when a v2 peer is not known, and keep explicit phase separate from event type.
+- Preserve privacy-safe worker grouping from v2 batch envelopes without exporting raw worker-session IDs.
+- Report QoL Normal-mode source aggregates separately from observed individual operation spans; never count aggregate wall time as CPU time.
+- Clarified popup connection status during quiet Normal tracing.
+- Audited Chrome permissions: storage, unlimitedStorage, webRequest and existing restricted host access remain; activeTab retained pending an optional future removal.
+- Retained v0.1.6 trigger/reason attribution, low-overhead recording and extension-context invalidation protection.
+
 ## 0.1.4
 - Grouped static assets and tracker resources on QoL helper pages into a few bounded Resource Timing categories, avoiding page-close event bursts; slow API request timings remain individually observable.
 - Changed reported Inspector throttle coverage to stop at observed page hide/freeze and distinguish events emitted after page closure from genuine active capture gaps. Unobserved page endings remain upper bounds, not asserted data loss.

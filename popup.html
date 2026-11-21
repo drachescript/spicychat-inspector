@@ -30,7 +30,15 @@
     <p class="markerHelp">Off by default. For stuttering investigations, enable QoL internals and use Normal during a short foreground reproduction. Deep is only for targeted cases where Normal is insufficient. Turn tracing off afterward. No extra observers are installed for this option.</p>
     <button id="requestQolTrace" class="wide" disabled>Request QoL trace now</button>
     <button id="checkQolConnection" class="wide">Check QoL connection in active tab</button>
+    <button id="checkInspectorBuild" class="wide">Check Inspector build in active tab</button>
+    <p id="inspectorBuildResult" class="markerHelp" aria-live="polite">Compares the installed extension version with the script responding from the active SpicyChat tab.</p>
     <button id="snapshotHtml" class="wide">Snapshot HTML now</button>
+  </section>
+
+  <section class="options" aria-labelledby="extensionRecoveryHeading">
+    <h2 id="extensionRecoveryHeading">After an Inspector update</h2>
+    <p class="markerHelp">Already-open SpicyChat tabs can still have an old Inspector script after extension reloads. Refresh them to reconnect. Research Export and discarded tabs will be left alone.</p>
+    <button id="refreshSpicyChatTabs" class="wide">Refresh open SpicyChat tabs</button>
   </section>
 
   <button id="openInspector" class="primary wide">Open Inspector</button>

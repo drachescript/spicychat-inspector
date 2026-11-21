@@ -1,11 +1,14 @@
 (() => {
-  const INSPECTOR_VERSION = (() => { try { return chrome.runtime.getManifest().version || 'unknown'; } catch (_) { return 'unknown'; } })();
+  // Static source stamp: never call the runtime manifest API from an injected
+  // page script. The runtime API can disappear after a hot extension reload.
+  const INSPECTOR_VERSION = '0.1.9';
+  const INSPECTOR_CONTENT_BUILD = 'sci-content-0.1.9-aggregate-mobile-20261120-r1';
   const PAGE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   // The main collector and the additive Driver-support probe are two IIFEs in
   // the same content-script world. Link their shutdowns by this *instance-local*
   // object, not a recurring runtime API call. Old and new instances keep their
   // own object references, so reload notifications cannot stop a fresh probe.
-  const contentLifetime = { invalidated: false, stopCore: null, stopDriver: null };
+  const contentLifetime = { invalidated: false, stopCore: null, stopDriver: null, version: INSPECTOR_VERSION, buildId: INSPECTOR_CONTENT_BUILD };
   try { window.__SCI_INSPECTOR_CONTENT_LIFETIME_V1__ = contentLifetime; } catch (_) {}
   // Firefox Android supports recording, but browser Long Task/LoAF APIs may be missing.
   // Keep collection bounded even when a busy chat generates thousands of mutations/traces.
@@ -2148,9 +2151,14 @@ function inspectorRedactUrlsInText(value) {
       : (build != null ? String(build) : null);
     const sessionId = pick(inner, ['sessionId','pageSessionId','runtimeId','instanceId']) || pick(data, ['pageSessionId','sessionId']) || inherited.qolSessionId || null;
     const traceSessionId = pick(inner, ['traceSessionId','traceRunId','runtimeSessionId']) || inherited.traceSessionId || sessionId || null;
-    const workerSessionId = pick(inner, ['workerSessionId','workerId','helperSessionId']) || inherited.workerSessionId || null;
+    const workerSessionId = pick(inner, ['workerSessionId','workerId','helperSessionId']) || pick(data, ['workerSessionId']) || inherited.workerSessionId || null;
     const protocol = String(data.protocol || inner.protocol || inherited.traceProtocol || '').slice(0, 120) || null;
-    const subtype = `${subtypeRaw}${phase && !String(subtypeRaw).toLowerCase().includes(String(phase).toLowerCase()) ? `-${phase}` : ''}`.toLowerCase().replace(/[^a-z0-9:_-]+/g, '-').slice(0, 120);
+    // QoL v2 sends type and phase independently. Appending the phase to type
+    // turns operation-end into operation-end-<phase>, hiding it from exact-type
+    // filters in Inspector. Preserve legacy v1's combined subtype format.
+    const stableType = protocol === QOL_PROTOCOL_V2 ? subtypeRaw :
+      `${subtypeRaw}${phase && !String(subtypeRaw).toLowerCase().includes(String(phase).toLowerCase()) ? `-${phase}` : ''}`;
+    const subtype = String(stableType).toLowerCase().replace(/[^a-z0-9:_-]+/g, '-').slice(0, 120);
     const sourceTs = normalizedTraceNumber(traceField(inner, data, ['ts','timestamp','time']));
     const monoMs = normalizedTraceNumber(traceField(inner, data, ['monoMs','performanceNow','perfNow','monotonicMs']));
     const seq = normalizedTraceNumber(traceField(inner, data, ['seq','sequence','sequenceNumber']));
@@ -2173,6 +2181,9 @@ function inspectorRedactUrlsInText(value) {
       qolSessionId: sessionId ? String(sessionId).slice(0, 200) : null,
       traceSessionId: traceSessionId ? String(traceSessionId).slice(0, 200) : null,
       workerSessionId: workerSessionId ? String(workerSessionId).slice(0, 200) : null,
+      // Export sanitization redacts raw session IDs. Keep a bounded one-way
+      // worker group fingerprint for distinguishing concurrent worker streams.
+      workerGroup: workerSessionId ? traceFingerprint(String(workerSessionId).slice(0, 200)) : null,
       traceProtocol: protocol,
       traceSeq: seq,
       sourceTs,
@@ -2204,7 +2215,9 @@ function inspectorRedactUrlsInText(value) {
       qolVersion: data.qolVersion || payload?.qolVersion || null,
       build: data.build || payload?.build || null,
       qolSessionId: data.pageSessionId || data.sessionId || payload?.pageSessionId || payload?.sessionId || null,
-      traceSessionId: data.traceSessionId || payload?.traceSessionId || null,
+      traceSessionId: data.traceSessionId || data.runtimeSessionId || payload?.traceSessionId || null,
+      // QoL v2 puts the worker identity on the envelope, not each batch row.
+      workerSessionId: data.workerSessionId || payload?.workerSessionId || null,
       traceProtocol: data.protocol || payload?.protocol || null
     };
     // Cap normalization cost before creating/sanitizing hundreds of trace objects.
@@ -2510,15 +2523,30 @@ function inspectorRedactUrlsInText(value) {
       payload: {
         inspectorVersion: INSPECTOR_VERSION,
         inspectorSessionId: INSPECTOR_SESSION_ID,
-        recording: !!settings?.recording,
+        // QoL's v2 `recording` flag controls its diagnostic capture, not
+        // Inspector's general event recorder. Turning Detailed QoL internals
+        // off must explicitly unsubscribe QoL, even if Inspector stays REC.
+        recording: !!settings?.recording && qolInternalsEnabled(),
         traceLevel: effectiveQolTraceLevel(),
         reason: String(reason || type).slice(0,80),
         requestedProtocols: [QOL_PROTOCOL_V2, QOL_PROTOCOL_V1],
         capabilities: ['trace-batch','operation-spans','scheduler','storage','workers','settings','background-forwarding','sequence-gap-detection','performance-correlation']
       }
     };
-    try { window.postMessage(message, '*'); } catch (_) {}
-    try { document.dispatchEvent(new CustomEvent(QOL_REQUEST_EVENT, { detail: JSON.stringify(message) })); } catch (_) {}
+    // v2 has one canonical window.postMessage transport. Sending the same
+    // request as both a postMessage and CustomEvent made QoL process duplicate
+    // handshakes, metric snapshots and background subscriptions. Older v1
+    // versions retain the compatibility event path.
+    try { window.postMessage(message, location.origin); } catch (_) {}
+    if (protocol !== QOL_PROTOCOL_V2) {
+      try { document.dispatchEvent(new CustomEvent(QOL_REQUEST_EVENT, { detail: JSON.stringify(message) })); } catch (_) {}
+    }
+  }
+  function v2PeerKnown() {
+    try {
+      return latestQolHandshake?.protocol === QOL_PROTOCOL_V2 ||
+        document.documentElement?.dataset?.dsQolDiagnosticProtocolLatest === QOL_PROTOCOL_V2;
+    } catch (_) { return false; }
   }
   function announceInspectorToQol(reason = 'hello') {
     if (qolInternalsEnabled()) {
@@ -2533,11 +2561,12 @@ function inspectorRedactUrlsInText(value) {
       },QOL_TRACE_CHECK_DELAY_MS);
     }
     dispatchQolDiagnosticRequest(QOL_PROTOCOL_V2, 'hello', reason);
-    dispatchQolDiagnosticRequest(QOL_PROTOCOL_V1, 'hello', reason);
+    // Only send legacy fallback when a v2 peer has not been discovered.
+    if (!v2PeerKnown()) dispatchQolDiagnosticRequest(QOL_PROTOCOL_V1, 'hello', reason);
   }
   function requestQolMetrics(reason = 'snapshot') {
     dispatchQolDiagnosticRequest(QOL_PROTOCOL_V2, 'request-metrics', reason);
-    dispatchQolDiagnosticRequest(QOL_PROTOCOL_V1, 'request-metrics', reason);
+    if (!v2PeerKnown()) dispatchQolDiagnosticRequest(QOL_PROTOCOL_V1, 'request-metrics', reason);
   }
   function startQolPresence() {
     if (!qolInternalsEnabled() || qolPresenceTimer) return;
@@ -2866,7 +2895,8 @@ function inspectorRedactUrlsInText(value) {
             nonce: e.data.nonce || null,
             ready: !!settings,
             recording: !!settings?.recording,
-            version: INSPECTOR_VERSION
+            version: INSPECTOR_VERSION,
+            contentBuildId: INSPECTOR_CONTENT_BUILD
           }, '*');
         } catch (_) {}
         return;
@@ -2906,12 +2936,20 @@ function inspectorRedactUrlsInText(value) {
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type !== 'SCI_COMMAND') return;
+    if (message.command === 'inspector-build-status') {
+      sendResponse({ ok: true, version: INSPECTOR_VERSION, contentBuildId: INSPECTOR_CONTENT_BUILD,
+        pageInstanceId: INSPECTOR_SESSION_ID, contextActive: contextAvailable(),
+        recording: !!settings?.recording });
+      return;
+    }
     if (message.command === 'qol-trace-status') {
       // Read-only, on-demand status. A successful command is not proof QoL paired.
       sendResponse({ok:true, recording:!!settings?.recording, traceEnabled:qolInternalsEnabled(),
         traceLevel:effectiveQolTraceLevel(), handshakeResponses:qolHandshakeResponses,
         traceEventsSeen:qolTracesSeen, lastTraceAgeMs:qolLastTraceTs ? Date.now()-qolLastTraceTs : null,
-        qolVersion:passiveQolIdentity()?.version||null });
+        qolVersion:passiveQolIdentity()?.version||null,
+        qolProtocol:latestQolHandshake?.protocol||null,
+        inspectorVersion: INSPECTOR_VERSION, contentBuildId: INSPECTOR_CONTENT_BUILD });
       return;
     }
     if (message.command === 'snapshot-html') { htmlSnapshot(); sendResponse({ ok: true }); return; }
@@ -2935,7 +2973,7 @@ function inspectorRedactUrlsInText(value) {
       setTimeout(() => announceInspectorToQol('startup-retry'), 1000);
       setTimeout(() => { announceInspectorToQol('startup-settled'); requestQolMetrics('startup-settled'); }, 3000);
     }
-    emit({ type: 'lifecycle', subtype: 'page-start', title: document.title, href: redactString(location.href), userAgent: navigator.userAgent, wasDiscarded: !!document.wasDiscarded, interaction: interactionState(), inspectorVersion: INSPECTOR_VERSION, qolIdentity: passiveQolIdentity(), captureProfile: isQolWorkerPage() ? 'qol-worker-lite' : IS_FIREFOX_ANDROID ? 'firefox-android-lightweight' : 'adaptive-lite' });
+    emit({ type: 'lifecycle', subtype: 'page-start', title: document.title, href: redactString(location.href), userAgent: navigator.userAgent, wasDiscarded: !!document.wasDiscarded, interaction: interactionState(), inspectorVersion: INSPECTOR_VERSION, contentScriptBuildId: INSPECTOR_CONTENT_BUILD, qolIdentity: passiveQolIdentity(), captureProfile: isQolWorkerPage() ? 'qol-worker-lite' : IS_FIREFOX_ANDROID ? 'firefox-android-lightweight' : 'adaptive-lite' });
     if (isQolWorkerPage()) emit({ type: 'performance', subtype: 'worker-capture-profile', workerRole: PAGE_ROLE, domObserver: false, resourceTiming: 'aggregated-with-outliers', interaction: interactionState() });
     emit({ type: 'lifecycle', subtype: 'network-connectivity', connectivity: connectionState(), interaction: interactionState() });
     setTimeout(() => captureLightweightStateSnapshot('page-start', false, false).catch(() => {}), 1200);
@@ -3062,8 +3100,10 @@ function inspectorRedactUrlsInText(value) {
     try { return window.__SCI_INSPECTOR_CONTENT_LIFETIME_V1__ || null; }
     catch (_) { return null; }
   })();
-  let inspectorVersion = 'unknown';
-  try { inspectorVersion = chrome.runtime.getManifest().version || 'unknown'; } catch (_) {}
+  // Share the main collector's immutable source stamp; do not access runtime
+  // manifest APIs from the Driver-support content-script probe.
+  const inspectorVersion = contentLifetime?.version || '0.1.8';
+  const inspectorBuildId = contentLifetime?.buildId || 'sci-content-0.1.8-context-20261119-r1';
 
   function stopStaleHeartbeat() {
     if (stopped) return;
