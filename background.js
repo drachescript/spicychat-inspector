@@ -1545,7 +1545,12 @@ async function sendToActiveTab(command, payload = {}) {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   const tab = tabs[0];
   if (!tab?.id) throw new Error('No active tab.');
-  return chrome.tabs.sendMessage(tab.id, { type: 'SCI_COMMAND', command, payload });
+  // Only the on-demand Inspector build check relays authoritative settings.
+  // This lets callback-limited iOS content scripts recover without granting
+  // any extra permissions or changing the persisted recording preference.
+  const checkedPayload = command === 'inspector-build-status' ?
+    { ...payload, verifiedSettings: await getSettings() } : payload;
+  return chrome.tabs.sendMessage(tab.id, { type: 'SCI_COMMAND', command, payload: checkedPayload });
 }
 
 async function migrateSettingsFor004() {

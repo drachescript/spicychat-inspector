@@ -1,8 +1,8 @@
 (() => {
   // Static source stamp: never call the runtime manifest API from an injected
   // page script. The runtime API can disappear after a hot extension reload.
-  const INSPECTOR_VERSION = '0.1.10';
-  const INSPECTOR_CONTENT_BUILD = 'sci-content-0.1.10-bridge-ios-20261121-r1';
+  const INSPECTOR_VERSION = '0.1.12';
+  const INSPECTOR_CONTENT_BUILD = 'sci-content-0.1.12-orion-settings-transport-20261122-r1';
   const PAGE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   // The main collector and the additive Driver-support probe are two IIFEs in
   // the same content-script world. Link their shutdowns by this *instance-local*
@@ -599,11 +599,12 @@ function inspectorRedactUrlsInText(value) {
     try { contentLifetime.stopDriver?.(); } catch (_) {}
   }
   contentLifetime.stopCore = stopInvalidatedContext;
+  contentLifetime.currentRecording = () => collectorsInitialized && !!settings?.recording;
 
   function contextAvailable() {
     if (extensionContextInvalidated) return false;
     try {
-      if (!chrome?.runtime?.id) { stopInvalidatedContext(); return false; }
+      if (typeof chrome?.runtime?.sendMessage !== 'function') { stopInvalidatedContext(); return false; }
       return true;
     } catch (_) {
       stopInvalidatedContext();
@@ -611,16 +612,92 @@ function inspectorRedactUrlsInText(value) {
     }
   }
 
-  function directSend(payload) {
-    if (!contextAvailable()) return null;
-    try {
-      return chrome.runtime.sendMessage({ type: 'SCI_EVENT', event: payload }).catch(error => {
-        if (isInvalidatedContextError(error)) stopInvalidatedContext();
-      });
-    } catch (error) {
+  // Orion and some WebExtension ports expose callback-style chrome APIs rather
+  // than Promise-returning methods. Resolve from either route, exactly once.
+  // Timeouts are used ONLY for one-shot settings reads, never per-event polling.
+  function compatibleChromeCall(invoke, timeoutMs = 4000) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => finish(new Error('extension-api-timeout')), timeoutMs);
+      function finish(error, result) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (error) reject(error); else resolve(result);
+      }
+      try {
+        const returned = invoke(result => {
+          let lastError = null;
+          try { lastError = chrome.runtime?.lastError || null; } catch (_) {}
+          finish(lastError ? new Error(String(lastError.message || lastError)) : null, result);
+        });
+        if (returned && typeof returned.then === 'function') {
+          returned.then(result => {
+            // Some shims return Promise<void> even while invoking the callback
+            // later. Do not let that undefined value win the race.
+            if (result !== undefined) finish(null, result);
+          }, error => finish(error));
+        }
+      } catch (error) {
+        // Promise-only compatibility shims sometimes reject an explicit
+        // callback argument before dispatching the request.
+        if (!/callback|argument|parameter/i.test(String(error?.message || error))) {
+          finish(error); return;
+        }
+        try {
+          const returned = invoke();
+          if (!returned || typeof returned.then !== 'function') {
+            finish(new Error('no-supported-extension-message-result')); return;
+          }
+          returned.then(result => finish(null, result), failure => finish(failure));
+        } catch (fallbackError) { finish(fallbackError); }
+      }
+    });
+  }
+
+  let eventMessagesSent = 0;
+  let eventMessagesAcked = 0;
+  let eventMessagesFailed = 0;
+  let lastEventAckAt = 0;
+  let settingsSource = 'pending';
+  function dispatchRuntimeEvent(message) {
+    if (!contextAvailable()) return;
+    eventMessagesSent++;
+    let finished = false;
+    const noteResult = (response, error) => {
+      if (finished) return;
+      finished = true;
+      if (response?.ok) { eventMessagesAcked++; lastEventAckAt = Date.now(); }
+      else eventMessagesFailed++;
       if (isInvalidatedContextError(error)) stopInvalidatedContext();
-      return null;
+    };
+    try {
+      const result = chrome.runtime.sendMessage(message, response => {
+        let lastError = null;
+        try { lastError = chrome.runtime?.lastError || null; } catch (_) {}
+        noteResult(response, lastError);
+      });
+      if (result && typeof result.then === 'function') {
+        result.then(response => {
+          if (response !== undefined) noteResult(response, null);
+        }, error => noteResult(null, error));
+      }
+    } catch (error) {
+      if (/callback|argument|parameter/i.test(String(error?.message || error))) {
+        try {
+          const result = chrome.runtime.sendMessage(message);
+          if (result && typeof result.then === 'function') {
+            result.then(response => noteResult(response, null), failure => noteResult(null, failure));
+            return;
+          }
+        } catch (fallbackError) { error = fallbackError; }
+      }
+      noteResult(null, error);
     }
+  }
+
+  function directSend(payload) {
+    dispatchRuntimeEvent({ type: 'SCI_EVENT', event: payload });
   }
 
   function flushEventQueue() {
@@ -628,11 +705,7 @@ function inspectorRedactUrlsInText(value) {
     if (!contextAvailable()) return;
     if (!eventQueue.length) return;
     const batch = eventQueue.splice(0, EVENT_BATCH_MAX * 4);
-    try {
-      chrome.runtime.sendMessage({ type: 'SCI_EVENT_BATCH', events: batch }).catch(error => {
-        if (isInvalidatedContextError(error)) stopInvalidatedContext();
-      });
-    } catch (error) { if (isInvalidatedContextError(error)) stopInvalidatedContext(); }
+    dispatchRuntimeEvent({ type: 'SCI_EVENT_BATCH', events: batch });
     if (eventQueue.length) eventBatchTimer = setTimeout(flushEventQueue, 0);
   }
 
@@ -1074,6 +1147,12 @@ function inspectorRedactUrlsInText(value) {
   let bridgeLoadedAt = 0;
   let bridgeAckAt = 0;
   let bridgeHealthTimer = null;
+  let bridgeStartTrigger = null;
+  let bridgeAttemptCount = 0;
+  let bootstrapState = 'waiting-settings';
+  let collectorsInitialized = false;
+  let bootstrapError = null;
+  let bridgeDocumentListenerInstalled = false;
   function noteBridgeReady(method) {
     if (bridgeAckAt) return;
     bridgeAckAt = Date.now();
@@ -1082,8 +1161,25 @@ function inspectorRedactUrlsInText(value) {
     emit({ type: 'lifecycle', subtype: 'inspector-bridge-health', stage: 'ready', method,
       scriptLoaded: !!bridgeLoadedAt, elapsedMs: null });
   }
-  function injectBridge() {
-    if (!contextAvailable() || bridgeState !== 'not-injected') return;
+  function injectBridge(trigger = 'startup') {
+    // The page bridge does not read stored settings or record anything by itself.
+    // Launch it independently of the asynchronous settings reply, which may be
+    // delayed/unsupported by some WebExtension compatibility layers.
+    if (!['not-injected', 'waiting-document'].includes(bridgeState)) return;
+    if (!contextAvailable()) { bridgeState = 'runtime-unavailable'; return; }
+    const root = document.documentElement || document.head || document.body;
+    if (!root) {
+      bridgeState = 'waiting-document';
+      if (!bridgeDocumentListenerInstalled) {
+        bridgeDocumentListenerInstalled = true;
+        const tryOnDocument = () => {
+          if (!extensionContextInvalidated) injectBridge('document-ready');
+        };
+        document.addEventListener('DOMContentLoaded', tryOnDocument, { once: true });
+        document.addEventListener('readystatechange', tryOnDocument, { once: true });
+      }
+      return;
+    }
     const script = document.createElement('script');
     try { script.src = chrome.runtime.getURL('bridge.js'); }
     catch (error) {
@@ -1097,6 +1193,8 @@ function inspectorRedactUrlsInText(value) {
     }
     script.dataset.sciPageId = PAGE_ID;
     const startedAt = Date.now();
+    bridgeStartTrigger = trigger;
+    bridgeAttemptCount++;
     bridgeState = 'injected';
     script.onload = () => {
       bridgeLoadedAt = Date.now();
@@ -1123,13 +1221,20 @@ function inspectorRedactUrlsInText(value) {
         reason: bridgeLoadedAt ? 'page-bridge-did-not-respond' : 'bridge-load-not-confirmed',
         scriptLoaded: !!bridgeLoadedAt, elapsedMs: Date.now() - startedAt });
     }, 2500);
-    try { (document.documentElement || document.head || document.body).appendChild(script); }
+    try { root.appendChild(script); }
     catch (_) {
       bridgeState = 'injection-error';
       if (bridgeHealthTimer) { clearTimeout(bridgeHealthTimer); bridgeHealthTimer = null; }
       emit({ type: 'error', subtype: 'inspector-bridge-health', stage: bridgeState,
         reason: 'bridge-script-append-failed' });
     }
+  }
+
+  // This function is safe for the popup's on-demand diagnostic: if startup was
+  // previously deferred, it attempts the missing injection just once. It never
+  // reinjects after a definitive load/error/timeout stage.
+  function ensureBridgeStarted(trigger) {
+    if (bridgeState === 'not-injected' || bridgeState === 'waiting-document') injectBridge(trigger);
   }
 
   function connectionState() {
@@ -3003,14 +3108,24 @@ function inspectorRedactUrlsInText(value) {
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type !== 'SCI_COMMAND') return;
     if (message.command === 'inspector-build-status') {
-      // An on-demand ping is useful after recording is toggled on and never
-      // claims the page bridge is working before its reply arrives.
+      // On-demand bootstrap recovery only when no injection has been attempted.
+      // The background worker can relay verified settings through an active-tab
+      // command even if Orion disallows content -> background message replies.
+      if (!collectorsInitialized && message.payload?.verifiedSettings) {
+        initializeCollectors(message.payload.verifiedSettings, 'background-active-tab-relay');
+      }
+      ensureBridgeStarted('popup-check');
       if (!bridgeAckAt && bridgeLoadedAt) requestBridge('ping');
       sendResponse({ ok: true, version: INSPECTOR_VERSION, contentBuildId: INSPECTOR_CONTENT_BUILD,
         pageInstanceId: INSPECTOR_SESSION_ID, contextActive: contextAvailable(),
-        recording: !!settings?.recording, bridgeState,
-        bridgeScriptLoaded: !!bridgeLoadedAt,
-        bridgeLastAckAgeMs: bridgeAckAt ? Date.now() - bridgeAckAt : null });
+        recording: !!settings?.recording, bridgeState, bridgeStartTrigger,
+        bridgeAttemptCount, bridgeScriptLoaded: !!bridgeLoadedAt,
+        bridgeLastAckAgeMs: bridgeAckAt ? Date.now() - bridgeAckAt : null,
+        runtimeIdPresent: !!chrome?.runtime?.id, startupPhase: bootstrapState,
+        settingsLoaded: collectorsInitialized, bootstrapError, settingsSource,
+        eventMessagesSent, eventMessagesAcked, eventMessagesFailed,
+        lastEventAckAgeMs: lastEventAckAt ? Date.now() - lastEventAckAt : null,
+        documentReadyState: document.readyState });
       return;
     }
     if (message.command === 'qol-trace-status') {
@@ -3033,9 +3148,40 @@ function inspectorRedactUrlsInText(value) {
     sendResponse({ ok: false, error: 'This Inspector command is disabled or unavailable.' });
   });
 
-  chrome.runtime.sendMessage({ type: 'SCI_GET_SETTINGS' }).then(res => {
-    if (!contextAvailable()) return;
-    settings = res?.settings || { recording: true, captureDom: true, capturePerformance: true, captureErrors: true, captureQolInternals: false };
+  // Run the bridge bootstrap without waiting for settings. The message listener
+  // above is already installed, so even an immediate bridge-installed event is
+  // observable. No telemetry is saved until recording settings are initialized.
+  ensureBridgeStarted('content-startup');
+
+  // Normal recording still requires verified settings. If background message
+  // replies do not work on Orion, read the same extension storage namespace
+  // directly. An unreadable/invalid settings store never enables recording.
+  const CONTENT_DEFAULT_SETTINGS = Object.freeze({
+    recording: true, captureNetworkBodies: true, captureDom: true,
+    captureWebSocket: true, captureStorage: true, capturePerformance: true,
+    captureErrors: true, captureQolInternals: false, qolTraceLevel: 'off',
+    maxBodyChars: 200000, maxEvents: 100000
+  });
+  function verifiedSettings(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const result = { ...CONTENT_DEFAULT_SETTINGS, ...value };
+    if (typeof result.recording !== 'boolean' ||
+        typeof result.captureDom !== 'boolean' ||
+        typeof result.capturePerformance !== 'boolean' ||
+        typeof result.captureErrors !== 'boolean' ||
+        typeof result.captureQolInternals !== 'boolean') return null;
+    return result;
+  }
+  function initializeCollectors(next, source) {
+    if (extensionContextInvalidated) return false;
+    const verified = verifiedSettings(next);
+    if (!verified) return false;
+    settingsSource = source;
+    bootstrapState = 'settings-ready';
+    bootstrapError = null;
+    settings = verified;
+    if (collectorsInitialized) return true;
+    collectorsInitialized = true;
     injectBridge(); startDomObserver(); startPerformanceObservers(); installErrorCapture(); startPressureSampling();
     emit({type:'performance',subtype:'qol-trace-capture-config',enabled:qolInternalsEnabled(),traceLevel:effectiveQolTraceLevel(),qolIdentity:passiveQolIdentity()});
     if (qolInternalsEnabled()) {
@@ -3048,18 +3194,62 @@ function inspectorRedactUrlsInText(value) {
     if (isQolWorkerPage()) emit({ type: 'performance', subtype: 'worker-capture-profile', workerRole: PAGE_ROLE, domObserver: false, resourceTiming: 'aggregated-with-outliers', interaction: interactionState() });
     emit({ type: 'lifecycle', subtype: 'network-connectivity', connectivity: connectionState(), interaction: interactionState() });
     setTimeout(() => captureLightweightStateSnapshot('page-start', false, false).catch(() => {}), 1200);
+    return true;
+  }
+  async function loadVerifiedSettings() {
+    let runtimeFailure = 'settings-reply-unavailable';
+    try {
+      const response = await compatibleChromeCall(
+        callback => callback ? chrome.runtime.sendMessage({ type: 'SCI_GET_SETTINGS' }, callback) :
+          chrome.runtime.sendMessage({ type: 'SCI_GET_SETTINGS' }), 2800);
+      const candidate = response?.ok ? verifiedSettings(response.settings) : null;
+      if (candidate) return { settings: candidate, source: 'background-message' };
+    } catch (error) {
+      if (isInvalidatedContextError(error)) throw error;
+      runtimeFailure = String(error?.message || error || runtimeFailure).slice(0, 100);
+    }
+    // No global/default recording override when this API is unavailable. A
+    // successful storage response, including an empty fresh-install store,
+    // is required. The default values then match background.DEFAULT_SETTINGS.
+    try {
+      if (typeof chrome?.storage?.local?.get !== 'function') throw new Error('storage-api-unavailable');
+      const stored = await compatibleChromeCall(
+        callback => callback ? chrome.storage.local.get('sci_settings', callback) :
+          chrome.storage.local.get('sci_settings'), 2800);
+      if (!stored || typeof stored !== 'object' || Array.isArray(stored)) throw new Error('storage-reply-unavailable');
+      const candidate = verifiedSettings(stored.sci_settings || CONTENT_DEFAULT_SETTINGS);
+      if (!candidate) throw new Error('settings-invalid');
+      return { settings: candidate, source: 'direct-extension-storage' };
+    } catch (error) {
+      if (isInvalidatedContextError(error)) throw error;
+      throw new Error(`runtime:${runtimeFailure};storage:${String(error?.message || error || 'failed').slice(0, 100)}`);
+    }
+  }
+  loadVerifiedSettings().then(({ settings: next, source }) => {
+    if (!collectorsInitialized) initializeCollectors(next, source);
   }).catch(error => {
     if (isInvalidatedContextError(error) || !contextAvailable()) {
+      bootstrapState = 'context-invalidated';
       stopInvalidatedContext();
       return;
     }
-    settings = { recording: true, captureDom: true, capturePerformance: true, captureErrors: true, captureQolInternals: false };
-    injectBridge(); startDomObserver(); startPerformanceObservers(); installErrorCapture(); startPressureSampling();
+    // A later explicit storage-change event can still provide verified settings.
+    if (collectorsInitialized) return;
+    bootstrapState = 'settings-error';
+    bootstrapError = String(error?.message || error || 'settings-unavailable').slice(0, 250);
+    settingsSource = 'unavailable';
+    settings = { recording: false, captureDom: false, capturePerformance: false,
+      captureErrors: false, captureQolInternals: false };
+    installErrorCapture();
   });
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (extensionContextInvalidated) return;
     if (area !== 'local' || !changes.sci_settings) return;
+    if (!collectorsInitialized) {
+      initializeCollectors(changes.sci_settings.newValue || CONTENT_DEFAULT_SETTINGS, 'storage-change');
+      return;
+    }
     const wasQolInternals = qolInternalsEnabled();
     const previousSettings = settings || {};
     const wasRecording = previousSettings.recording !== false;
@@ -3110,7 +3300,7 @@ function inspectorRedactUrlsInText(value) {
 
   // The compatibility heartbeat detects reloads even while recording is off.
   // An old content script must not call getManifest() on an invalidated runtime;
-  // checking the runtime ID is enough here and avoids another Chrome API call.
+  // checking runtime messaging capability avoids another Chrome API call.
   // Do not stop a healthy instance that hears a notice from a stale script.
   window.addEventListener('sci:extension-context-invalidated', () => {
     if (contextAvailable()) return;
@@ -3173,8 +3363,8 @@ function inspectorRedactUrlsInText(value) {
   })();
   // Share the main collector's immutable source stamp; do not access runtime
   // manifest APIs from the Driver-support content-script probe.
-  const inspectorVersion = contentLifetime?.version || '0.1.10';
-  const inspectorBuildId = contentLifetime?.buildId || 'sci-content-0.1.10-bridge-ios-20261121-r1';
+  const inspectorVersion = contentLifetime?.version || '0.1.12';
+  const inspectorBuildId = contentLifetime?.buildId || 'sci-content-0.1.12-orion-settings-transport-20261122-r1';
 
   function stopStaleHeartbeat() {
     if (stopped) return;
@@ -3210,7 +3400,7 @@ function inspectorRedactUrlsInText(value) {
       // Version was cached once during startup. Actual message failures are
       // handled by the normal sendMessage rejection paths.
       const runtime = typeof chrome === 'undefined' ? null : chrome.runtime;
-      if (!runtime?.id) {
+      if (typeof runtime?.sendMessage !== 'function') {
         stopStaleHeartbeat();
         return false;
       }
@@ -3267,22 +3457,13 @@ function inspectorRedactUrlsInText(value) {
 
   async function readRecording() {
     if (!liveExtensionContext()) return false;
-    let next = null;
+    // The core collector owns settings validation. Read the validated state
+    // rather than issuing a second, potentially incompatible runtime request.
+    // Driver compatibility stays fail-closed until the core has initialized.
     try {
-      const response = await chrome.runtime.sendMessage({ type: 'SCI_GET_SETTINGS' });
-      if (response?.ok && response.settings) next = !!response.settings.recording;
-    } catch (error) {
-      if (/extension context invalidated|context invalidated/i.test(String(error?.message || error || ''))) stopStaleHeartbeat();
-    }
-    if (stopped) return false;
-    if (next == null) {
-      try {
-        const stored = await chrome.storage.local.get(SETTINGS_KEY);
-        next = !!stored?.[SETTINGS_KEY]?.recording;
-      } catch (_) { next = false; }
-    }
-    if (stopped) return false;
-    recording = !!next;
+      const core = contentLifetime?.currentRecording?.();
+      if (typeof core === 'boolean') recording = core;
+    } catch (_) { recording = false; }
     return recording;
   }
 
@@ -3339,7 +3520,7 @@ function inspectorRedactUrlsInText(value) {
   function emit(event) {
     if (!recording || !liveExtensionContext()) return;
     try {
-      chrome.runtime.sendMessage({
+      const returned = chrome.runtime.sendMessage({
         type: 'SCI_EVENT',
         event: {
           ...event,
@@ -3348,7 +3529,13 @@ function inspectorRedactUrlsInText(value) {
           pageUrl: location.href,
           inspectorAddon: 'driver-support-v2'
         }
-      }).catch(error => {
+      }, () => {
+        try {
+          const err = chrome.runtime?.lastError;
+          if (/extension context invalidated|context invalidated/i.test(String(err?.message || err || ''))) stopStaleHeartbeat();
+        } catch (_) {}
+      });
+      if (returned && typeof returned.then === 'function') returned.catch(error => {
         if (/extension context invalidated|context invalidated/i.test(String(error?.message || error || ''))) stopStaleHeartbeat();
       });
     } catch (error) {
@@ -3467,13 +3654,14 @@ function inspectorRedactUrlsInText(value) {
   try {
     chrome.storage.onChanged.addListener((changes, area) => {
       if (stopped || area !== 'local' || !changes?.[SETTINGS_KEY]) return;
-      recording = !!changes[SETTINGS_KEY].newValue?.recording;
+      recording = !!contentLifetime?.currentRecording?.();
       publishHeartbeat();
     });
   } catch (_) {}
 
   function tick() {
     if (!liveExtensionContext()) return;
+    try { recording = !!contentLifetime?.currentRecording?.(); } catch (_) { recording = false; }
     publishHeartbeat();
     emitStoryPressure();
   }

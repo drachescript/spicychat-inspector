@@ -1,3 +1,21 @@
+## 0.1.12
+
+- Fixed a likely Orion/iOS settings mismatch: the content script can now receive extension messages through callback-style as well as Promise-style APIs (including promise-only APIs that reject callback arguments). Empty or unavailable replies no longer masquerade as successful settings reads.
+- Added an extension-local storage fallback when runtime settings replies are unavailable. Recording remains safely paused if neither source responds with verifiable settings.
+- The existing on-demand **Check Inspector build** action can relay validated settings from the background worker when both content-side read paths are unavailable (no new permission, observer, timer loop, or implicit recording override).
+- Event delivery now handles callback-based runtime messages rather than assuming every call returns a Promise. The build diagnostic shows the settings source and acknowledged/failed event batches; a responding page bridge alone does not guarantee successful recording.
+- Reused the core collector's validated recording state for optional Test Driver heartbeat reporting, preventing its own duplicate settings request from wrongly reporting a paused recording.
+- Preserved bridge startup and existing passive collection limits; no new long-lived polling.
+
+## 0.1.11
+
+- Fixed the Orion/iOS diagnostic false ambiguity where an active Inspector content script could report `Page bridge not started` simply because page-bridge setup waited for an asynchronous settings reply. The bridge now starts independently of settings and only saves telemetry when recording is enabled.
+- Removed the overstrict `runtime.id` checks for both the content script and the optional Driver-support heartbeat; a compatible messaging API is a better startup signal on partial WebExtension implementations.
+- Added a one-shot document-ready bridge launch and a safe on-demand attempt from the existing popup build-status button if startup did not run. No polling, auto-reloads or new permissions.
+- Expanded popup diagnostics with bridge attempts, launch trigger, settings initialization status and `runtime.id` presence. Distinguishes unavailable settings, script failures and missing page-world handshakes.
+- Fail closed for recording if Inspector cannot retrieve settings; avoids treating an unsupported settings response as permission to record.
+- Kept page interception methods, bridge instrumentation, desktop behavior and privacy filters otherwise unchanged. Orion device-side verification is still required; the popup result cannot prove compatibility alone.
+
 ## 0.1.10
 
 - Added an on-demand, privacy-safe page-bridge health indicator to the existing popup build check. Distinguishes an active content script from a page bridge that actually replies, rather than treating a loaded script tag as proof of working capture.

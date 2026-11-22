@@ -81,12 +81,29 @@ $('#checkInspectorBuild')?.addEventListener('click', async () => {
     const match = liveVersion === manifestVersion;
     const bridgeState = String(info.bridgeState || 'not-reported');
     const bridgeNote = bridgeState === 'ready' ? 'Page bridge responding' :
+      bridgeState === 'waiting-document' ? 'Page bridge awaiting document; check after the page finishes loading' :
       bridgeState === 'script-loaded' || bridgeState === 'injected' ? 'Page bridge not confirmed yet; check again shortly' :
-      bridgeState === 'not-injected' ? 'Page bridge not started' :
+      bridgeState === 'not-injected' ? 'Page bridge not started (startup issue)' :
+      bridgeState === 'runtime-unavailable' ? 'Page bridge cannot start: extension runtime unavailable' :
+      bridgeState === 'no-handshake' ? 'Bridge file loaded but did not respond (possibly blocked or stale; refresh tab)' :
+      bridgeState === 'no-load-confirmation' ? 'Bridge script load not confirmed (Orion/WebKit restriction possible)' :
+      bridgeState === 'load-error' ? 'Bridge script load failed (Orion/WebKit restriction possible)' :
       `Page bridge: ${bridgeState} (recording may be incomplete)`;
+    const startInfo = info.startupPhase === 'settings-error' ?
+      ` · Settings unavailable: ${String(info.bootstrapError || 'unknown')}; recording paused` :
+      info.startupPhase === 'waiting-settings' ? ' · Settings pending' :
+      ` · Tab recording ${info.recording ? 'enabled' : 'paused'}` +
+        (info.settingsSource ? ` (settings: ${String(info.settingsSource)})` : '');
+    const deliveryInfo = Number(info.eventMessagesSent || 0) > 0 ?
+      ` · Event delivery: ${Number(info.eventMessagesAcked || 0)}/${Number(info.eventMessagesSent || 0)} acknowledged` +
+      (info.eventMessagesFailed ? `, ${Number(info.eventMessagesFailed)} failed` : '') :
+      (info.recording ? ' · No event deliveries attempted yet' : '');
+    const attemptInfo = ` · Bridge attempts ${Number(info.bridgeAttemptCount || 0)}` +
+      (info.bridgeStartTrigger ? ` (${String(info.bridgeStartTrigger)})` : '') +
+      (info.runtimeIdPresent === false ? ' · runtime.id absent' : '');
     if (result) result.textContent = `Installed v${manifestVersion} · Active tab v${liveVersion} · Build ${liveBuild}` +
       (match ? ' (version matches)' : ' (version differs — refresh this SpicyChat tab)') +
-      ` · ${bridgeNote}`;
+      ` · ${bridgeNote}${startInfo}${deliveryInfo}${attemptInfo}`;
   } catch (error) {
     if (result) result.textContent = 'No matching Inspector script in this tab. Open/refresh a SpicyChat tab, then retry. ' +
       String(error?.message || error);
