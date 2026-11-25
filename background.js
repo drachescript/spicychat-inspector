@@ -44,6 +44,7 @@ const PSID_VALUE_RE = /\b(psid)([:=])([A-Za-z0-9_-]{8,})/gi;
 const URLENC_SECRET_RE = /(^|[?&])(refresh_token|access_token|id_token|token|password|client_secret|session|jwt|api_key|apikey|frontend_sign|p?_?psid)=([^&#]*)/gi;
 let eventsSinceCleanup = 0;
 let lastCleanupAt = 0;
+let cleanupInFlight = null;
 let settingsCache = null;
 let settingsCachePromise = null;
 let dbPromise = null;
@@ -1044,13 +1045,26 @@ async function addEvents(events) {
   if (eventsSinceCleanup >= 250 || now - lastCleanupAt >= 60000) {
     eventsSinceCleanup = 0;
     lastCleanupAt = now;
-    cleanupOldEvents(settings.maxEvents).catch(() => {});
+    // Multiple active tabs can cross the cleanup threshold while an earlier
+    // cleanup is still scanning IndexedDB. Never start competing prune passes.
+    runCleanupSingleFlight(settings.maxEvents);
   }
   return safeEvents.length;
 }
 
 async function addEvent(event) {
   return addEvents([event]);
+}
+
+function runCleanupSingleFlight(maxEvents) {
+  if (cleanupInFlight) return cleanupInFlight;
+  const pending = Promise.resolve().then(() => cleanupOldEvents(maxEvents));
+  // Cleanup is best-effort and must never block event persistence. Preserve
+  // the existing failure behavior while preventing simultaneous prune cursors.
+  cleanupInFlight = pending.catch(() => {}).finally(() => {
+    cleanupInFlight = null;
+  });
+  return cleanupInFlight;
 }
 
 async function cleanupOldEvents(maxEvents) {
@@ -1606,9 +1620,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     if (message?.type === 'SCI_EVENT') {
       const event = await prepareIncomingEvent(message.event || {}, sender);
-      if (!event) { sendResponse({ ok: true, dedupedDriverMirror: true }); return; }
-      await addEvent(event);
-      sendResponse({ ok: true }); return;
+      if (!event) { sendResponse({ ok: true, stored: 0, dedupedDriverMirror: true }); return; }
+      const stored = await addEvent(event);
+      sendResponse({ ok: true, stored }); return;
     }
     if (message?.type === 'SCI_EVENT_BATCH') {
       const prepared = [];

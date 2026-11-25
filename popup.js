@@ -98,12 +98,18 @@ $('#checkInspectorBuild')?.addEventListener('click', async () => {
       ` · Event delivery: ${Number(info.eventMessagesAcked || 0)}/${Number(info.eventMessagesSent || 0)} acknowledged` +
       (info.eventMessagesFailed ? `, ${Number(info.eventMessagesFailed)} failed` : '') :
       (info.recording ? ' · No event deliveries attempted yet' : '');
+    // A valid message acknowledgement alone does not prove an event was saved.
+    // These counters cover the core content collector, not optional Driver events.
+    const storedInfo = Number(info.eventEntriesSubmitted || 0) > 0 ?
+      ` · Core events stored ${Number(info.eventEntriesStored || 0)}/${Number(info.eventEntriesSubmitted || 0)}` +
+      (info.eventEntriesNotStored ? ` (${Number(info.eventEntriesNotStored)} filtered/not stored)` : '') +
+      (info.eventEntriesUnconfirmed ? ` (${Number(info.eventEntriesUnconfirmed)} unconfirmed)` : '') : '';
     const attemptInfo = ` · Bridge attempts ${Number(info.bridgeAttemptCount || 0)}` +
       (info.bridgeStartTrigger ? ` (${String(info.bridgeStartTrigger)})` : '') +
       (info.runtimeIdPresent === false ? ' · runtime.id absent' : '');
     if (result) result.textContent = `Installed v${manifestVersion} · Active tab v${liveVersion} · Build ${liveBuild}` +
       (match ? ' (version matches)' : ' (version differs — refresh this SpicyChat tab)') +
-      ` · ${bridgeNote}${startInfo}${deliveryInfo}${attemptInfo}`;
+      ` · ${bridgeNote}${startInfo}${deliveryInfo}${storedInfo}${attemptInfo}`;
   } catch (error) {
     if (result) result.textContent = 'No matching Inspector script in this tab. Open/refresh a SpicyChat tab, then retry. ' +
       String(error?.message || error);

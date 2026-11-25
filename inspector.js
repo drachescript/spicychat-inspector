@@ -917,8 +917,11 @@ function summary(e) {
   }
   if (e.type === 'qol') {
     const details = qolTraceReasonFields(e);
-    const duration = e.subtype === 'operation-end' && Number.isFinite(e.durationMs) ? ` · ${Math.round(e.durationMs*10)/10}ms wall` : '';
-    return `${e.subtype || 'telemetry'}${e.feature ? ` · ${e.feature}` : ''}${e.operation ? ` · ${e.operation}` : ''}${e.module ? ` · ${e.module}` : ''}${duration}${details.trigger ? ` · trigger ${details.trigger}` : ''}${details.reason ? ` · reason ${details.reason}` : ''}${details.phase ? ` · phase ${details.phase}` : ''}`;
+    const settings = compactQolOptionsPayload(e);
+    const elapsed = e.durationMs ?? settings?.durationMs;
+    const duration = (e.subtype === 'operation-end' || settings) && Number.isFinite(elapsed) ? ` · ${Math.round(elapsed*10)/10}ms wall` : '';
+    const settingsLabel = settings ? ` · ${settings.manager || settings.key || settings.keys?.join(', ') || 'Settings'}${settings.otherKeyCount ? ` +${settings.otherKeyCount} other key(s)` : ''}` : '';
+    return `${e.subtype || 'telemetry'}${e.feature ? ` · ${e.feature}` : ''}${e.operation ? ` · ${e.operation}` : ''}${e.module ? ` · ${e.module}` : ''}${duration}${settingsLabel}${details.trigger ? ` · trigger ${details.trigger}` : ''}${details.reason ? ` · reason ${details.reason}` : ''}${details.phase ? ` · phase ${details.phase}` : ''}`;
   }
   if (e.type === 'state') return e.subtype || 'state snapshot';
   if (e.type === 'storage') {
@@ -945,6 +948,9 @@ function isInteresting(e) {
 }
 function classFor(e) { if (e.type === 'marker' || e.type === 'marker-context') return 'marker'; if (e.type === 'error' && e.likelyNonCriticalTracker) return 'interesting'; if (e.type === 'error' || (e.type === 'network' && e.status >= 400)) return 'error'; if (e.type === 'performance' && (e.durationMs || 0) >= 1000) return 'slow'; if (isInteresting(e)) return 'interesting'; return ''; }
 
+function hasCaptureTimeQolOverlap(task) {
+  return task.qolOperationOverlapAtCapture === true || !!task.attribution?.qol?.overlappingOperations?.length;
+}
 function buildLongTaskAttributionDiagnostics(events) {
   const tasks=events.filter(e=>e.type==='performance' && e.subtype==='long-task');
   const framesByPage=new Map();
@@ -974,10 +980,10 @@ function buildLongTaskAttributionDiagnostics(events) {
     const label=kinds.length===0?'unattributed':(kinds.length===1?kinds[0]:'multiple-script-sources');
     const group=sources.get(label)||{source:label,count:0,longTaskMs:0};
     group.count++;group.longTaskMs+=Number(task.durationMs)||0;sources.set(label,group);
-    if(task.attribution?.qol?.overlappingOperations?.length)explicitQolOverlap++;
-    if(Number(task.durationMs||0)>=500) worst.push({ts:task.ts,pageId:task.pageId,route:routeLabel(task.pageUrl||task.url),durationMs:task.durationMs,scriptCandidates:kinds.slice(0,5),inputKind:task.inputCorrelation?.inputKind||null,scrollOverlap:task.inputCorrelation?.scrollTemporalOverlap===true,qolOperationOverlap:!!task.attribution?.qol?.overlappingOperations?.length});
+    if(hasCaptureTimeQolOverlap(task))explicitQolOverlap++;
+    if(Number(task.durationMs||0)>=500) worst.push({ts:task.ts,pageId:task.pageId,route:routeLabel(task.pageUrl||task.url),durationMs:task.durationMs,scriptCandidates:kinds.slice(0,5),inputKind:task.inputCorrelation?.inputKind||null,scrollOverlap:task.inputCorrelation?.scrollTemporalOverlap===true,qolOperationOverlap:hasCaptureTimeQolOverlap(task)});
   }
-  return {longTasks:tasks.length,loafFrameOverlap:withFrames,loafScriptCandidates:withScriptDetail,explicitQolOperationOverlap:explicitQolOverlap,unattributedTasks:tasks.length-withScriptDetail,sourceCandidates:[...sources.values()].sort((a,b)=>b.longTaskMs-a.longTaskMs).map(x=>({...x,longTaskMs:Math.round(x.longTaskMs*10)/10})),worstCorrelations:worst.sort((a,b)=>b.durationMs-a.durationMs).slice(0,15),note:'LoAF script sources, nearby input and QoL operation overlap are evidence of temporal proximity, never proof of who caused a Long Task.'};
+  return {longTasks:tasks.length,loafFrameOverlap:withFrames,loafScriptCandidates:withScriptDetail,explicitQolOperationOverlap:explicitQolOverlap,captureTimeQolOperationOverlap:explicitQolOverlap,unattributedTasks:tasks.length-withScriptDetail,sourceCandidates:[...sources.values()].sort((a,b)=>b.longTaskMs-a.longTaskMs).map(x=>({...x,longTaskMs:Math.round(x.longTaskMs*10)/10})),worstCorrelations:worst.sort((a,b)=>b.durationMs-a.durationMs).slice(0,15),note:'Capture-time overlaps use only explicit overlap markers on the Long Task event. Export-time reconstructed spans may identify additional overlaps. Neither measure proves causation.'};
 }
 function buildScrollAndInputDiagnostics(events) {
   const scroll=events.filter(e=>e.type==='performance'&&e.subtype==='scroll-performance-window');
@@ -1046,7 +1052,9 @@ function buildCaptureHealthDiagnostics(events) {
     pressureSnapshots: pressure.length,
     generationCachedPressureSnapshots: pressure.filter(e=>e.pressureSampleMode==='generation-recent-cache').length,
     generationPressureSamples: pressure.filter(e=>/^generation-/.test(e.reason||'')).length,
-    pressureSamplerVersionObserved: Math.max(0,...pressure.map(e=>Number(e.pressureSamplerVersion)||0)),
+    pressureSamplerVersionObserved: pressure.reduce((m,e)=>Math.max(m,Number(e.pressureSamplerVersion)||0),0),
+    pressureSampleModes: pressure.reduce((counts,e)=>{ const mode=e.pressureSampleMode||'unreported'; counts[mode]=(counts[mode]||0)+1; return counts; },Object.create(null)),
+    legacyPressureResponseWithFollowupMetadata: pressure.filter(e=>e.reason==='generation-response' && Number(e.pressureSamplerVersion||0)<3 && (e.actualDelayMs!=null || e.coalescedGenerations!=null)).length,
     generationPressureDecisions: Object.entries(pressure.filter(e=>/^generation-/.test(e.reason||''))
       .reduce((counts,e)=>(counts[e.pressureCacheDecision || 'unreported']=(counts[e.pressureCacheDecision || 'unreported']||0)+1,counts),{}))
       .map(([decision,count])=>({decision,count})).sort((a,b)=>b.count-a.count),
@@ -1251,17 +1259,76 @@ function compactQolAggregatePayload(payload) {
   return result;
 }
 
+// Settings events are forwarded by QoL, not measured inside the Options page.
+// Keep only bounded structural fields in the full-history projection.
+const QOL_OPTIONS_STORAGE_KEYS = new Set([
+  'settings','blockedBots','notInterestedBots','favoriteBots','laterBots','openedChats','openedChatMeta',
+  'favoriteCreators','followedCreators','creatorBotWatchV1','recentlySeenBots','botOrganization',
+  'botAvailability','botArchive','botUnavailableRecoveryV1','botStatusIgnoredIdsV1',
+  'botStatusPausedQueueV1','botStatusPausedStaleQueueV1','botStatusLastRunFeedbackV1','botStatusLastRateV1',
+  'dsPerformanceBaselineV1','dsBotStatusArchiveUploadStateV1','dsBotStatusArchiveSubmissionStateV1',
+  'dsArchivePublicContributionEnabledV1','dsFirstRunSetupPendingV1','dsFirstRunSetupCompletedV1',
+  'dsFirstRunOptInDefaultsAppliedV1','quickDislikeHistoryV1','quickDislikeBulkStateV1',
+  'quickLessLikeHistoryV1','quickLessLikeBulkStateV1','personas','savedPersonas','oocTemplates','generationProfiles'
+]);
+function compactQolOptionsPayload(e) {
+  if (e?.type !== 'qol' || !/^options-[a-z0-9-]{1,64}$/.test(e.feature || '') || e.subtype === 'trace-aggregate') return undefined;
+  const p = e.payload && typeof e.payload === 'object' ? e.payload : {};
+  const out = {};
+  const number = (key, max = 864000000) => {
+    const v = p[key];
+    if (typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= max) out[key] = v;
+  };
+  for (const key of ['durationMs','largeStoreWallMs','chromeCallbackWallMs','activeMs','synchronousCallMs','queueDelayMs','yieldMs','indexMs','renderMs','commitMs','timeToInteractiveMs']) number(key);
+  for (const key of ['keyCount','largeKeyCount','pages','records','total','shown','matching','archiveRecords','availabilityRecords','otherKeyCount']) number(key, 100000000);
+  if (typeof p.manager === 'string' && /^(?:deleted-recovery|saved-copies|bot-availability|bot-status|saved-bots-hub|favorite|later|opened|blocked|not-interested|saved:\d{1,3})$/.test(p.manager)) out.manager = p.manager;
+  const key = p.key || e.storageKey || p.storageKey;
+  if (QOL_OPTIONS_STORAGE_KEYS.has(key)) out.key = key;
+  if (Array.isArray(p.keys)) {
+    const keys = p.keys.slice(0,64);
+    out.keys = [...new Set(keys.filter(k => QOL_OPTIONS_STORAGE_KEYS.has(k)))];
+    out.otherKeyCount = Math.max(out.otherKeyCount || 0, (out.keyCount ?? p.keys.length) - out.keys.length);
+  }
+  return out;
+}
+function buildQolOptionsDiagnostics(events) {
+  const groups = new Map(), examples = {storage:[], paging:[], render:[], other:[]};
+  let observed = 0, timed = 0;
+  for (const e of events) {
+    const p = compactQolOptionsPayload(e);
+    if (!p) continue;
+    observed++;
+    const durationMs = e.durationMs ?? p.durationMs;
+    if (typeof durationMs !== 'number' || !Number.isFinite(durationMs) || durationMs < 0 || durationMs > 864000000) continue;
+    timed++;
+    const subtype = safeQolAttributionLabel(e.subtype) || 'other';
+    const kind = e.feature === 'options-storage' ? (subtype === 'read-large-paged' ? 'paging' : 'storage') : /render/.test(subtype) ? 'render' : 'other';
+    const reportedVersion = normalizedQolIdentity(e).version;
+    const version = /^\d{1,4}\.\d{1,4}\.\d{1,4}(?:[-+][a-z0-9.-]{1,24})?$/i.test(reportedVersion || '') ? reportedVersion : 'not reported';
+    const row = {ts:eventTs(e),kind,feature:safeQolAttributionLabel(e.feature) || 'options',subtype,version,...p,durationMs};
+    const label = p.manager || p.key || (p.keys?.length ? p.keys.join(', ') : null) || subtype;
+    const key = JSON.stringify([version,kind,row.feature,subtype,label,p.otherKeyCount || 0]);
+    let g = groups.get(key);
+    if (!g) { g = {version,kind,feature:row.feature,subtype,label,otherKeyCount:p.otherKeyCount || 0,count:0,maxMs:0,slow200:0,slow1000:0}; groups.set(key,g); }
+    g.count++; g.maxMs=Math.max(g.maxMs,durationMs); if(durationMs>=200)g.slow200++; if(durationMs>=1000)g.slow1000++;
+    if(durationMs>=50) {
+      const list=examples[kind]; list.push(row); list.sort((a,b)=>b.durationMs-a.durationMs); if(list.length>12)list.pop();
+    }
+  }
+  return {observed,timed,groups:[...groups.values()].sort((a,b)=>b.maxMs-a.maxMs).slice(0,30),slowExamples:examples,
+    interpretation:'Forwarded QoL Settings telemetry only. Versions are reported per event or left unknown; relay tab identity is not a Settings startup measurement. Storage callback wait, paged reads and render wall times are separate observations; overlapping parent reads and child paging must not be added. Missing timings are not zero, and elapsed time is not CPU time.'};
+}
 function compactVersionProjection(e) {
   if (e.type === 'qol') return decorateCompactProjection(e, {
     type:e.type, subtype:e.subtype, ts:e.ts, sourceTs:e.sourceTs, receivedAt:e.receivedAt, pageId:e.pageId, tabId:e.tabId, pageUrl:e.pageUrl||e.url,
     qolVersion:e.qolVersion, qolBuild:e.qolBuild, qolSessionId:e.qolSessionId, traceSessionId:e.traceSessionId, traceProtocol:e.traceProtocol,
-    traceSeq:e.traceSeq, traceSequenceGapBefore:e.traceSequenceGapBefore, traceBatchIndex:e.traceBatchIndex, traceBatchSize:e.traceBatchSize,
+    traceSeq:e.traceSeq, traceSequenceGapBefore:e.traceSequenceGapBefore, traceBatchIndex:e.traceBatchIndex, traceBatchSize:e.traceBatchSize, transport:e.transport,
     feature:e.feature, module:e.module, category:e.category, operation:e.operation, operationId:e.operationId, parentOperationId:e.parentOperationId,
     workerSessionId:e.workerSessionId, requestId:e.requestId, requestFingerprint:e.requestFingerprint, requestedUrl:e.requestedUrl,
     monoMs:e.monoMs, durationMs:e.durationMs, queueDelayMs:e.queueDelayMs, lane:e.lane, priority:e.priority, outcome:e.outcome, status:e.status,
     storageKey:e.storageKey, storageBackend:e.storageBackend, approxBytes:e.approxBytes, records:e.records, settingName:e.settingName,
     counts:e.counts, meta:e.meta,
-    payload:e.subtype === 'trace-aggregate' ? compactQolAggregatePayload(e.payload) : e.payload && typeof e.payload==='object' ? {
+    payload:e.subtype === 'trace-aggregate' ? compactQolAggregatePayload(e.payload) : compactQolOptionsPayload(e) ?? (e.payload && typeof e.payload==='object' ? {
       qolVersion:e.payload.qolVersion, protocolVersion:e.payload.protocolVersion, reason:e.payload.reason, traceLevel:e.payload.traceLevel,
       endpoint:e.payload.endpoint, requestedUrl:e.payload.requestedUrl, durationMs:e.payload.durationMs, status:e.payload.status, ok:e.payload.ok,
       outcome:e.payload.outcome, counts:e.payload.counts, probeStatus:e.payload.probeStatus, count:e.payload.count, added:e.payload.added, removed:e.payload.removed, updated:e.payload.updated, changed:e.payload.changed, baseline:e.payload.baseline, httpStatus:e.payload.httpStatus, key:e.payload.key, storageKey:e.payload.storageKey, backend:e.payload.backend,
@@ -1269,15 +1336,15 @@ function compactVersionProjection(e) {
       // QoL v0.2.62 reports bookmark-star lifecycle counts without message text or IDs.
       created:e.payload.created, repaired:e.payload.repaired, reused:e.payload.reused,
       waiting:e.payload.waiting, examined:e.payload.examined
-    } : undefined
+    } : undefined)
   });
   if (e.type === 'lifecycle' && e.subtype === 'page-start') return { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, inspectorVersion:e.inspectorVersion, wasDiscarded:e.wasDiscarded===true, href:e.href, pageUrl:e.pageUrl || e.url };
   if (e.type === 'lifecycle' && e.subtype === 'route-change') return { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, pageUrl:e.pageUrl || e.to || e.url, from:e.from, to:e.to };
   if (e.type === 'lifecycle' && /^(page-show|page-hide|page-freeze|page-resume)$/.test(e.subtype || '')) return { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, persisted:e.persisted===true };
-  if (e.type === 'performance' && e.subtype === 'page-pressure') return decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, pageUrl:e.pageUrl || e.url, reason:e.reason, pressureSampleMode:e.pressureSampleMode, pressureSamplerVersion:e.pressureSamplerVersion, pressureCacheDecision:e.pressureCacheDecision, cachedMeasurementAgeMs:e.cachedMeasurementAgeMs, relatedRequestId:e.relatedRequestId, generationResponseTs:e.generationResponseTs, backendDurationMs:e.backendDurationMs, spikeId:e.spikeId, domElements:e.domElements, mountedMessages:e.mountedMessages, mountedMessageKind:e.mountedMessageKind, jsHeapUsedBytes:e.jsHeapUsedBytes, jsHeapTotalBytes:e.jsHeapTotalBytes, resourceEntries:e.resourceEntries, resourceTimingCapacityHint:e.resourceTimingCapacityHint });
+  if (e.type === 'performance' && e.subtype === 'page-pressure') return decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, pageUrl:e.pageUrl || e.url, reason:e.reason, pressureSampleMode:e.pressureSampleMode, pressureSamplerVersion:e.pressureSamplerVersion, pressureCacheDecision:e.pressureCacheDecision, cachedMeasurementAgeMs:e.cachedMeasurementAgeMs, relatedRequestId:e.relatedRequestId, generationResponseTs:e.generationResponseTs, backendDurationMs:e.backendDurationMs, actualDelayMs:e.actualDelayMs, coalescedGenerations:e.coalescedGenerations, spikeId:e.spikeId, domElements:e.domElements, mountedMessages:e.mountedMessages, mountedMessageKind:e.mountedMessageKind, jsHeapUsedBytes:e.jsHeapUsedBytes, jsHeapTotalBytes:e.jsHeapTotalBytes, resourceEntries:e.resourceEntries, resourceTimingCapacityHint:e.resourceTimingCapacityHint });
   if (e.type === 'performance' && e.subtype === 'resource-timing-buffer-full') return { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, pageUrl:e.pageUrl || e.url, configuredSize:e.configuredSize, resourceEntries:e.resourceEntries, clearAttempted:e.clearAttempted, cleared:e.cleared, clearError:e.clearError, occurrence:e.occurrence, suppressedSinceLast:e.suppressedSinceLast };
   if (e.type === 'dom' && e.subtype === 'mutation-batch') return decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, pageUrl:e.pageUrl || e.url, stats:{ totalMutations:e.stats?.totalMutations||0, qolRelated:e.stats?.qolRelated||0, qolOwned:e.stats?.qolOwned||0, noOp:e.stats?.noOp||0, researchStatusMutations:e.stats?.researchStatusMutations||0, messageNodesAdded:e.stats?.messageNodesAdded||0, messageNodesRemoved:e.stats?.messageNodesRemoved||0, mountedMessages:e.stats?.mountedMessages, observerCallbacks:e.stats?.observerCallbacks||0, inspectorObserverMs:e.stats?.inspectorObserverMs||0, inspectorObserverWallMs:e.stats?.inspectorObserverWallMs, observerTimingContaminatedCallbacks:e.stats?.observerTimingContaminatedCallbacks||0, observerTimingContaminatedWallMs:e.stats?.observerTimingContaminatedWallMs||0, inspectorFlushMs:e.stats?.inspectorFlushMs||0, largeDomMode:e.stats?.largeDomMode===true, fastModeUsed:e.stats?.fastModeUsed===true, fastModeCallbacks:e.stats?.fastModeCallbacks||0, fastModeMutations:e.stats?.fastModeMutations||0, budgetSkippedMutationRecords:e.stats?.budgetSkippedMutationRecords||0, budgetExceededCallbacks:e.stats?.budgetExceededCallbacks||0, recordLimitCallbacks:e.stats?.recordLimitCallbacks||0, fastModeReasons:(e.stats?.fastModeReasons||[]).slice(0,6), maxObserverCallbackMs:e.stats?.maxObserverCallbackMs||0, observerCallbacksOver16ms:e.stats?.observerCallbacksOver16ms||0, observerCallbacksOver50ms:e.stats?.observerCallbacksOver50ms||0, topPatterns:(e.stats?.topPatterns||[]).slice(0,8) } });
-  if (e.type === 'performance' && (e.subtype === 'long-task' || e.subtype === 'long-animation-frame')) return decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, entryStartTs:e.entryStartTs, entryEndTs:e.entryEndTs, startTimeMs:e.startTimeMs, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, durationMs:e.durationMs||0, blockingDurationMs:e.blockingDurationMs||0, researchExport:e.researchExport||null, scripts:e.subtype==='long-animation-frame'?(e.scripts||[]).slice(0,3):undefined, inputCorrelation:e.inputCorrelation||null, attribution:e.attribution||null, pageUrl:e.pageUrl || e.url, url:e.url || e.pageUrl });
+  if (e.type === 'performance' && (e.subtype === 'long-task' || e.subtype === 'long-animation-frame')) return decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, entryStartTs:e.entryStartTs, entryEndTs:e.entryEndTs, startTimeMs:e.startTimeMs, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, durationMs:e.durationMs||0, blockingDurationMs:e.blockingDurationMs||0, researchExport:e.researchExport||null, scripts:e.subtype==='long-animation-frame'?(e.scripts||[]).slice(0,3):undefined, inputCorrelation:e.inputCorrelation||null, qolOperationOverlapAtCapture:e.subtype==='long-task'?hasCaptureTimeQolOverlap(e):undefined, attribution:e.attribution||null, pageUrl:e.pageUrl || e.url, url:e.url || e.pageUrl });
   if (e.type === 'performance' && (e.subtype === 'generation-response-dom-signal' || e.subtype === 'generation-reply-text-observed' || e.subtype === 'generation-first-message-dom' || e.subtype === 'auto-lag-spike' || e.subtype === 'generation-followup-skipped-late')) return decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, pageId:e.pageId, pageUrl:e.pageUrl || e.url, relatedRequestId:e.relatedRequestId, generationResponseTs:e.generationResponseTs, latencyMs:e.latencyMs, signalKind:e.signalKind, signalConfidence:e.signalConfidence, renderSignalVersion:e.renderSignalVersion,
     phase:e.phase, textChars:e.textChars, hasLayoutBox:e.hasLayoutBox, exactReplyIdMatched:e.exactReplyIdMatched, observation:e.observation, paintConfirmed:e.paintConfirmed, mountedMessagesAtResponse:e.mountedMessagesAtResponse, mountedMessages:e.mountedMessages, mountedDelta:e.mountedDelta, mountedMessageKind:e.mountedMessageKind, generationContentAdded:e.generationContentAdded===true, matchedReplyId:e.matchedReplyId===true, priorMessageReinserted:e.priorMessageReinserted===true, spikeId:e.spikeId, rollingWindowMs:e.rollingWindowMs, rollingLongTaskMs:e.rollingLongTaskMs, longTaskCount:e.longTaskCount, worstLongTaskMs:e.worstLongTaskMs, reason:e.reason, intendedDelayMs:e.intendedDelayMs, actualDelayMs:e.actualDelayMs, latenessMs:e.latenessMs, coalescedCount:e.coalescedCount });
   if (e.type === 'performance' && e.subtype === 'research-export-phase') return {type:e.type,subtype:e.subtype,ts:e.ts,pageId:e.pageId,pageRole:e.pageRole||null,pageUrl:e.pageUrl||e.url,phase:e.phase,previousPhase:e.previousPhase,observation:e.observation};
@@ -1813,9 +1880,10 @@ function normalizedQolOutcome(value) {
   }
   return null;
 }
+function hasQolTraceSeq(e) { return Number.isSafeInteger(e?.traceSeq) && e.traceSeq >= 0; }
 function qolEventRichness(e) {
   let score=0;
-  if (Number.isFinite(Number(e.traceSeq))) score+=20;
+  if (hasQolTraceSeq(e)) score+=20;
   if (String(e.transport||'').includes(':batch')) score+=8;
   if (e.traceProtocol) score+=6;
   if (e.category) score+=4;
@@ -1833,7 +1901,7 @@ function qolDedupeIdentity(e) {
   const subtype=String(e.subtype||'telemetry');
   const strong=[];
   const boundaryLike=/(?:^|[-_:])(?:operation-?|op-?)?(?:start|begin|started|enter|end|finish|finished|complete|completed|stop|stopped|exit)(?:$|[-_:])/.test(`-${subtype}-`);
-  const hasSeq=Number.isFinite(Number(e.traceSeq));
+  const hasSeq=hasQolTraceSeq(e);
   if (!hasSeq && e.operationId && boundaryLike) strong.push(`op|${page}|${session}|${e.operationId}|${subtype}`);
   if (!hasSeq && e.requestId && /network|request|response/.test(subtype)) strong.push(`req|${page}|${session}|${e.requestId}|${subtype}`);
   if (hasSeq) strong.push(`seq|${page}|${session}|${Number(e.traceSeq)}`);
@@ -1855,7 +1923,7 @@ function dedupeQolDiagnosticEvents(events) {
     if (existingIndex == null && fallbackToIndex.has(identity.fallback)) {
       const candidateIndex=fallbackToIndex.get(identity.fallback);
       const candidate=chosen[candidateIndex];
-      const candidateHasSeq=Number.isFinite(Number(candidate?.traceSeq));
+      const candidateHasSeq=hasQolTraceSeq(candidate);
       // Same timestamp/shape can represent several distinct v2 events. Only use
       // the fallback to join a no-seq compatibility copy to a seq-bearing event,
       // or to collapse two no-seq legacy copies.
@@ -1872,7 +1940,7 @@ function dedupeQolDiagnosticEvents(events) {
     if (qolEventRichness(e)>qolEventRichness(existing)) chosen[existingIndex]=e;
     for (const key of identity.strong) strongToIndex.set(key,existingIndex);
     const owner=fallbackToIndex.has(identity.fallback) ? chosen[fallbackToIndex.get(identity.fallback)] : null;
-    const ownerHasSeq=Number.isFinite(Number(owner?.traceSeq));
+    const ownerHasSeq=hasQolTraceSeq(owner);
     if (!fallbackToIndex.has(identity.fallback) || !ownerHasSeq || !identity.hasSeq) fallbackToIndex.set(identity.fallback,existingIndex);
   }
   return chosen;
@@ -1880,8 +1948,8 @@ function dedupeQolDiagnosticEvents(events) {
 function computeFinalQolSequenceGaps(events) {
   const streams=new Map();
   for (const e of events) {
-    const seq=Number(e.traceSeq);
-    if (!Number.isInteger(seq) || seq < 0) continue;
+    if (!hasQolTraceSeq(e)) continue;
+    const seq=e.traceSeq;
     const key=`${e.pageId||''}|${e.traceSessionId||e.qolSessionId||'session'}`;
     let set=streams.get(key);
     if (!set) { set=new Set(); streams.set(key,set); }
@@ -2240,8 +2308,8 @@ function buildQolTraceDiagnostics(events) {
   }
   workers.top=[...workerGroups.values()].sort((a,b)=>b.events-a.events).slice(0,10);
 
-  const longTasks=events.filter(e=>e.type==='performance'&&e.subtype==='long-task'&&Number.isFinite(Number(e.entryStartTs))&&Number.isFinite(Number(e.entryEndTs)));
-  const byPage=new Map();for(const op of spans){if(!op.pageId||!Number.isFinite(op.startTs)||!Number.isFinite(op.endTs))continue;const a=byPage.get(op.pageId)||[];a.push(op);byPage.set(op.pageId,a);}for(const a of byPage.values())a.sort((x,y)=>x.startTs-y.startTs);
+  const longTasks=events.filter(e=>e.type==='performance'&&e.subtype==='long-task'&&Number.isFinite(e.entryStartTs)&&Number.isFinite(e.entryEndTs)&&e.entryStartTs>0&&e.entryEndTs>e.entryStartTs&&!!e.pageId);
+  const byPage=new Map();for(const op of spans){if(!op.pageId||!Number.isFinite(op.startTs)||!Number.isFinite(op.endTs)||op.endTs<=op.startTs)continue;const a=byPage.get(op.pageId)||[];a.push(op);byPage.set(op.pageId,a);}for(const a of byPage.values())a.sort((x,y)=>x.startTs-y.startTs);
   let ltOverlapCount=0,totalOverlapMs=0;const overlapFeatures=new Map();
   const overlapContext=new Map();
   const stallExamples=[];
@@ -2293,6 +2361,7 @@ function buildQolTraceDiagnostics(events) {
     traceBatches:{events:traceBatchEvents,maxBatchSize},
     operations:{count:spans.length,totalMs:Math.round(operationTotalMs*10)/10,timingSummary,slow50:spans.filter(x=>(x.durationMs||0)>=50).length,slow200:spans.filter(x=>(x.durationMs||0)>=200).length,slow1000:spans.filter(x=>(x.durationMs||0)>=1000).length,top:topOps,attribution},
     scheduler,
+    optionsDiagnostics:buildQolOptionsDiagnostics(q),
     storage:{events:storageEvents.length,reads:storageReads,writes:storageWrites,totalMs:Math.round(storageTotalMs*10)/10,top:storageTop},
     network:{events:networkEvents.length,completed:networkEnds.length,errors:networkErrors,totalMs:Math.round(networkTotalMs*10)/10,top:networkTop},
     workers,
@@ -2301,7 +2370,7 @@ function buildQolTraceDiagnostics(events) {
     performanceActions:q.filter(e=>e.category==='performance'||/performance-mode|quiet-(?:start|end)|pressure|startup-quiet|reply-quiet/i.test(e.subtype||'')).length,
     errorEvents:q.filter(e=>e.category==='error'||/error|failed|failure|exception/i.test(e.subtype||'')||e.outcome==='failed').length,
     backgroundEvents:q.filter(e=>e.category==='background'||e.module==='background'||e.payload?.origin==='background'||e.meta?.origin==='background').length,
-    longTaskCorrelation:{supported:longTasks.length>0,longTasksChecked:longTasks.length,longTasksOverlappingQol:ltOverlapCount,totalOverlapMs:Math.round(totalOverlapMs*10)/10,topFeatures:overlapTop,topTriggerOverlaps,stallExamples:stallExamples.slice(0,8)}
+    longTaskCorrelation:{supported:longTasks.length>0,longTasksChecked:longTasks.length,operationSpansAvailable:[...byPage.values()].reduce((n,a)=>n+a.length,0),longTasksOverlappingQol:ltOverlapCount,totalOverlapMs:Math.round(totalOverlapMs*10)/10,topFeatures:overlapTop,topTriggerOverlaps,stallExamples:stallExamples.slice(0,8)}
   };
 }
 
@@ -3451,6 +3520,10 @@ function buildSummary(events) {
   // Final export-time interval reconstruction is more reliable than provisional
   // capture-time attribution, especially when v1/v2 telemetry arrives out of order.
   qolOverlappedLongTasks = Number(qolTrace?.longTaskCorrelation?.longTasksOverlappingQol || 0);
+  const reconstructed = qolTrace?.longTaskCorrelation;
+  longTaskAttribution.reconstructedQolOperationOverlap = reconstructed?.supported && reconstructed.operationSpansAvailable > 0 ? reconstructed.longTasksOverlappingQol : null;
+  longTaskAttribution.reconstructedQolTasksChecked = reconstructed?.longTasksChecked || 0;
+  longTaskAttribution.reconstructedQolSpansAvailable = reconstructed?.operationSpansAvailable || 0;
   const canonicalLongTaskTotalMs = Math.round(longTasks.reduce((n,e)=>n+(e.durationMs||0),0)*10)/10;
   const diagnosticConsistencyWarnings = buildDiagnosticConsistencyWarnings(events, {
     longTasks: longTasks.length,
@@ -3646,6 +3719,7 @@ function renderOverview() {
     const h=s.captureHealth, decisions=(h.generationPressureDecisions||[]).slice(0,3).map(x=>`${esc(x.decision)} ${x.count}`).join(' · ');
     extra.push(`<div><strong>Generation pressure sampling:</strong> ${h.generationCachedPressureSnapshots||0}/${h.generationPressureSamples} snapshots reused cached DOM/resource counts · sampler ${h.pressureSamplerVersionObserved ? `v${h.pressureSamplerVersionObserved}` : 'unverified/older runtime'}${decisions ? ` · ${decisions}` : ''}. <em>Cached counts are not fresh DOM measurements. If the sampler is unverified, reload tabs after the extension update before comparing performance.</em></div>`);
   }
+  if(s.captureHealth?.legacyPressureResponseWithFollowupMetadata) extra.push(`<div><strong>Legacy pressure metadata:</strong> ${s.captureHealth.legacyPressureResponseWithFollowupMetadata.toLocaleString()} generation-response snapshot(s) carry follow-up fields from a pre-v3 pressure sampler. Ignore those follow-up fields on response snapshots; request-linked samples remain preserved.</div>`);
   if(s.generationRender?.generationsWithDomSamplingGaps) extra.push(`<div><strong>Generation DOM coverage:</strong> ${s.generationRender.generationsWithDomSamplingGaps} response window(s) overlapped Inspector DOM sampling gaps; ${s.generationRender.domMatchNotRecorded} lacked a finalized DOM match event. Missing signals are not automatically rendering failures.</div>`);
   if (s.messageRemountPressure?.batches) {
     const m=s.messageRemountPressure;
@@ -3688,9 +3762,18 @@ function renderOverview() {
     }
     if (t.scheduler?.events) extra.push(`<div><strong>QoL scheduler:</strong> ${t.scheduler.events} event(s) · deferred ${t.scheduler.deferred} · coalesced ${t.scheduler.coalesced} · skipped ${t.scheduler.skipped}${t.scheduler.queueDelaySamples?` · queue delay avg ${t.scheduler.avgQueueDelayMs.toFixed(1)}ms / p95 ${t.scheduler.p95QueueDelayMs.toFixed(1)}ms`:''}.</div>`);
     if (t.storage?.events) extra.push(`<div><strong>QoL storage trace:</strong> ${t.storage.events} event(s) · reads ${t.storage.reads} / writes ${t.storage.writes} · ${(t.storage.totalMs/1000).toFixed(2)}s measured${t.storage.top?.[0]?` · top ${esc(t.storage.top[0].backend)}:${esc(t.storage.top[0].key)} ${(t.storage.top[0].totalMs/1000).toFixed(2)}s`:''}.</div>`);
+    if (t.optionsDiagnostics?.observed) {
+      const d=t.optionsDiagnostics;
+      const fmt = row => `${esc(row.manager || row.key || row.keys?.join(', ') || row.subtype)}${row.otherKeyCount ? ` +${row.otherKeyCount} other key(s)` : ''} · ${row.durationMs.toFixed(1)}ms wall${Number.isFinite(row.chromeCallbackWallMs)?` · callback ${row.chromeCallbackWallMs.toFixed(1)}ms`:''}${Number.isFinite(row.largeStoreWallMs)?` · paging wait ${row.largeStoreWallMs.toFixed(1)}ms`:''}${Number.isFinite(row.pages)?` · ${row.pages} pages`:''}${Number.isFinite(row.records)?` · ${row.records.toLocaleString()} records`:''}${Number.isFinite(row.shown)?` · ${row.shown} shown / ${row.total ?? '?'} total`:''} · QoL ${esc(row.version)} · ${new Date(row.ts).toISOString()}`;
+      extra.push(`<div><strong>QoL Settings diagnostics:</strong> ${d.observed} forwarded event(s), ${d.timed} with measured duration. <em>${esc(d.interpretation)}</em></div>`);
+      for(const [kind,label] of [['storage','Settings storage calls'],['paging','Settings paged reads'],['render','Settings manager renders'],['other','Other Settings work']]) {
+        const rows=d.slowExamples[kind]||[];
+        if(rows.length)extra.push(`<div><strong>${label} (slowest):</strong> ${rows.slice(0,3).map(fmt).join(' | ')}.</div>`);
+      }
+    }
     if (t.network?.events) extra.push(`<div><strong>QoL network trace:</strong> ${t.network.completed} completed request(s) · ${t.network.errors} error(s) · ${(t.network.totalMs/1000).toFixed(2)}s measured request time${t.network.top?.[0]?` · top ${esc(t.network.top[0].feature)} ${esc(t.network.top[0].endpoint)}`:''}.</div>`);
     if (t.workers?.events) extra.push(`<div><strong>QoL workers:</strong> ${t.workers.events} trace event(s) · starts ${t.workers.starts} · ready ${t.workers.ready} · jobs ${t.workers.jobs} · throttled ${t.workers.throttled} · restarts ${t.workers.restarts} · closed ${t.workers.closed}.</div>`);
-    if (lc.supported) extra.push(`<div><strong>Long Task ↔ explicit QoL span correlation:</strong> ${lc.longTasksOverlappingQol}/${lc.longTasksChecked} timestamped Long Task(s) overlapped QoL operation span(s), with ${(lc.totalOverlapMs/1000).toFixed(2)}s aggregate interval overlap${lc.topFeatures?.[0]?` · most overlap ${esc(lc.topFeatures[0].feature)} ${(lc.topFeatures[0].overlapMs/1000).toFixed(2)}s`:''}. <em>Overlap is correlation, not automatic proof of causation.</em></div>`);
+    if (lc.supported && lc.operationSpansAvailable > 0) extra.push(`<div><strong>Long Task ↔ explicit QoL span correlation:</strong> ${lc.longTasksOverlappingQol}/${lc.longTasksChecked} timestamped Long Task(s) overlapped QoL operation span(s), with ${(lc.totalOverlapMs/1000).toFixed(2)}s aggregate interval overlap${lc.topFeatures?.[0]?` · most overlap ${esc(lc.topFeatures[0].feature)} ${(lc.topFeatures[0].overlapMs/1000).toFixed(2)}s`:''}. <em>Overlap is correlation, not automatic proof of causation.</em></div>`);
     if (lc.topTriggerOverlaps?.length) extra.push(`<div><strong>Long Task overlap by QoL trigger/reason:</strong> ${lc.topTriggerOverlaps.slice(0,5).map(row=>`${esc(row.feature)} / ${esc(row.operation)} ← ${esc(row.trigger)}${row.triggerSource==='parent'?' (parent)':''} · reason ${esc(row.reason)} · ${row.longTasks} task(s), ${row.overlapMs.toFixed(1)}ms interval overlap`).join(' | ')}. <em>Nested operation spans can overlap the same task; context-group totals must not be added together.</em></div>`);
     if (lc.stallExamples?.length) extra.push(`<div><strong>Slow Long Task ↔ QoL context samples:</strong> ${lc.stallExamples.slice(0,4).map(row=>`${new Date(row.ts).toISOString()} · ${row.durationMs.toFixed(1)}ms task · ${row.candidateOperations.map(op=>`${esc(op.feature)} / ${esc(op.operation)} ← ${esc(op.trigger)} · ${esc(op.reason)} (${op.overlapMs.toFixed(1)}ms)`).join(', ')}`).join(' | ')}. <em>Matching times do not identify the executing script or prove causation.</em></div>`);
   }
@@ -3706,7 +3789,7 @@ function renderOverview() {
   if (s.domSummary.batches) extra.push(`<div><strong>DOM churn:</strong> ${s.domSummary.totalMutations.toLocaleString()} mutations · ${s.domSummary.qolOwned.toLocaleString()} QoL-owned · ${s.domSummary.qolRelated.toLocaleString()} direct/owned ds-related · ${s.domSummary.noOp.toLocaleString()} no-op${s.domSummary.topPatterns[0] ? ` · top: ${esc(s.domSummary.topPatterns[0].pattern)} ×${s.domSummary.topPatterns[0].count}` : ''}.</div>`);
   if (s.captureHealth?.pressureSnapshots) extra.push(`<div><strong>Page pressure:</strong> ${s.captureHealth.pressureSnapshots} snapshot(s) · max ${s.captureHealth.maxDomElements.toLocaleString()} DOM element(s)${s.captureHealth.maxMountedMessages ? ` · max ${s.captureHealth.maxMountedMessages} mounted message(s)` : ''}${s.captureHealth.maxJsHeapUsedBytes ? ` · max JS heap ${formatBytes(s.captureHealth.maxJsHeapUsedBytes)}` : ''}${s.captureHealth.maxResourceEntries ? ` · max ${s.captureHealth.maxResourceEntries} Resource Timing entries` : ''}${s.captureHealth.resourceTimingBufferFullEvents ? ` · buffer-full events ${s.captureHealth.resourceTimingBufferFullEvents} · clear attempts ${s.captureHealth.resourceTimingBufferClearAttempts||0} / ${s.captureHealth.resourceTimingBufferClears||0} succeeded${s.captureHealth.resourceTimingBufferClearFailures ? ` / ${s.captureHealth.resourceTimingBufferClearFailures} failed` : ''}` : ''}${s.captureHealth.observerFastModeCallbacks ? ` · fast observer ${s.captureHealth.observerFastModeCallbacks} callback(s) / ${s.captureHealth.observerFastModeMutations.toLocaleString()} mutation(s)` : ''}.</div>`);
   if (s.captureHealth && (s.captureHealth.pageFreezes || s.captureHealth.pageResumes || s.captureHealth.discardedPageStarts)) extra.push(`<div><strong>Browser page lifecycle (not Long Tasks):</strong> freeze ${s.captureHealth.pageFreezes} · resume ${s.captureHealth.pageResumes} · discarded/reloaded starts ${s.captureHealth.discardedPageStarts} · pagehide ${s.captureHealth.pageHides} · pageshow ${s.captureHealth.pageShows}. <em>Page freeze is a browser lifecycle signal, not a measured multi-second main-thread stall.</em></div>`);
-  if (s.longTaskAttribution?.loafFrameOverlap) extra.push(`<div><strong>Long Task attribution candidates:</strong> ${s.longTaskAttribution.loafFrameOverlap} / ${s.longTaskAttribution.longTasks} tasks overlapped Long Animation Frames; ${s.longTaskAttribution.loafScriptCandidates} had at least one script-source category, ${s.longTaskAttribution.explicitQolOperationOverlap} also overlapped explicit QoL operations. A matching script does not prove causation.</div>`);
+  if (s.longTaskAttribution?.longTasks) extra.push(`<div><strong>Long Task attribution candidates:</strong> ${s.longTaskAttribution.loafFrameOverlap} / ${s.longTaskAttribution.longTasks} tasks overlapped Long Animation Frames; ${s.longTaskAttribution.loafScriptCandidates} had at least one script-source category, ${s.longTaskAttribution.captureTimeQolOperationOverlap ?? s.longTaskAttribution.explicitQolOperationOverlap} had explicit capture-time QoL overlap markers. Export-time reconstruction: ${s.longTaskAttribution.reconstructedQolOperationOverlap == null ? 'unavailable (no usable operation spans or task intervals)' : `${s.longTaskAttribution.reconstructedQolOperationOverlap}/${s.longTaskAttribution.reconstructedQolTasksChecked} timestamped tasks overlapped recorded QoL spans`}. These are separate evidence layers, not additive or proof of causation.</div>`);
   if (s.scrollAndInput?.scrollWindows || s.scrollAndInput?.slowInputEvents) extra.push(`<div><strong>Scroll &amp; input:</strong> ${s.scrollAndInput.scrollWindows} human-input-correlated scroll window(s) · ${s.scrollAndInput.scrollFrameGapsOver100ms} sampled frame gap(s) &gt;100ms · ${s.scrollAndInput.scrollLinkedLongTasks} temporally overlapping Long Task(s) · ${s.scrollAndInput.slowInputEvents} slow Event Timing entry/entries. These are correlations, not causality.</div>`);
   if (s.generationRender?.count) extra.push(`<div><strong>Reply timing confidence:</strong> ${s.generationRender.repliesAlreadyPresentAtResponse||0} reply/replies already present at network observation; ${s.generationRender.verifiedPostResponseReplySamples||0} exact post-response reply node matches; ${s.generationRender.tentativeDomSignals||0} tentative DOM-change signals · ${s.generationRender.timingConfidence?.noResponseDomSignal||0} without a DOM signal · ${s.generationRender.timingConfidence?.delayedOrLimited||0} late/limited checks. None of these is a direct measurement of first visible text.</div>`);
   if (s.generationRender?.domMatchOutcomes?.length) extra.push(`<div><strong>Generation DOM checks:</strong> ${s.generationRender.domMatchOutcomes.slice(0,5).map(x=>`${esc(x.label)} (${x.count})`).join(' · ')}.</div>`);
@@ -3725,7 +3808,7 @@ function renderOverview() {
     const buckets = Object.entries(s.chatDomPressure.longTaskBuckets || {}).map(([k,x]) => `${k} msg: ${x.count}/${(x.totalMs/1000).toFixed(1)}s`).join(', ');
     extra.push(`<div><strong>Large-chat pressure:</strong> max ${s.chatDomPressure.maxMountedMessages || 'n/a'} mounted message node(s) · successful history responses ${s.chatDomPressure.historyResponses}${s.chatDomPressure.historyFailures ? ` · ${s.chatDomPressure.historyFailures} failed history response(s)` : ''}${s.chatDomPressure.olderHistoryPages ? ` (${s.chatDomPressure.olderHistoryPages} older-page load${s.chatDomPressure.olderHistoryPages===1?'':'s'})` : ''}${s.chatDomPressure.resourceOnlyHistoryPages ? ` · ${s.chatDomPressure.resourceOnlyHistoryPages} resource-only history timing(s)${s.chatDomPressure.resourceOnlyOlderHistoryPages ? ` (${s.chatDomPressure.resourceOnlyOlderHistoryPages} cursor page${s.chatDomPressure.resourceOnlyOlderHistoryPages===1?'':'s'})` : ''}` : ''}${s.chatDomPressure.maxReportedMessages ? ` · API-reported messages ${s.chatDomPressure.maxReportedMessages}` : ''}${buckets ? ` · Long Tasks by mounted size: ${esc(buckets)}` : ''}.</div>`);
   }
-  if (s.longTasks) extra.push(`<div><strong>Long Task ↔ DOM:</strong> ${s.domLongCorrelation.within500ms}/${s.longTasks} within 500 ms · ${s.domLongCorrelation.within1000ms}/${s.longTasks} within 1s · ${s.qolOverlappedLongTasks} overlapped reconstructed completed QoL operation span(s).</div>`);
+  if (s.longTasks) extra.push(`<div><strong>Long Task ↔ DOM:</strong> ${s.domLongCorrelation.within500ms}/${s.longTasks} within 500 ms · ${s.domLongCorrelation.within1000ms}/${s.longTasks} within 1s · ${s.longTaskAttribution?.reconstructedQolOperationOverlap == null ? "QoL span overlap unavailable" : `${s.qolOverlappedLongTasks} overlapped reconstructed completed QoL operation span(s)`}.</div>`);
   if (s.connectivity?.offlineWindows) extra.push(`<div><strong>Connectivity:</strong> ${s.connectivity.offlineWindows} offline window(s) · ${(s.connectivity.totalOfflineMs/1000).toFixed(1)}s total · longest ${(s.connectivity.longestOfflineMs/1000).toFixed(1)}s · first-party failures near outage ${s.connectivity.firstPartyFailuresNearOutage} · page starts within 60s of reconnect ${s.connectivity.reconnectPageStarts}. <em>Browser online/offline is a connectivity hint, not proof of a SpicyChat outage.</em></div>`);
   if (s.longAnimationFrames) extra.push(`<div><strong>Long Animation Frames:</strong> ${s.longAnimationFrames} frame(s) · ${(s.longAnimationFrameTotalMs/1000).toFixed(1)}s duration · ${(s.longAnimationFrameBlockingMs/1000).toFixed(1)}s blocking${s.topLongAnimationFrameScripts[0] ? ` · top script: ${esc(s.topLongAnimationFrameScripts[0].source)} (${(s.topLongAnimationFrameScripts[0].totalMs/1000).toFixed(1)}s)` : ''}.</div>`);
   if (Object.keys(s.longTaskInteraction).length) extra.push(`<div><strong>Long Tasks by page state:</strong> ${Object.entries(s.longTaskInteraction).map(([k,x]) => `${esc(k)} ${x.count}/${(x.totalMs/1000).toFixed(1)}s`).join(', ')}.</div>`);

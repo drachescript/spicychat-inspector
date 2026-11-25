@@ -1,8 +1,8 @@
 (() => {
   // Static source stamp: never call the runtime manifest API from an injected
   // page script. The runtime API can disappear after a hot extension reload.
-  const INSPECTOR_VERSION = '0.1.12';
-  const INSPECTOR_CONTENT_BUILD = 'sci-content-0.1.12-orion-settings-transport-20261122-r1';
+  const INSPECTOR_VERSION = '0.1.13';
+  const INSPECTOR_CONTENT_BUILD = 'sci-content-0.1.13-pressure-correlation-20261125-r1';
   const PAGE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   // The main collector and the additive Driver-support probe are two IIFEs in
   // the same content-script world. Link their shutdowns by this *instance-local*
@@ -87,7 +87,7 @@
   let lastFullPressureSnapshot = null;
   let lastFullPressureAt = 0;
   let lastFullPressureRoute = '';
-  const PRESSURE_SAMPLER_VERSION = 2;
+  const PRESSURE_SAMPLER_VERSION = 3;
   const GENERATION_PRESSURE_CACHE_MAX_AGE_MS = 12000;
   const GENERATION_RENDER_WINDOW_MS = 8_000;
   const GENERATION_FOLLOWUP_MAX_LATENESS_MS = 30_000;
@@ -658,17 +658,37 @@ function inspectorRedactUrlsInText(value) {
   let eventMessagesSent = 0;
   let eventMessagesAcked = 0;
   let eventMessagesFailed = 0;
+  // A transport acknowledgement is not necessarily a persisted event.
+  // The worker confirms the number committed in each IndexedDB transaction.
+  let eventEntriesSubmitted = 0;
+  let eventEntriesStored = 0;
+  let eventEntriesNotStored = 0;
+  let eventEntriesUnconfirmed = 0;
   let lastEventAckAt = 0;
   let settingsSource = 'pending';
   function dispatchRuntimeEvent(message) {
     if (!contextAvailable()) return;
     eventMessagesSent++;
+    const submitted = message.type === 'SCI_EVENT_BATCH' ?
+      (Array.isArray(message.events) ? message.events.length : 0) : 1;
+    eventEntriesSubmitted += submitted;
     let finished = false;
     const noteResult = (response, error) => {
       if (finished) return;
       finished = true;
-      if (response?.ok) { eventMessagesAcked++; lastEventAckAt = Date.now(); }
-      else eventMessagesFailed++;
+      if (response?.ok) {
+        eventMessagesAcked++;
+        lastEventAckAt = Date.now();
+        // Missing `stored` on older background builds is unknown, not success.
+        const stored = response.stored;
+        if (Number.isInteger(stored) && stored >= 0 && stored <= submitted) {
+          eventEntriesStored += stored;
+          eventEntriesNotStored += submitted - stored;
+        } else eventEntriesUnconfirmed += submitted;
+      } else {
+        eventMessagesFailed++;
+        eventEntriesUnconfirmed += submitted;
+      }
       if (isInvalidatedContextError(error)) stopInvalidatedContext();
     };
     try {
@@ -1861,21 +1881,32 @@ function inspectorRedactUrlsInText(value) {
       : !sameRoute ? 'route-changed' : age > GENERATION_PRESSURE_CACHE_MAX_AGE_MS
         ? 'expired' : 'clock-reset';
     const snapshot = reuse ? {
-      ...lastFullPressureSnapshot, reason, ...extra,
+      type: 'performance', subtype: 'page-pressure', reason,
+      // Cache only the measured DOM count, never request-specific metadata.
+      domElements: lastFullPressureSnapshot.domElements,
+      resourceTimingCapacityHint: RESOURCE_TIMING_BUFFER_SIZE,
+      ...extra,
       pressureSampleMode: 'generation-recent-cache',
       pressureSamplerVersion: PRESSURE_SAMPLER_VERSION,
       pressureCacheDecision: sampleDecision,
       cachedMeasurementAgeMs: age,
       // Never carry over request IDs or event timing from another generation.
       mountedMessages: sampleMountedMessageCount(false),
-      jsHeapUsedBytes: Number.isFinite(performance.memory?.usedJSHeapSize) ? performance.memory.usedJSHeapSize : lastKnownJsHeapUsedBytes,
+      mountedMessageKind: mountedMessageKind(),
+      jsHeapUsedBytes: Number.isFinite(performance.memory?.usedJSHeapSize) ? performance.memory.usedJSHeapSize : null,
+      jsHeapTotalBytes: Number.isFinite(performance.memory?.totalJSHeapSize) ? performance.memory.totalJSHeapSize : null,
+      jsHeapLimitBytes: Number.isFinite(performance.memory?.jsHeapSizeLimit) ? performance.memory.jsHeapSizeLimit : null,
       resourceEntries: null, interaction: interactionState(), qolIdentity: passiveQolIdentity()
     } : {
       ...pagePressureSnapshot(reason, extra),
       pressureSamplerVersion: PRESSURE_SAMPLER_VERSION,
       pressureCacheDecision: sampleDecision
     };
-    if (!reuse) { lastFullPressureSnapshot = snapshot; lastFullPressureAt = now; lastFullPressureRoute = location.pathname; }
+    // A large-DOM lightweight sample is not a fresh full DOM measurement.
+    if (!reuse && snapshot.pressureSampleMode === 'full' && Number.isFinite(snapshot.domElements)) {
+      lastFullPressureSnapshot = { domElements: snapshot.domElements };
+      lastFullPressureAt = now; lastFullPressureRoute = location.pathname;
+    }
     if (Number.isFinite(snapshot.domElements)) lastKnownDomElements = snapshot.domElements;
     if (Number.isFinite(snapshot.mountedMessages)) lastKnownMountedMessages = snapshot.mountedMessages;
     if (Number.isFinite(snapshot.jsHeapUsedBytes)) lastKnownJsHeapUsedBytes = snapshot.jsHeapUsedBytes;
@@ -3124,6 +3155,8 @@ function inspectorRedactUrlsInText(value) {
         runtimeIdPresent: !!chrome?.runtime?.id, startupPhase: bootstrapState,
         settingsLoaded: collectorsInitialized, bootstrapError, settingsSource,
         eventMessagesSent, eventMessagesAcked, eventMessagesFailed,
+        eventEntriesSubmitted, eventEntriesStored, eventEntriesNotStored,
+        eventEntriesUnconfirmed,
         lastEventAckAgeMs: lastEventAckAt ? Date.now() - lastEventAckAt : null,
         documentReadyState: document.readyState });
       return;
@@ -3363,8 +3396,8 @@ function inspectorRedactUrlsInText(value) {
   })();
   // Share the main collector's immutable source stamp; do not access runtime
   // manifest APIs from the Driver-support content-script probe.
-  const inspectorVersion = contentLifetime?.version || '0.1.12';
-  const inspectorBuildId = contentLifetime?.buildId || 'sci-content-0.1.12-orion-settings-transport-20261122-r1';
+  const inspectorVersion = contentLifetime?.version || '0.1.13';
+  const inspectorBuildId = contentLifetime?.buildId || 'sci-content-0.1.13-pressure-correlation-20261125-r1';
 
   function stopStaleHeartbeat() {
     if (stopped) return;

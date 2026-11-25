@@ -1,3 +1,16 @@
+## 0.1.13
+
+- Serialized background IndexedDB retention cleanup across simultaneous SpicyChat tabs. When an earlier cleanup is still running, subsequent event batches no longer start competing prune cursors. Existing event retention and privacy rules are unchanged.
+- Background event acknowledgements now include the number of events actually committed for both individual events and batches (including zero when recording is off or a Driver mirror is filtered).
+- Active-tab build diagnostics distinguish transport acknowledgements from verified event persistence. They report submitted, stored, filtered/not-stored and unconfirmed core event totals. Missing/older worker counts remain unconfirmed, never assumed saved.
+- Added dedicated QoL Settings diagnostics to the Inspector report and full-history export. Separates storage callback/paging timings from saved-manager render durations and keeps reported row/page counts.
+- Preserves bounded structural Settings metadata in the compact export projection, including recovery-manager names and known storage-key batches. Unreported versions/timings remain unknown; no storage values are copied into the summary.
+- Fixed missing trace sequence numbers being interpreted as sequence zero during summary deduplication and sequence-gap reconstruction.
+- Fixed generation-pressure cache metadata leaking between responses and follow-ups. Cached samples now reuse only the measured DOM count; current heap readings and request-specific metadata are kept separate. Lightweight samples no longer refresh the full-measurement cache timestamp.
+- Reports pressure sample modes and flags older response snapshots carrying follow-up metadata. Keeps all request-linked samples for correlation.
+- Separates explicit capture-time QoL overlap markers from export-time reconstructed operation spans, including coverage and unavailable states. Preserves the capture-time overlap flag in compact summaries without copying operation details.
+- No new permissions, polling, observers, retention changes, or QoL/Android feature changes. Orion/iOS compatibility remains intact.
+
 ## 0.1.12
 
 - Fixed a likely Orion/iOS settings mismatch: the content script can now receive extension messages through callback-style as well as Promise-style APIs (including promise-only APIs that reject callback arguments). Empty or unavailable replies no longer masquerade as successful settings reads.
