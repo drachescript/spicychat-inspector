@@ -1,4 +1,5 @@
 ## 0.1.14
+- Fixed Firefox build compatibility for Creator Tools diagnostics by loading the SCT background modules in a static, ordered bundle shared by Chromium and Firefox. Existing permissions and local recordings are unchanged.
 - Added an independent, opt-in Creator Tools diagnostics recorder with six modes including Disabled, scoped creation-editor capture, configurable expiry and retention, and local JSON/GZIP exports.
 - Added sanitized creation operation timelines covering editor attempts, request outcomes, import progress, visibility and performance. Successful responses are not treated as proof of a saved or published creation.
 - Added optional project/release/publication correlation and a versioned SCT marker interface for explicitly authorized Chromium extension peers. Page observations remain untrusted. Backend transfer is not configured.

@@ -1519,23 +1519,23 @@ function buildRecommendationFeedbackDiagnostics(events, roleIndex = buildPageRol
   const keys = new Set([...pageByItem.keys(), ...browserByItem.keys()]);
   for (const key of keys) {
     const page = (pageByItem.get(key) || []).slice().sort((a,b)=>a.ts-b.ts);
-    const browser = (browserByItem.get(key) || []).slice().sort((a,b)=>a.ts-b.ts);
+    const browserAttempts = (browserByItem.get(key) || []).slice().sort((a,b)=>a.ts-b.ts);
     const usedBrowser = new Set();
     const pairs = [];
     let low = 0;
     for (const p of page) {
-      while (low < browser.length && browser[low].ts < p.ts - 2500) low++;
+      while (low < browserAttempts.length && browserAttempts[low].ts < p.ts - 2500) low++;
       let best = -1, distance = Infinity;
-      for (let j = low; j < browser.length && browser[j].ts <= p.ts + 2500; j++) {
-        const b = browser[j];
+      for (let j = low; j < browserAttempts.length && browserAttempts[j].ts <= p.ts + 2500; j++) {
+        const b = browserAttempts[j];
         if (usedBrowser.has(j) || !p.itemId || (p.tabId != null && b.tabId != null && p.tabId !== b.tabId)) continue;
         const d = Math.abs(p.ts - b.ts);
         if (d < distance) { best = j; distance = d; }
       }
       if (best >= 0) usedBrowser.add(best);
-      pairs.push([p, best >= 0 ? browser[best] : null]);
+      pairs.push([p, best >= 0 ? browserAttempts[best] : null]);
     }
-    for (let j=0;j<browser.length;j++) if (!usedBrowser.has(j)) pairs.push([null,browser[j]]);
+    for (let j=0;j<browserAttempts.length;j++) if (!usedBrowser.has(j)) pairs.push([null,browserAttempts[j]]);
     for (const [p,b] of pairs) {
       if (p && b) {
         const pageResolved = p.source !== 'unknown-mixed' && p.source !== 'third-party';
