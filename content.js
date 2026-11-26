@@ -1,8 +1,8 @@
 (() => {
   // Static source stamp: never call the runtime manifest API from an injected
   // page script. The runtime API can disappear after a hot extension reload.
-  const INSPECTOR_VERSION = '0.1.13';
-  const INSPECTOR_CONTENT_BUILD = 'sci-content-0.1.13-pressure-correlation-20261125-r1';
+  const INSPECTOR_VERSION = '0.1.14';
+  const INSPECTOR_CONTENT_BUILD = 'sci-content-0.1.14-sct-foundation-20261126-r3';
   const PAGE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   // The main collector and the additive Driver-support probe are two IIFEs in
   // the same content-script world. Link their shutdowns by this *instance-local*
@@ -581,6 +581,7 @@ function inspectorRedactUrlsInText(value) {
     if (extensionContextInvalidated) return;
     extensionContextInvalidated = true;
     contentLifetime.invalidated = true;
+    try { globalThis.SCI_SCT_CAPTURE?.reset(); } catch (_) {}
     settings = { ...(settings || {}), recording: false, captureQolInternals: false };
     try { stopDomObserver(); } catch (_) {}
     try { stopPerformanceObservers(); } catch (_) {}
@@ -774,6 +775,7 @@ function inspectorRedactUrlsInText(value) {
 
   function emit(event) {
     if (extensionContextInvalidated) return;
+    if (settings?.sct && (event.type==='qol'||(event.type==='error'&&event.subtype==='inspector-bridge-health'))) { try { globalThis.SCI_SCT_CAPTURE?.ordinary(event); } catch (_) {} }
     if (!settings?.recording && event.type !== 'marker' && event.type !== 'marker-context' && event.pinned !== true) return;
     try {
       const pageUrl = redactString(location.href);
@@ -1111,8 +1113,129 @@ function inspectorRedactUrlsInText(value) {
     emit(out);
   }
 
+  // Only allowlisted native labels and explicitly supplied profile role codes.
+  // No account identifiers, cookies, tokens, avatar URLs or arbitrary text.
+  function observedNativeTier() {
+    const link = document.querySelector('[data-testid="UserAccountLink"]');
+    const label = String(link?.textContent || '').trim().replace(/\s+/g, ' ').toLowerCase();
+    return ({'free':'free','get a taste':'get-a-taste','true supporter':'true-supporter','all-in':'all-in','all in':'all-in'})[label] || 'unknown';
+  }
+
+  function safeObservedTier(value){return ['free','get-a-taste','true-supporter','all-in'].includes(value)?value:'unknown';}
+  function safeObservedRoles(values){return Array.isArray(values)?[...new Set(values.filter(v=>typeof v==='string'&&/^(?:Free|free|unpaid|paid_minimal|paid_basic|paid_premium)$/.test(v)))].sort():[];}
+  function mappedRoleTiers(roles){const mapping={Free:'free',free:'free',paid_minimal:'get-a-taste',paid_basic:'true-supporter',paid_premium:'all-in'};return [...new Set(safeObservedRoles(roles).map(r=>mapping[r]).filter(Boolean))];}
+  function resolveQuotaTier(label,roles){
+    label=safeObservedTier(label);const mapped=mappedRoleTiers(roles),profileTier=mapped.length===1?mapped[0]:'unknown';
+    if(mapped.length>1||(label!=='unknown'&&profileTier!=='unknown'&&label!==profileTier))return {tier:'unknown',evidence:'conflicting-tier-evidence-at-response',profileTier};
+    if(profileTier!=='unknown')return {tier:profileTier,evidence:label==='unknown'?'profile-role-at-response':'profile-and-label-at-response',profileTier};
+    return {tier:label,evidence:label==='unknown'?'unknown-tier-at-response':'native-account-label-at-response',profileTier};
+  }
+  function safeResearchCount(v){return typeof v==='number'&&Number.isSafeInteger(v)&&v>=0?v:null;}
+  const QUOTA_RESEARCH_ACTIONS=new Set(['quota-research-start','quota-research-phase','quota-research-pause','quota-research-resume','quota-research-observation','quota-research-end']);
+  function safeQuotaResearchMarker(value,allowPseudonym=false){
+    if(!value||typeof value!=='object')return null;
+    const runId=value.runId,sequence=safeResearchCount(value.sequence),testCase=value.testCase,mode=value.mode;
+    if(typeof runId!=='string'||(!/^qr-[a-f0-9]{16,64}$/.test(runId)&&!(allowPseudonym&&/^\[ID-\d{1,9}\]$/.test(runId)))||sequence===null||!['A','B','C','D','E','F'].includes(testCase)||!['live','simulated'].includes(mode))return null;
+    const out={runId,sequence,testCase,mode};
+    const enums={phase:['setup','baseline','unrestricted','restricted','cooldown','planned-pause','paused','resumed','recovery','recovery-observed','generation','observing','validation','running','completed','interrupted','aborted','unknown'],outcome:['success','rate-limited','failed','unconfirmed','unchanged','changed','observed','not-tested','completed','interrupted','cancelled','unknown'],generationType:['normal','regeneration','continuation','unknown'],tier:['free','get-a-taste','true-supporter','all-in','unknown'],tierSource:['native-label','profile-role','both','conflict','unknown'],reason:['planned-pause','reload','maintenance-reload','browser-restart','extension-update','background','foreground','manual','natural-rate-limit','generation-confirmed','tier-change','coverage-gap','test-complete','unknown']};
+    for(const [key,allowed] of Object.entries(enums))if(allowed.includes(value[key]))out[key]=value[key];
+    for(const key of ['observedAt','restrictionStartedAt','cooldownDeadline','previousCooldownDeadline','plannedPauseMs','actualPauseMs','confirmedNumber','initialCounterNumber','successfulGenerations','httpStatus','requestSequence']){const n=safeResearchCount(value[key]);if(n!==null&&(key!=='httpStatus'||n<=599))out[key]=n;}
+    if(typeof value.errorCode==='string'&&/^SC-\d{3}-\d{4}$/.test(value.errorCode))out.errorCode=value.errorCode;
+    return out;
+  }
+  // Profile evidence is document-local and deliberately short-lived. A missing
+  // label never turns a stale profile into permanent account attribution.
+  let lastProfileRoles=[], lastProfileAt=0, resolvedTierEpoch=0, lastResolvedTierKey=null;
+  let lastTierObservation = null, tierEpoch = 0, lastTierDomCheckAt = 0;
+  function currentQuotaTier(trigger){
+    const nativeLabel=observeNativeTier(trigger),age=lastProfileAt?Date.now()-lastProfileAt:null;
+    const roles=age!==null&&age>=0&&age<=300000?lastProfileRoles:[];
+    const resolved=resolveQuotaTier(nativeLabel,roles);
+    const key=JSON.stringify([resolved.tier,resolved.evidence,nativeLabel,roles]);
+    if(key!==lastResolvedTierKey){lastResolvedTierKey=key;resolvedTierEpoch++;}
+    return {observedTier:resolved.tier,tierEpoch:resolvedTierEpoch,tierEvidence:resolved.evidence,tierNativeLabel:nativeLabel,tierProfileRoles:roles,tierProfileAgeMs:roles.length?age:null};
+  }
+  function observeNativeTier(trigger) {
+    if (!settings?.recording || extensionContextInvalidated || isQolWorkerPage()) return 'unknown';
+    const tier = observedNativeTier();
+    if (tier !== lastTierObservation) {
+      const priorTier = lastTierObservation;
+      lastTierObservation = tier; tierEpoch++;
+      emit({type:'research',subtype:'account-tier-observed',observedTier:tier,priorTier,tierEpoch,source:'native-account-label',trigger});
+    }
+    return tier;
+  }
+  function observeProfileRole(event, url) {
+    if (!/^\/(?:v\d+\/)?users\/?$/.test(url.pathname) || String(event.method||'GET').toUpperCase()!=='GET' || Number(event.status)!==200) return;
+    let body=event.body;
+    if(typeof body==='string') { if(body.length>100000)return; try{body=JSON.parse(body);}catch(_){return;} }
+    const u=body?.user || body;
+    if(!u||typeof u!=='object')return;
+    const candidates=[u.role,u.roles,u.subscription?.role,u.subscription?.roles,u.subscription?.tier,u.subscription?.plan].flatMap(x=>Array.isArray(x)?x.slice(0,12):[x]);
+    const observedRoles=safeObservedRoles(candidates);
+    lastProfileRoles=observedRoles;lastProfileAt=Date.now();
+    const nativeLabel=observeNativeTier('profile-response');
+    const resolved=resolveQuotaTier(nativeLabel,observedRoles);
+    emit({type:'research',subtype:'account-profile-role-observed',observedRoles,subscriptionMetadataPresent:u.subscription!=null,source:'native-profile-response',observedTier:nativeLabel,resolvedTier:resolved.tier,tierEvidence:resolved.evidence});
+  }
+  let lastLoreForm=null, lastLoreSave=null, loreFormEpoch=0, lastLoreWitness='', loreRoute='';
+  function loreImportContext() {
+    return /^\/(?:[a-z]{2}\/)?lorebook\/edit\/[^/]+\/entries\/?$/i.test(location.pathname);
+  }
+  function loreFormWitness(trigger, clickedSave=null) {
+    if(!settings?.recording||extensionContextInvalidated||isQolWorkerPage())return;
+    if(!loreImportContext()) {lastLoreForm=null;lastLoreSave=null;lastLoreWitness='';loreRoute='';return;}
+    if(loreRoute!==location.pathname){lastLoreForm=null;lastLoreSave=null;lastLoreWitness='';loreRoute=location.pathname;}
+    const job=document.getElementById('ds-lorebook-import-job');
+    if(!job){lastLoreForm=null;lastLoreSave=null;lastLoreWitness='';return;}
+    const summary=String(job.querySelector('[data-role="import-summary"]')?.textContent||'').slice(0,1500);
+    const match=/(\d+)\s*\/\s*(\d+)\s+processed\s*·\s*(\d+)\s+created\s*·\s*(\d+)\s+skipped[^\n]*?·\s*(\d+)\s+remaining/i.exec(summary);
+    const counts=match?{processed:+match[1],total:+match[2],created:+match[3],skipped:+match[4],remaining:+match[5]}:null;
+    // The final 'Last interruption' line is historical, not the current status.
+    const currentStatus=summary.split(/\r?\n|Last interruption:/i)[0].slice(0,400);
+    const phase=/No import progress for \d+ seconds/i.test(currentStatus)?'watchdog-interrupted':/Native keyword input changed/i.test(currentStatus)?'keyword-input-changed':/Native create form changed before submission/i.test(currentStatus)?'form-changed-before-submit':/Native import stopped|\binterrupted\b/i.test(currentStatus)?'interrupted':/\bcompleted\b/i.test(currentStatus)?'completed':/\bpaused\b/i.test(currentStatus)?'paused':/\b(cancelled|canceled)\b/i.test(currentStatus)?'cancelled':/\b(preparing|starting|reconciling)\b/i.test(currentStatus)?'preparing':/\b(running|importing|resuming)\b/i.test(currentStatus)?'running':'unclassified';
+    // A generic interrupted status may carry its detail in a separate historical line.
+    // Keep that reason separate so a resumed/running job is never misclassified.
+    const lastInterruption=summary.match(/Last interruption:\s*([^\r\n]{0,400})/i)?.[1]||'';
+    const lastInterruptionReason=/No import progress for \d+ seconds/i.test(lastInterruption)?'watchdog-interrupted':/Native keyword input changed/i.test(lastInterruption)?'keyword-input-changed':/Native create form changed before submission/i.test(lastInterruption)?'form-changed-before-submit':/Native import stopped/i.test(lastInterruption)?'interrupted':null;
+    // Native modal observed in saved HTML: name/content controls and aria-label Save.
+    // Scope Save to the same bounded ancestor, never read any field value.
+    const names=document.querySelectorAll('input[name="name"]');
+    let form=null,save=null;
+    for(let i=0;i<Math.min(names.length,4);i++){
+      let p=names[i].parentElement;
+      for(let depth=0;p&&p!==document.body&&depth<9;depth++,p=p.parentElement){
+        if(!p.querySelector('textarea[name="content"]'))continue;
+        const b=p.querySelector('button[aria-label="Save"]');if(b){form=p;save=b;break;}
+      }
+      if(form)break;
+    }
+    const replaced=!!(lastLoreForm&&form&&(lastLoreForm!==form||lastLoreSave!==save));
+    const removed=!!(lastLoreForm&&!form);
+    if(form&&(!lastLoreForm||replaced))loreFormEpoch++;
+    lastLoreForm=form;lastLoreSave=save;
+    const state={phase,lastInterruptionReason,counts,formPresent:!!form,savePresent:!!save,saveEnabled:save?!(save.disabled||save.getAttribute('aria-disabled')==='true'):null,formEpoch:loreFormEpoch,hidden:document.hidden===true,qolHiddenPaused:document.documentElement?.classList.contains('ds-qol-hidden-tab-paused')===true};
+    const sig=JSON.stringify(state);
+    const saveClick=!!(clickedSave&&save===clickedSave);
+    if(sig===lastLoreWitness&&!replaced&&!removed&&!saveClick)return;
+    lastLoreWitness=sig;
+    emit({type:'research',subtype:'lorebook-import-form-observed',trigger,...state,formReplaced:replaced,formRemoved:removed,saveClick});
+  }
+  function observeResearchNetwork(event){
+    if(!settings?.recording||extensionContextInvalidated||isQolWorkerPage()||!/(?:xhr|fetch)-response$/.test(event.subtype||''))return event;
+    try{
+      const u=new URL(event.finalUrl||event.requestedUrl||event.url||'');
+      if(!/(?:^|\.)(?:nd-api\.com|spicychat\.ai)$/i.test(u.hostname))return event;
+      if(/^\/chat\/?$/.test(u.pathname)&&String(event.method||'').toUpperCase()==='POST')return {...event,...currentQuotaTier('generation-response')};
+      observeProfileRole(event,u);
+      if(loreImportContext()&&/\/lorebooks\/[^/]+(?:\/entries)?\/?$/.test(u.pathname))loreFormWitness('lorebook-response');
+    }catch(_){}
+    return event;
+  }
+
   function handleBridgeNetworkEvent(event) {
     if (!event || event.type !== 'network') return false;
+    event = observeResearchNetwork(event);
     const subtype = String(event.subtype || '');
     const requestId = event.requestId || null;
     if (/request$/.test(subtype) && requestId) {
@@ -1323,7 +1446,14 @@ function inspectorRedactUrlsInText(value) {
     document.addEventListener('visibilitychange', () => {
       windowFocused = document.hasFocus();
       emit({ type: 'lifecycle', subtype: 'visibility-change', visibilityState: document.visibilityState, interaction: interactionState() });
+      observeNativeTier('visibility-change'); loreFormWitness('visibility-change');
     }, true);
+
+    document.addEventListener('click', e => {
+      if(!settings?.recording||!loreImportContext())return;
+      const save=e.target?.closest?.('button[aria-label="Save"]');
+      if(save)loreFormWitness('save-click',save);
+    }, {capture:true,passive:true});
 
     // Page Lifecycle API signals help distinguish a genuinely idle page from a tab
     // that Chrome froze, restored from BFCache, or discarded/reloaded.
@@ -1863,6 +1993,7 @@ function inspectorRedactUrlsInText(value) {
   function samplePagePressure(reason = 'periodic', extra = {}) {
     if (!settings?.recording || !settings?.capturePerformance) return null;
     lastPressureSampleAt = Date.now();
+    if(!/^generation-/.test(reason))observeNativeTier('pressure-sample');
     const now = Date.now();
     // Generation stress tests can request three snapshots per reply. Reuse
     // recent DOM/resource measurements instead of synchronously walking the
@@ -2244,6 +2375,10 @@ function inspectorRedactUrlsInText(value) {
     domTimer = null;
     if (!domStats.totalMutations) return;
     const flushStarted = performance.now();
+    if(lastTierObservation==null||lastTierObservation==='unknown') {
+      if(Date.now()-lastTierDomCheckAt>=30000){lastTierDomCheckAt=Date.now();observeNativeTier('dom-batch');}
+    }
+    loreFormWitness('dom-batch');
     const stats = {
       totalMutations: domStats.totalMutations,
       researchStatusMutations: domStats.researchStatusMutations,
@@ -3067,6 +3202,7 @@ function inspectorRedactUrlsInText(value) {
       // The page bridge remains installed for the lifetime of the document, but
       // expensive correlation/render bookkeeping must sleep when recording is off.
       const rawBridgeEvent = e.data.event || {};
+      if (settings?.sct) { try { globalThis.SCI_SCT_CAPTURE?.bridge(rawBridgeEvent); } catch (_) {} }
       if (rawBridgeEvent.type === 'lifecycle' &&
           (rawBridgeEvent.subtype === 'bridge-installed' || rawBridgeEvent.subtype === 'bridge-pong')) {
         noteBridgeReady(rawBridgeEvent.subtype);
@@ -3105,7 +3241,14 @@ function inspectorRedactUrlsInText(value) {
       }
 
       if (e.data.type === 'driver-marker') {
-        const m = sanitize(e.data.marker || {});
+        const rawMarker=e.data.marker || {};
+        const rawAction=rawMarker.action || rawMarker.subtype;
+        if(QUOTA_RESEARCH_ACTIONS.has(rawAction)){
+          const research=safeQuotaResearchMarker(rawMarker.quotaResearch||rawMarker);
+          if(research)emit({type:'driver',subtype:rawAction,action:rawAction,role:'counter',phase:research.phase||'event',quotaResearch:research});
+          return;
+        }
+        const m = sanitize(rawMarker);
         const action = String(m.action || m.subtype || 'action').slice(0, 120);
         if (action === 'scheduler-heartbeat' || action === 'inspector-probe-heartbeat') {
           noteDriverHeartbeat(action === 'scheduler-heartbeat' ? 'scheduler' : 'probe', m);
@@ -3137,6 +3280,7 @@ function inspectorRedactUrlsInText(value) {
   installInteractionCapture();
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type==='SCT_FLUSH' && sender?.id===chrome.runtime.id && message.recordingId===settings?.sct?.recordingId) { Promise.resolve(globalThis.SCI_SCT_CAPTURE?.stop()).then(r=>sendResponse(r||{ok:false}),()=>sendResponse({ok:false}));return true; }
     if (message?.type !== 'SCI_COMMAND') return;
     if (message.command === 'inspector-build-status') {
       // On-demand bootstrap recovery only when no injection has been attempted.
@@ -3205,6 +3349,9 @@ function inspectorRedactUrlsInText(value) {
         typeof result.captureQolInternals !== 'boolean') return null;
     return result;
   }
+  function configureSct(next) {
+    try { globalThis.SCI_SCT_CAPTURE?.configure(next?.sct, data => compatibleChromeCall(callback => callback ? chrome.runtime.sendMessage(data, callback) : chrome.runtime.sendMessage(data), 4000)); } catch (_) {}
+  }
   function initializeCollectors(next, source) {
     if (extensionContextInvalidated) return false;
     const verified = verifiedSettings(next);
@@ -3213,6 +3360,7 @@ function inspectorRedactUrlsInText(value) {
     bootstrapState = 'settings-ready';
     bootstrapError = null;
     settings = verified;
+    configureSct(settings);
     if (collectorsInitialized) return true;
     collectorsInitialized = true;
     injectBridge(); startDomObserver(); startPerformanceObservers(); installErrorCapture(); startPressureSampling();
@@ -3226,7 +3374,7 @@ function inspectorRedactUrlsInText(value) {
     emit({ type: 'lifecycle', subtype: 'page-start', title: document.title, href: redactString(location.href), userAgent: navigator.userAgent, wasDiscarded: !!document.wasDiscarded, interaction: interactionState(), inspectorVersion: INSPECTOR_VERSION, contentScriptBuildId: INSPECTOR_CONTENT_BUILD, qolIdentity: passiveQolIdentity(), captureProfile: isQolWorkerPage() ? 'qol-worker-lite' : IS_IOS_WEBKIT ? 'ios-webkit-lightweight' : IS_MOBILE_LIGHTWEIGHT ? 'firefox-android-lightweight' : 'adaptive-lite' });
     if (isQolWorkerPage()) emit({ type: 'performance', subtype: 'worker-capture-profile', workerRole: PAGE_ROLE, domObserver: false, resourceTiming: 'aggregated-with-outliers', interaction: interactionState() });
     emit({ type: 'lifecycle', subtype: 'network-connectivity', connectivity: connectionState(), interaction: interactionState() });
-    setTimeout(() => captureLightweightStateSnapshot('page-start', false, false).catch(() => {}), 1200);
+    setTimeout(() => { observeNativeTier('startup-settled'); loreFormWitness('startup-settled'); captureLightweightStateSnapshot('page-start', false, false).catch(() => {}); }, 1200);
     return true;
   }
   async function loadVerifiedSettings() {
@@ -3291,6 +3439,9 @@ function inspectorRedactUrlsInText(value) {
     const nextSettings = { ...previousSettings, ...(changes.sci_settings.newValue || {}) };
     if (wasRecording && nextSettings.recording === false) flushTransientAggregates('recording-stopped');
     settings = nextSettings;
+    configureSct(settings);
+    if(wasRecording && !settings.recording){lastTierObservation=null;lastProfileRoles=[];lastProfileAt=0;lastResolvedTierKey=null;lastLoreWitness='';lastLoreForm=null;lastLoreSave=null;}
+    if(!wasRecording && settings.recording){observeNativeTier('recording-resumed');loreFormWitness('recording-resumed');}
     if (wasQolInternals !== qolInternalsEnabled()) {
       qolTracesSeen=0; qolHandshakeResponses=0; qolLastTraceTs=0; qolHandshakeRequests=0; qolTraceCheckSerial++;
       emit({type:'performance',subtype:'qol-trace-capture-config',enabled:qolInternalsEnabled(),traceLevel:effectiveQolTraceLevel(),qolIdentity:passiveQolIdentity()});
@@ -3396,8 +3547,8 @@ function inspectorRedactUrlsInText(value) {
   })();
   // Share the main collector's immutable source stamp; do not access runtime
   // manifest APIs from the Driver-support content-script probe.
-  const inspectorVersion = contentLifetime?.version || '0.1.13';
-  const inspectorBuildId = contentLifetime?.buildId || 'sci-content-0.1.13-pressure-correlation-20261125-r1';
+  const inspectorVersion = contentLifetime?.version || '0.1.14';
+  const inspectorBuildId = contentLifetime?.buildId || 'sci-content-0.1.14-sct-foundation-20261126-r3';
 
   function stopStaleHeartbeat() {
     if (stopped) return;

@@ -219,8 +219,10 @@
 
   function contentLength(headers) {
     try {
-      const n = Number(new Headers(headers || {}).get('content-length'));
-      return Number.isFinite(n) ? n : null;
+      const raw = new Headers(headers || {}).get('content-length');
+      if (raw === null || raw.trim() === '') return null;
+      const n = Number(raw);
+      return Number.isFinite(n) && n >= 0 ? n : null;
     } catch (_) { return null; }
   }
 
@@ -453,15 +455,15 @@
         let ct = '';
         let responseHeaders = {};
         try {
-          ct = this.getResponseHeader('content-type') || '';
           const rawHeaders = this.getAllResponseHeaders() || '';
           rawHeaders.trim().split(/[\r\n]+/).forEach(line => {
             const i = line.indexOf(':');
             if (i <= 0) return;
-            const k = line.slice(0, i).trim();
+            const k = line.slice(0, i).trim().toLowerCase();
             const v = line.slice(i + 1).trim();
             responseHeaders[k] = isSecretKey(k) ? '[REDACTED]' : redactString(v);
           });
+          ct = responseHeaders['content-type'] || '';
           if (!this.responseType || this.responseType === 'text') {
             const text = this.responseText || '';
             responseChars = text.length;

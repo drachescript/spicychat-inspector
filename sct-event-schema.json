@@ -1,0 +1,305 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SCT community v1 authorized operation message",
+  "description": "Recommended strict producer contract. Runtime also ignores unknown properties, validates sender separately, and never accepts webpage messages as authorized events.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol",
+    "type",
+    "recordingId",
+    "streamId",
+    "sequence",
+    "tabId",
+    "event"
+  ],
+  "properties": {
+    "protocol": {
+      "const": "sct.community.v1"
+    },
+    "type": {
+      "const": "SCT_OPERATION_EVENT"
+    },
+    "recordingId": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    },
+    "streamId": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100000000
+    },
+    "tabId": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 2147483647
+    },
+    "observedAt": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1000000000000000.0
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "correlation"
+      ],
+      "properties": {
+        "phase": {
+          "type": "string",
+          "enum": [
+            "start",
+            "attempt",
+            "submission",
+            "response",
+            "verification",
+            "failure",
+            "interruption",
+            "recovery",
+            "completion",
+            "observation"
+          ]
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "create",
+            "edit",
+            "delete",
+            "save",
+            "publish",
+            "unpublish",
+            "visibility",
+            "attach",
+            "detach",
+            "import",
+            "export",
+            "read",
+            "unknown"
+          ]
+        },
+        "creationType": {
+          "type": "string",
+          "enum": [
+            "lorebook",
+            "lorebook-entry",
+            "chatbot",
+            "rulebook",
+            "group"
+          ]
+        },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "http-success",
+            "http-error",
+            "rate-limited",
+            "network-error",
+            "validation-failed",
+            "pending",
+            "readback-match",
+            "readback-mismatch",
+            "native-ui-observed",
+            "journal-reported",
+            "manual-check",
+            "reported-success",
+            "reported-failure",
+            "unknown"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "watchdog",
+            "form-changed",
+            "keyword-changed",
+            "validation",
+            "rate-limit",
+            "navigation",
+            "freeze",
+            "reload",
+            "background",
+            "cancelled",
+            "timeout",
+            "unavailable",
+            "unknown"
+          ]
+        },
+        "correlation": {
+          "type": "object",
+          "properties": {
+            "projectId": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "releaseId": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "publicationJobId": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "operationId": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "internalCreationId": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "nativeCreationId": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "internalEntryId": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "nativeEntryId": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "creationType": {
+              "type": "string",
+              "enum": [
+                "lorebook",
+                "lorebook-entry",
+                "chatbot",
+                "rulebook",
+                "group"
+              ]
+            }
+          },
+          "required": [
+            "operationId"
+          ],
+          "additionalProperties": false
+        },
+        "counts": {
+          "type": "object",
+          "properties": {
+            "processed": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "total": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "created": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "skipped": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "remaining": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "expected": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "observed": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "retries": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "resumes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "entries": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            }
+          },
+          "additionalProperties": false
+        },
+        "durationMs": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 86400000
+        },
+        "status": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 599
+        },
+        "qolVersion": {
+          "type": "string",
+          "pattern": "^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$"
+        },
+        "errorCode": {
+          "type": "string",
+          "pattern": "^SC-\\d{3}-\\d{4}$"
+        },
+        "pendingWrite": {
+          "type": "boolean"
+        },
+        "previousConfirmed": {
+          "type": "boolean"
+        },
+        "nativeCreationId": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "nativeEntryId": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "nativeResponseId": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "relatedNativeId": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        "visibility": {
+          "type": "string",
+          "enum": [
+            "public",
+            "private",
+            "unlisted",
+            "draft"
+          ]
+        },
+        "publicationStatus": {
+          "type": "string",
+          "enum": [
+            "draft",
+            "pending",
+            "approved",
+            "rejected",
+            "published",
+            "unpublished",
+            "under-review"
+          ]
+        }
+      }
+    }
+  }
+}

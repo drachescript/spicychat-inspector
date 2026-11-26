@@ -1,3 +1,4 @@
+importScripts('sct-core.js','sct-store.js','sct-transport.js','sct-worker.js');
 const DB_NAME = 'spicychat-inspector';
 const DB_VERSION = 2;
 const STORE = 'events';
@@ -17,6 +18,7 @@ const FAVORITES_SEARCH_PRIVACY_MIGRATION_KEY = 'sci_favorites_search_privacy_mig
 
 const DEFAULT_SETTINGS = {
   recording: true,
+  sct: null, // Independent, opt-in Creator Tools recorder.
   captureNetworkBodies: true,
   captureDom: true,
   captureWebSocket: true,
@@ -1538,12 +1540,19 @@ async function getSettings() {
     .finally(() => { settingsCachePromise = null; });
   return settingsCachePromise;
 }
-async function setSettings(patch) {
-  const current = await getSettings();
-  const next = { ...current, ...patch };
-  settingsCache = next;
-  await chrome.storage.local.set({ [SETTINGS_KEY]: next });
-  return next;
+// Serialize settings changes so an ordinary toggle cannot overwrite an SCT
+// recording started in another extension page at the same time.
+let settingsWriteTail = Promise.resolve();
+function setSettings(patch) {
+  const task = settingsWriteTail.then(async () => {
+    const current = await getSettings();
+    const next = { ...current, ...patch };
+    await chrome.storage.local.set({ [SETTINGS_KEY]: next });
+    settingsCache = next;
+    return next;
+  });
+  settingsWriteTail = task.catch(() => {});
+  return task;
 }
 
 if (chrome.storage?.onChanged) {
@@ -1618,6 +1627,7 @@ async function prepareIncomingEvent(rawEvent, sender) {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
+    if (typeof message?.type === 'string' && message.type.startsWith('SCT_')) { sendResponse(await SCTWorker.handle(message,sender)); return; }
     if (message?.type === 'SCI_EVENT') {
       const event = await prepareIncomingEvent(message.event || {}, sender);
       if (!event) { sendResponse({ ok: true, stored: 0, dedupedDriverMirror: true }); return; }
@@ -1634,12 +1644,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: true, stored }); return;
     }
     if (message?.type === 'SCI_GET_SETTINGS') { sendResponse({ ok: true, settings: await getSettings() }); return; }
-    if (message?.type === 'SCI_SET_SETTINGS') { sendResponse({ ok: true, settings: await setSettings(message.patch || {}) }); return; }
+    if (message?.type === 'SCI_SET_SETTINGS') { const patch={...(message.patch||{})};delete patch.sct;sendResponse({ ok: true, settings: await setSettings(patch) }); return; }
     if (message?.type === 'SCI_GET_EVENTS') { const events = await getEvents(message.limit || 2000); sendResponse({ ok: true, events, total: await getEventCount() }); return; }
     if (message?.type === 'SCI_CLEAR_EVENTS') { await clearEvents(); sendResponse({ ok: true }); return; }
     // Manual markers are retired. Retain legacy recorded markers for old exports.
     if (message?.type === 'SCI_MARK') { sendResponse({ ok: false, error: 'Manual markers have been retired.' }); return; }
     if (message?.type === 'SCI_ACTIVE_COMMAND') { sendResponse({ ok: true, result: await sendToActiveTab(message.command, message.payload) }); return; }
+    if (message?.type === 'SCI_OPEN_SCT') { await chrome.tabs.create({url:chrome.runtime.getURL('sct.html')});sendResponse({ok:true});return; }
     if (message?.type === 'SCI_OPEN_INSPECTOR') { await chrome.tabs.create({ url: chrome.runtime.getURL('inspector.html') }); sendResponse({ ok: true }); return; }
     sendResponse({ ok: false, error: 'Unknown message.' });
   })().catch(err => sendResponse({ ok: false, error: String(err?.message || err) }));

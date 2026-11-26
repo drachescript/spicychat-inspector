@@ -1,3 +1,21 @@
+## 0.1.14
+- Added an independent, opt-in Creator Tools diagnostics recorder with six modes including Disabled, scoped creation-editor capture, configurable expiry and retention, and local JSON/GZIP exports.
+- Added sanitized creation operation timelines covering editor attempts, request outcomes, import progress, visibility and performance. Successful responses are not treated as proof of a saved or published creation.
+- Added optional project/release/publication correlation and a versioned SCT marker interface for explicitly authorized Chromium extension peers. Page observations remain untrusted. Backend transfer is not configured.
+- Added separate bounded SCT storage, commit acknowledgements, duplicate/conflict and missing-sequence reporting, and restart-resilient committed recordings. Ordinary Inspector recording and permissions remain unchanged.
+- Added passive generation quota research with observed rolling counts, rate-limit metadata, generation-type evidence, and recovery intervals. No authoritative quota countdown or additional generation requests.
+- Added subscription-tier detection using native account labels and support-confirmed internal roles, with quota references, document-local role freshness checks, conflict handling and separate known/unknown evidence coverage.
+- Added restriction spans preserving the first observed 429, comparing recovery against the support-described 24-hour reference and counting successes before the next restriction. Actual server recovery remains unconfirmed.
+- Added structured Counter Driver quota research markers with persistent run/sequence evidence, missing and duplicate marker diagnostics, and separate live and simulated research.
+- Added Lorebook creation gap summaries across reloads, visibility correlations and trailing inactivity; gaps alone do not establish automatic recovery or failure.
+- Added native Lorebook form-state diagnostics, including Save clicks, replaced controls, progress counts, watchdog and keyword-input interruptions, and separate explicit job progress and observed form stages. No entry content, keywords or form values are collected by these diagnostics.
+- Added candidate Save-to-request correlation and interruption timelines, including sampled background state and last observed successful creation.
+- Added composite-cursor pagination research with unique entry coverage, repeated pages and incomplete-data safeguards. Retrieved coverage does not verify the saved backup file.
+- Added chat history/export research summaries distinguishing API responses, resource-only timings and explicitly reported export outcomes.
+- Improved rating request pairing across browser and page observations, distinguishing successful repeat ratings from rapid failed-request retry candidates and preserving intentional Less Like → Dislike workflows.
+- Updated response-header collection to use browser-exposed headers and preserve unavailable content lengths as unknown.
+- Preserved new research evidence in compact and full-history exports. No new permissions, network requests, polling, observers or retention changes.
+
 ## 0.1.13
 
 - Serialized background IndexedDB retention cleanup across simultaneous SpicyChat tabs. When an earlier cleanup is still running, subsequent event batches no longer start competing prune cursors. Existing event retention and privacy rules are unchanged.

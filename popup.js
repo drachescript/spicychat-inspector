@@ -182,5 +182,6 @@ $('#refreshSpicyChatTabs')?.addEventListener('click', async () => {
   }
 });
 
+$('#openSct').onclick = async () => { await msg({type:'SCI_OPEN_SCT'}); window.close(); };
 $('#openInspector').onclick = async () => { await msg({ type: 'SCI_OPEN_INSPECTOR' }); window.close(); };
 refresh().catch(e => status(e.message, true));
