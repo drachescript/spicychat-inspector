@@ -1154,7 +1154,41 @@ function extractSignals(value, path = '$', depth = 0, out = []) {
   return out;
 }
 
+function quotaStateProjection(v, prior=null){
+  const out={}, valid=!!v&&typeof v==='object'&&!Array.isArray(v);
+  const counts={acceptedFields:0,unsupportedFields:0,invalidFields:0,nullFields:0,normalizedFields:0,invalidEnvelope:valid?0:1};
+  const own=(obj,k)=>Object.prototype.hasOwnProperty.call(obj,k);
+  const number=v=>typeof v==='number'&&Number.isSafeInteger(v)&&v>=0;
+  const nums=['retainedGenerationCount','observed24hCount','estimatedCycleCount','quotaCeiling','initialRestrictionAt','latestRestrictionAt','estimatedDeadline','firstRecoveryAt','sustainedRecoveryAt','prunedCount','deduplicatedCount','storageErrors','renderedCount','renderedCeiling'];
+  const enums={tier:['free','get-a-taste','true-supporter','all-in','unknown'],coverage:['complete','partial','unknown'],restrictionState:['available','restricted','partial-recovery','awaiting-confirmation','unknown'],classification:['suspected-quota','temporary','unknown','none'],transitionReason:['new-cycle','initial-restriction','repeat-restriction','partial-recovery','sustained-recovery','estimate-expired','restored','migration','storage-error','generation','tier-change','unknown','partial-recovery-restricted','observed-recovery','full-observed-allowance','restriction-after-sustained-recovery','legacy-incomplete-cycle-evidence','manual-estimate-reset','observation-checkpoint'],displayState:['count','estimate-active','estimate-passed','restricted','unknown'],renderedState:['count','estimate-active','estimate-passed','restricted','unknown']};
+  const known=new Set([...nums,...Object.keys(enums),'countdownVisible','cycleRef']);
+  if(valid){
+    for(const k of Object.keys(v)){if(!known.has(k)){counts.unsupportedFields++;continue;}const raw=v[k];if(raw==null){counts.nullFields++;continue;}let x=raw;
+      if(k==='tier'){const aliases={paid_minimal:'get-a-taste',paid_basic:'true-supporter',paid_premium:'all-in',Free:'free'};if(typeof x==='string'&&own(aliases,x))x=aliases[x];}
+      if(k==='classification'&&x==='unknown-rate-limit')x='unknown';
+      if(k==='restrictionState'){
+        if(x==='unrestricted')x='available';
+        if(x==='recovering'){
+          const sustained=number(v.sustainedRecoveryAt)&&v.sustainedRecoveryAt>0&&(!number(v.initialRestrictionAt)||v.sustainedRecoveryAt>=v.initialRestrictionAt)&&(!number(v.firstRecoveryAt)||v.sustainedRecoveryAt>=v.firstRecoveryAt)&&(!number(v.latestRestrictionAt)||v.sustainedRecoveryAt>=v.latestRestrictionAt);
+          x=sustained?'available':(v.displayState==='estimate-passed'||v.transitionReason==='estimate-expired')?'awaiting-confirmation':'partial-recovery';
+        }
+      }
+      const ok=nums.includes(k)?number(x):own(enums,k)?enums[k].includes(x):k==='countdownVisible'?typeof x==='boolean':typeof x==='string'&&/^qc-[a-f0-9]{16,64}$/.test(x);
+      if(!ok){counts.invalidFields++;continue;}out[k]=x;counts.acceptedFields++;if(x!==raw)counts.normalizedFields++;
+    }
+  }
+  // Preserve original capture diagnostics through storage, compact projection and export.
+  // Older records have no capture counters; previously discarded values cannot be recovered.
+  const hasPrior=prior&&typeof prior==='object'&&prior.version===1;
+  if(hasPrior){for(const k of ['unsupportedFields','invalidFields','nullFields','normalizedFields','invalidEnvelope'])if(number(prior[k]))counts[k]=Math.min(Number.MAX_SAFE_INTEGER,counts[k]+prior[k]);}
+  return {state:out,validation:{version:1,captureValidationKnown:hasPrior?prior.captureValidationKnown===true: false,...counts}};
+}
+function quotaWitnessProjection(e){
+  const p=quotaStateProjection(e.quotaState,e.quotaProjection);
+  return {...e,quotaState:p.state,quotaProjection:p.validation};
+}
 function enrichEvent(event) {
+  if(event.type==='research'&&['quota-state-observed','quota-ui-observed'].includes(event.subtype))event=quotaWitnessProjection(event);
   let safe = sanitizeDeep(event);
   safe = applyStateSnapshotPrivacy(safe).event;
   safe = applyNetworkPayloadPrivacy(safe).event;
@@ -1231,6 +1265,7 @@ async function addEvents(events) {
 
   const safeEvents = incoming.map(enrichEvent);
   const db = await openDb();
+  let committedCount=0;
   await new Promise((resolve, reject) => {
     const tx = db.transaction(STORE, 'readwrite');
     const store = tx.objectStore(STORE);
@@ -1241,7 +1276,7 @@ async function addEvents(events) {
       if (index >= safeEvents.length) return;
       const safeEvent = safeEvents[index++];
       const addNow = () => {
-        try { store.add(safeEvent); } catch (_) {}
+        try { const req=store.add(safeEvent);req.onsuccess=()=>{committedCount++;}; } catch (_) {}
         next();
       };
       const endpointForDedupe = safeEvent.networkMeta?.endpoint || safeEvent.finalUrl || safeEvent.requestedUrl || safeEvent.url || '';
@@ -1266,7 +1301,7 @@ async function addEvents(events) {
     tx.onabort = () => reject(tx.error || new Error('Inspector event batch transaction aborted.'));
   });
 
-  eventsSinceCleanup += safeEvents.length;
+  eventsSinceCleanup += committedCount;
   const now = Date.now();
   if (eventsSinceCleanup >= 250 || now - lastCleanupAt >= 60000) {
     eventsSinceCleanup = 0;
@@ -1275,7 +1310,7 @@ async function addEvents(events) {
     // cleanup is still scanning IndexedDB. Never start competing prune passes.
     runCleanupSingleFlight(settings.maxEvents);
   }
-  return safeEvents.length;
+  return committedCount;
 }
 
 async function addEvent(event) {

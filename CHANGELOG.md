@@ -1,3 +1,13 @@
+## 0.1.15
+- Match actual QoL v0.3.3 quota button formats: approximate countdown prefix, unknown-rate-limit display, counts without a known ceiling, and localized chat routes. Preserve unknown values and do not treat an unknown cooldown as an active estimate.
+- Normalize legacy QoL tier, recovery and restriction aliases and preserve detailed quota transition reasons at capture, storage, analysis and export. Retain bounded numeric validation counters, distinguish missing/null/zero, and compare same-document reported state against sampled accessible and visible quota-button state. Track anonymous cycle changes, anchor changes, manual estimate resets and scoped coverage caveats. No additional polling, requests or permission changes.
+- Added passive quota-button witnesses using existing non-generation pressure samples; record only parsed usage, ceiling and display state, never full UI text.
+- Added an optional allowlisted QoL quota-state-v1 diagnostic envelope and same-tab/tier comparison with observed generation history. No quota reset inference.
+- Correlate QoL generation-type evidence with native responses by unique document, timestamp, request-start and status evidence; preserve unmatched/ambiguous observations and never count QoL events as extra generations.
+- Added bounded Driver bridge reception counters, explicit counter-event-v1 metadata support, and optional synthetic single-event persistence receipt. A heartbeat is not a persistence receipt.
+- Count successful IndexedDB adds only after transaction completion for ordinary event acknowledgements.
+- Added report-only per-tab observation gaps and same-conversation/tier cross-reload quota-cycle candidates; neither establishes account identity or a server reset. No extra polling, network requests or permissions; SCT and previous recording behavior remain independent.
+
 ## 0.1.14
 - Fixed Firefox build compatibility for Creator Tools diagnostics by loading the SCT background modules in a static, ordered bundle shared by Chromium and Firefox. Existing permissions and local recordings are unchanged.
 - Added an independent, opt-in Creator Tools diagnostics recorder with six modes including Disabled, scoped creation-editor capture, configurable expiry and retention, and local JSON/GZIP exports.

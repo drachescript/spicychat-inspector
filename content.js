@@ -1,8 +1,8 @@
 (() => {
   // Static source stamp: never call the runtime manifest API from an injected
   // page script. The runtime API can disappear after a hot extension reload.
-  const INSPECTOR_VERSION = '0.1.14';
-  const INSPECTOR_CONTENT_BUILD = 'sci-content-0.1.14-sct-foundation-20261126-r3';
+  const INSPECTOR_VERSION = '0.1.15';
+  const INSPECTOR_CONTENT_BUILD = 'sci-content-0.1.15-quota-compat-20261128-r2';
   const PAGE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   // The main collector and the additive Driver-support probe are two IIFEs in
   // the same content-script world. Link their shutdowns by this *instance-local*
@@ -667,8 +667,8 @@ function inspectorRedactUrlsInText(value) {
   let eventEntriesUnconfirmed = 0;
   let lastEventAckAt = 0;
   let settingsSource = 'pending';
-  function dispatchRuntimeEvent(message) {
-    if (!contextAvailable()) return;
+  function dispatchRuntimeEvent(message, onResult=null) {
+    if (!contextAvailable()) {onResult?.(null);return;}
     eventMessagesSent++;
     const submitted = message.type === 'SCI_EVENT_BATCH' ?
       (Array.isArray(message.events) ? message.events.length : 0) : 1;
@@ -691,6 +691,7 @@ function inspectorRedactUrlsInText(value) {
         eventEntriesUnconfirmed += submitted;
       }
       if (isInvalidatedContextError(error)) stopInvalidatedContext();
+      if(onResult)onResult(error?null:response);
     };
     try {
       const result = chrome.runtime.sendMessage(message, response => {
@@ -1147,6 +1148,63 @@ function inspectorRedactUrlsInText(value) {
   // label never turns a stale profile into permanent account attribution.
   let lastProfileRoles=[], lastProfileAt=0, resolvedTierEpoch=0, lastResolvedTierKey=null;
   let lastTierObservation = null, tierEpoch = 0, lastTierDomCheckAt = 0;
+function quotaStateProjection(v, prior=null){
+  const out={}, valid=!!v&&typeof v==='object'&&!Array.isArray(v);
+  const counts={acceptedFields:0,unsupportedFields:0,invalidFields:0,nullFields:0,normalizedFields:0,invalidEnvelope:valid?0:1};
+  const own=(obj,k)=>Object.prototype.hasOwnProperty.call(obj,k);
+  const number=v=>typeof v==='number'&&Number.isSafeInteger(v)&&v>=0;
+  const nums=['retainedGenerationCount','observed24hCount','estimatedCycleCount','quotaCeiling','initialRestrictionAt','latestRestrictionAt','estimatedDeadline','firstRecoveryAt','sustainedRecoveryAt','prunedCount','deduplicatedCount','storageErrors','renderedCount','renderedCeiling'];
+  const enums={tier:['free','get-a-taste','true-supporter','all-in','unknown'],coverage:['complete','partial','unknown'],restrictionState:['available','restricted','partial-recovery','awaiting-confirmation','unknown'],classification:['suspected-quota','temporary','unknown','none'],transitionReason:['new-cycle','initial-restriction','repeat-restriction','partial-recovery','sustained-recovery','estimate-expired','restored','migration','storage-error','generation','tier-change','unknown','partial-recovery-restricted','observed-recovery','full-observed-allowance','restriction-after-sustained-recovery','legacy-incomplete-cycle-evidence','manual-estimate-reset','observation-checkpoint'],displayState:['count','estimate-active','estimate-passed','restricted','unknown'],renderedState:['count','estimate-active','estimate-passed','restricted','unknown']};
+  const known=new Set([...nums,...Object.keys(enums),'countdownVisible','cycleRef']);
+  if(valid){
+    for(const k of Object.keys(v)){if(!known.has(k)){counts.unsupportedFields++;continue;}const raw=v[k];if(raw==null){counts.nullFields++;continue;}let x=raw;
+      if(k==='tier'){const aliases={paid_minimal:'get-a-taste',paid_basic:'true-supporter',paid_premium:'all-in',Free:'free'};if(typeof x==='string'&&own(aliases,x))x=aliases[x];}
+      if(k==='classification'&&x==='unknown-rate-limit')x='unknown';
+      if(k==='restrictionState'){
+        if(x==='unrestricted')x='available';
+        if(x==='recovering'){
+          const sustained=number(v.sustainedRecoveryAt)&&v.sustainedRecoveryAt>0&&(!number(v.initialRestrictionAt)||v.sustainedRecoveryAt>=v.initialRestrictionAt)&&(!number(v.firstRecoveryAt)||v.sustainedRecoveryAt>=v.firstRecoveryAt)&&(!number(v.latestRestrictionAt)||v.sustainedRecoveryAt>=v.latestRestrictionAt);
+          x=sustained?'available':(v.displayState==='estimate-passed'||v.transitionReason==='estimate-expired')?'awaiting-confirmation':'partial-recovery';
+        }
+      }
+      const ok=nums.includes(k)?number(x):own(enums,k)?enums[k].includes(x):k==='countdownVisible'?typeof x==='boolean':typeof x==='string'&&/^qc-[a-f0-9]{16,64}$/.test(x);
+      if(!ok){counts.invalidFields++;continue;}out[k]=x;counts.acceptedFields++;if(x!==raw)counts.normalizedFields++;
+    }
+  }
+  // Preserve original capture diagnostics through storage, compact projection and export.
+  // Older records have no capture counters; previously discarded values cannot be recovered.
+  const hasPrior=prior&&typeof prior==='object'&&prior.version===1;
+  if(hasPrior){for(const k of ['unsupportedFields','invalidFields','nullFields','normalizedFields','invalidEnvelope'])if(number(prior[k]))counts[k]=Math.min(Number.MAX_SAFE_INTEGER,counts[k]+prior[k]);}
+  return {state:out,validation:{version:1,captureValidationKnown:hasPrior?prior.captureValidationKnown===true: false,...counts}};
+}
+function quotaWitnessProjection(e){
+  const p=quotaStateProjection(e.quotaState,e.quotaProjection);
+  return {...e,quotaState:p.state,quotaProjection:p.validation};
+}
+function quotaGenerationMetadata(v){
+  if(!v||typeof v!=='object')return null;
+  const kind=['normal','regeneration','continuation'].includes(v.kind)?v.kind:null;
+  const at=safeResearchCount(v.at),startedAt=safeResearchCount(v.startedAt),status=safeResearchCount(v.status);
+  if(!kind||!at||status===null||status>599)return null;
+  return {kind,at,startedAt,status};
+}
+  let quotaWitnessSignature=null,quotaWitnessAt=0;
+  function observeQuotaButton(){
+    if(!settings?.recording||!settings?.captureQolInternals||!/^\/(?:[a-z]{2}\/)?chat\//i.test(location.pathname))return;
+    const now=Date.now();if(now-quotaWitnessAt<30000)return;quotaWitnessAt=now;
+    const el=document.getElementById('ds-qol-generation-quota-button');if(!el){quotaWitnessSignature=null;return;}
+    const label=el.getAttribute('aria-label')||el.getAttribute('title')||'';
+    const m=/Generation usage\s*[—–-]\s*([\d,]+)(?:\s*\/\s*([\d,]+))?\s+locally observed/i.exec(label.slice(0,600));
+    const hasLabelCount=!!m&&/last 24h|last 24 hours/i.test(label);
+    const tier=currentQuotaTier('quota-ui-sample').observedTier;
+    const text=String(el.textContent||'').slice(0,160).trim();
+    const labelState=/estimate passed|est\. passed/i.test(label)?'estimate-passed':/suspected quota restriction|rate limit observed/i.test(label)?(/estimated 24h reference/i.test(label)?'estimate-active':'restricted'):hasLabelCount?'count':'unknown';
+    const visibleRatio=/^\s*(?:◔\s*)?([\d,]+)(?:\s*\/\s*([\d,]+))?\s*$/.exec(text);
+    const renderedState=/estimate passed|est\. passed/i.test(text)?'estimate-passed':visibleRatio?'count': /^(?:◷|⏳|⌛)\s*~?\s*\d+\s*(?:h|m|:)/i.test(text)?'estimate-active':/^◷\s*\?$/.test(text)?'restricted':'unknown';
+    const state=quotaStateProjection({tier,...(hasLabelCount?{observed24hCount:Number(m[1].replace(/,/g,'')),...(m[2]?{quotaCeiling:Number(m[2].replace(/,/g,''))}:{})}:{}),displayState:labelState,renderedState,classification:/suspected quota restriction/i.test(label)?'suspected-quota':'unknown',...(visibleRatio&&hasLabelCount?{renderedCount:Number(visibleRatio[1].replace(/,/g,'')),...(visibleRatio[2]?{renderedCeiling:Number(visibleRatio[2].replace(/,/g,''))}:{})}:{}),...(renderedState==='unknown'?{}:{countdownVisible:renderedState==='estimate-active'})}).state;
+    const sig=JSON.stringify(state);if(sig===quotaWitnessSignature)return;quotaWitnessSignature=sig;
+    emit({type:'research',subtype:'quota-ui-observed',quotaState:state});
+  }
   function currentQuotaTier(trigger){
     const nativeLabel=observeNativeTier(trigger),age=lastProfileAt?Date.now()-lastProfileAt:null;
     const roles=age!==null&&age>=0&&age<=300000?lastProfileRoles:[];
@@ -1993,7 +2051,8 @@ function inspectorRedactUrlsInText(value) {
   function samplePagePressure(reason = 'periodic', extra = {}) {
     if (!settings?.recording || !settings?.capturePerformance) return null;
     lastPressureSampleAt = Date.now();
-    if(!/^generation-/.test(reason))observeNativeTier('pressure-sample');
+    if(!/^generation-/.test(reason)){observeNativeTier('pressure-sample');sampleDriverLink();}
+    observeQuotaButton();
     const now = Date.now();
     // Generation stress tests can request three snapshots per reply. Reuse
     // recent DOM/resource measurements instead of synchronously walking the
@@ -2671,6 +2730,7 @@ function inspectorRedactUrlsInText(value) {
 
   function trackQolTelemetry(e) {
     const receivedAt = Date.now();
+    if(e.feature==='generation-quota'&&e.subtype==='account')e={...e,payload:{accountEvidenceObserved:true},meta:null,counts:null};
     const eventTs = traceEventTs(e, receivedAt);
     e = sanitizeMemoryProbeDiagnostic(noteQolTraceSequence({ ...e, ts: eventTs, receivedAt }));
     if (shouldDedupeQolTelemetry(e, eventTs, receivedAt)) return;
@@ -2801,6 +2861,13 @@ function inspectorRedactUrlsInText(value) {
     if (extensionContextInvalidated) return;
     if (!qolInternalsEnabled()) return;
     if (!looksLikeQolTelemetry(data)) return;
+    // New state snapshots use an explicit metadata-only envelope. Never store the raw payload.
+    if(data?.source==='spicychat-qol-generation-quota'&&data?.type==='quota-state-v1'){
+      const p=quotaStateProjection(data.state);p.validation.captureValidationKnown=true;
+      // A fresh state permits the next existing pressure sample to witness the UI again.
+      quotaWitnessSignature=null;
+      emit({type:'research',subtype:'quota-state-observed',quotaState:p.state,quotaProjection:p.validation});return;
+    }
     try {
       const events=expandQolTelemetry(data, transport);
       const accepted = [];
@@ -3196,6 +3263,13 @@ function inspectorRedactUrlsInText(value) {
     emit({ type: 'dom', subtype: 'html-snapshot', html: redactString(html), title: document.title });
   }
 
+  const driverLink={probes:0,markers:0,invalidMarkers:0,unrecognizedEnvelopes:0,notRecording:0,receiptRequests:0};
+  let lastDriverLinkSample='',lastDriverReceiptAt=0;
+  function sampleDriverLink(){
+    if(!settings?.recording||!Object.values(driverLink).some(Boolean))return;
+    const signature=JSON.stringify(driverLink);if(signature===lastDriverLinkSample)return;lastDriverLinkSample=signature;
+    emit({type:'research',subtype:'driver-link-observed',linkCounts:{...driverLink}});
+  }
   window.addEventListener('message', e => {
     if (e.source !== window || !e.data) return;
     if (e.data.source === BRIDGE_SOURCE && e.data.pageId === PAGE_ID) {
@@ -3220,12 +3294,14 @@ function inspectorRedactUrlsInText(value) {
     // independent: with no Driver installed these messages simply never occur.
     if (e.data.source === TEST_DRIVER_SOURCE) {
       if (e.data.type === 'probe-inspector') {
+        driverLink.probes++;
         driverProbeCount++;
         const now = Date.now();
         if (!lastDriverProbeEmitAt || now - lastDriverProbeEmitAt >= 60_000) {
           noteDriverHeartbeat('probe');
           driverProbeCount = 0;
           lastDriverProbeEmitAt = now;
+          sampleDriverLink();
         }
         try {
           window.postMessage({
@@ -3240,13 +3316,37 @@ function inspectorRedactUrlsInText(value) {
         return;
       }
 
-      if (e.data.type === 'driver-marker') {
-        const rawMarker=e.data.marker || {};
+      if(e.data.type==='driver-marker-test'){
+        // Optional test only. A receipt confirms this one IDB transaction, not all markers.
+        const nonce=e.data.nonce;if(typeof nonce!=='string'||!/^dt-[a-f0-9]{16,64}$/.test(nonce))return;
+        const now=Date.now();if(now-lastDriverReceiptAt<5000)return;lastDriverReceiptAt=now;driverLink.receiptRequests++;
+        const reply=status=>{try{window.postMessage({source:TEST_DRIVER_STATUS_SOURCE,type:'driver-marker-receipt',nonce,status,version:INSPECTOR_VERSION},'*');}catch(_){}};
+        if(!settings?.recording){driverLink.notRecording++;reply('not-recording');return;}
+        const pageUrl=redactString(location.href);
+        dispatchRuntimeEvent({type:'SCI_EVENT',event:{type:'research',subtype:'driver-delivery-test',ts:now,pageId:PAGE_ID,pageUrl,url:pageUrl,receiptRef:nonce}},r=>reply(r?.ok&&r.stored===1?'committed':r?.ok&&r.stored===0?'not-stored':'unconfirmed'));
+        return;
+      }
+      if (e.data.type === 'driver-marker' || e.data.type === 'counter-event-v1') {
+        driverLink.markers++;
+        if(!settings?.recording){driverLink.notRecording++;return;}
+        const rawMarker=e.data.type==='driver-marker'?e.data.marker:(e.data.event||e.data.marker);
+        if(!rawMarker||typeof rawMarker!=='object'||Array.isArray(rawMarker)){driverLink.invalidMarkers++;return;}
         const rawAction=rawMarker.action || rawMarker.subtype;
         if(QUOTA_RESEARCH_ACTIONS.has(rawAction)){
           const research=safeQuotaResearchMarker(rawMarker.quotaResearch||rawMarker);
-          if(research)emit({type:'driver',subtype:rawAction,action:rawAction,role:'counter',phase:research.phase||'event',quotaResearch:research});
+          if(research)emit({type:'driver',subtype:rawAction,action:rawAction,role:'counter',phase:research.phase||'event',quotaResearch:research});else driverLink.invalidMarkers++;
           return;
+        }
+        if(rawMarker.schema==='counter-event-v1'||e.data.type==='counter-event-v1'){
+          const actions=['confirmed','send-check','send-attempt','send-result','visibility-change','scheduler-heartbeat','driver-start','reload','recovery-notice','reload-dispatched','cooldown-restored','limit','retry','recovery-complete','reload-ready','manual-intervention','network-429-unattributed','recovered','retry-deferred'];
+          if(!actions.includes(rawAction)){driverLink.invalidMarkers++;return;}
+          if(rawAction==='scheduler-heartbeat'){noteDriverHeartbeat('scheduler',{role:'counter'});return;}
+          const data={};for(const k of ['at','number','lastConfirmedNumber','pendingNumber','cooldownDeadline','retryCount','httpStatus']){const n=safeResearchCount(rawMarker[k]);if(n!==null)data[k]=n;}
+          if(typeof rawMarker.eventId==='string'&&/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(rawMarker.eventId))data.markerRef=rawMarker.eventId;
+          if(typeof rawMarker.errorCode==='string'&&/^SC-\d{3}-\d{4}$/.test(rawMarker.errorCode))data.errorCode=rawMarker.errorCode;
+          if(typeof rawMarker.userAiPaired==='boolean')data.userAiPaired=rawMarker.userAiPaired;
+          const canonical={'send-attempt':'counter-send','confirmed':'counter-confirmed'}[rawAction]||rawAction;
+          emit({type:'driver',subtype:canonical,action:rawAction,role:'counter',phase:'event',driverNumber:data.number??null,counterEvidence:data});return;
         }
         const m = sanitize(rawMarker);
         const action = String(m.action || m.subtype || 'action').slice(0, 120);
@@ -3272,6 +3372,7 @@ function inspectorRedactUrlsInText(value) {
         });
         return;
       }
+      driverLink.unrecognizedEnvelopes++;return;
     }
 
     onQolMessage(e.data, 'postMessage');
@@ -3547,8 +3648,8 @@ function inspectorRedactUrlsInText(value) {
   })();
   // Share the main collector's immutable source stamp; do not access runtime
   // manifest APIs from the Driver-support content-script probe.
-  const inspectorVersion = contentLifetime?.version || '0.1.14';
-  const inspectorBuildId = contentLifetime?.buildId || 'sci-content-0.1.14-sct-foundation-20261126-r3';
+  const inspectorVersion = contentLifetime?.version || '0.1.15';
+  const inspectorBuildId = contentLifetime?.buildId || 'sci-content-0.1.15-quota-compat-20261128-r2';
 
   function stopStaleHeartbeat() {
     if (stopped) return;

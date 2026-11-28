@@ -1341,6 +1341,7 @@ function compactVersionProjection(e) {
       created:e.payload.created, repaired:e.payload.repaired, reused:e.payload.reused,
       waiting:e.payload.waiting, examined:e.payload.examined,
       ...(e.feature==='lorebook-import'?compactLoreJobPayload(e):{}),
+      ...(e.feature==='generation-quota'?(quotaGenerationMetadata(e.payload)||{}):{}),
       ...(/^(?:chat-export|chat-export-job|chat-export-manager)$/.test(e.feature||'') ? Object.fromEntries(['pages','expectedCount','rawUniqueCount','duplicateRawRows','missingRawIds','filteredCount','elapsedMs','requestMs','networkMs','retries','authRefreshes','checkpointMs','reusedMessages','newMessages','compressionMs','serializationMs'].filter(k=>typeof e.payload[k]==='number'&&Number.isFinite(e.payload[k])&&e.payload[k]>=0).map(k=>[k,e.payload[k]])) : {})
     } : undefined)
   });
@@ -1379,7 +1380,7 @@ function compactVersionProjection(e) {
     driverPath:e.driverPath, driverNumber:e.driverNumber, driverAttempt:e.driverAttempt, driverDurationMs:e.driverDurationMs,
     driverHref:e.driverHref, driverTs:e.driverTs, inspectorProbeVersion:e.inspectorProbeVersion, qolExtensionId:e.qolExtensionId,
     probesSinceLast:e.probesSinceLast, schedulerHeartbeats:e.schedulerHeartbeats, inspectorProbeHeartbeats:e.inspectorProbeHeartbeats,
-    firstAt:e.firstAt, lastAt:e.lastAt, recording:e.recording
+    firstAt:e.firstAt, lastAt:e.lastAt, recording:e.recording, counterEvidence:e.counterEvidence
   });
   if (e.type === 'network' && (/(?:request|response|error|incomplete)$/.test(e.subtype || '') || e.requestCombined === true)) {
     const out = decorateCompactProjection(e, { type:e.type, subtype:e.subtype, ts:e.ts, responseReceivedAt:e.responseReceivedAt, requestStartedAt:e.requestStartedAt, requestCombined:e.requestCombined===true, requestId:e.requestId, pageId:e.pageId, tabId:e.tabId, pageRole:e.pageRole||null, pageUrl:e.pageUrl, url:e.url, finalUrl:e.finalUrl, requestedUrl:e.requestedUrl, method:e.method, status:e.status, durationMs:e.durationMs||0, responseChars:e.responseChars||0, contentLength:e.contentLength??null, responseFingerprint:e.responseFingerprint, requestFingerprint:e.requestFingerprint, errorCode:e.errorCode, dailyCapEvidence:isKnownDailyMessageLimitEvent(e), authInvalidToken:e.authInvalidToken===true, statusZeroHint:e.statusZeroHint, browserObserver:e.browserObserver===true, eventName:e.subtype==='browser-character-rating-response'?e.eventName:undefined, botId:e.subtype==='browser-character-rating-response'?e.botId:undefined, rating:e.subtype==='browser-character-rating-response'?e.rating:undefined, initiator:e.initiator, networkMeta:e.networkMeta, signals:(e.signals||[]).slice(0,30) });
@@ -3000,8 +3001,51 @@ function quotaTierProjection(e){
   const resolved=resolveQuotaTier(nativeLabel,roles);
   return {observedTier:resolved.tier,tierEpoch:safeResearchCount(e.tierEpoch),tierEvidence:resolved.evidence,tierNativeLabel:nativeLabel,tierProfileRoles:roles,tierProfileAgeMs:roles.length?age:null};
 }
+function quotaStateProjection(v, prior=null){
+  const out={}, valid=!!v&&typeof v==='object'&&!Array.isArray(v);
+  const counts={acceptedFields:0,unsupportedFields:0,invalidFields:0,nullFields:0,normalizedFields:0,invalidEnvelope:valid?0:1};
+  const own=(obj,k)=>Object.prototype.hasOwnProperty.call(obj,k);
+  const number=v=>typeof v==='number'&&Number.isSafeInteger(v)&&v>=0;
+  const nums=['retainedGenerationCount','observed24hCount','estimatedCycleCount','quotaCeiling','initialRestrictionAt','latestRestrictionAt','estimatedDeadline','firstRecoveryAt','sustainedRecoveryAt','prunedCount','deduplicatedCount','storageErrors','renderedCount','renderedCeiling'];
+  const enums={tier:['free','get-a-taste','true-supporter','all-in','unknown'],coverage:['complete','partial','unknown'],restrictionState:['available','restricted','partial-recovery','awaiting-confirmation','unknown'],classification:['suspected-quota','temporary','unknown','none'],transitionReason:['new-cycle','initial-restriction','repeat-restriction','partial-recovery','sustained-recovery','estimate-expired','restored','migration','storage-error','generation','tier-change','unknown','partial-recovery-restricted','observed-recovery','full-observed-allowance','restriction-after-sustained-recovery','legacy-incomplete-cycle-evidence','manual-estimate-reset','observation-checkpoint'],displayState:['count','estimate-active','estimate-passed','restricted','unknown'],renderedState:['count','estimate-active','estimate-passed','restricted','unknown']};
+  const known=new Set([...nums,...Object.keys(enums),'countdownVisible','cycleRef']);
+  if(valid){
+    for(const k of Object.keys(v)){if(!known.has(k)){counts.unsupportedFields++;continue;}const raw=v[k];if(raw==null){counts.nullFields++;continue;}let x=raw;
+      if(k==='tier'){const aliases={paid_minimal:'get-a-taste',paid_basic:'true-supporter',paid_premium:'all-in',Free:'free'};if(typeof x==='string'&&own(aliases,x))x=aliases[x];}
+      if(k==='classification'&&x==='unknown-rate-limit')x='unknown';
+      if(k==='restrictionState'){
+        if(x==='unrestricted')x='available';
+        if(x==='recovering'){
+          const sustained=number(v.sustainedRecoveryAt)&&v.sustainedRecoveryAt>0&&(!number(v.initialRestrictionAt)||v.sustainedRecoveryAt>=v.initialRestrictionAt)&&(!number(v.firstRecoveryAt)||v.sustainedRecoveryAt>=v.firstRecoveryAt)&&(!number(v.latestRestrictionAt)||v.sustainedRecoveryAt>=v.latestRestrictionAt);
+          x=sustained?'available':(v.displayState==='estimate-passed'||v.transitionReason==='estimate-expired')?'awaiting-confirmation':'partial-recovery';
+        }
+      }
+      const ok=nums.includes(k)?number(x):own(enums,k)?enums[k].includes(x):k==='countdownVisible'?typeof x==='boolean':typeof x==='string'&&/^qc-[a-f0-9]{16,64}$/.test(x);
+      if(!ok){counts.invalidFields++;continue;}out[k]=x;counts.acceptedFields++;if(x!==raw)counts.normalizedFields++;
+    }
+  }
+  // Preserve original capture diagnostics through storage, compact projection and export.
+  // Older records have no capture counters; previously discarded values cannot be recovered.
+  const hasPrior=prior&&typeof prior==='object'&&prior.version===1;
+  if(hasPrior){for(const k of ['unsupportedFields','invalidFields','nullFields','normalizedFields','invalidEnvelope'])if(number(prior[k]))counts[k]=Math.min(Number.MAX_SAFE_INTEGER,counts[k]+prior[k]);}
+  return {state:out,validation:{version:1,captureValidationKnown:hasPrior?prior.captureValidationKnown===true: false,...counts}};
+}
+function quotaWitnessProjection(e){
+  const p=quotaStateProjection(e.quotaState,e.quotaProjection);
+  return {...e,quotaState:p.state,quotaProjection:p.validation};
+}
+function quotaGenerationMetadata(v){
+  if(!v||typeof v!=='object')return null;
+  const kind=['normal','regeneration','continuation'].includes(v.kind)?v.kind:null;
+  const at=safeResearchCount(v.at),startedAt=safeResearchCount(v.startedAt),status=safeResearchCount(v.status);
+  if(!kind||!at||status===null||status>599)return null;
+  return {kind,at,startedAt,status};
+}
 function researchProjection(e){
   const out={type:'research',subtype:e.subtype,ts:e.ts,pageId:e.pageId,tabId:e.tabId,pageUrl:e.pageUrl||e.url};
+  if(['quota-ui-observed','quota-state-observed'].includes(e.subtype)){const p=quotaStateProjection(e.quotaState,e.quotaProjection);return {...out,quotaState:p.state,quotaProjection:p.validation};}
+  if(e.subtype==='driver-link-observed')return {...out,linkCounts:Object.fromEntries(['probes','markers','invalidMarkers','unrecognizedEnvelopes','notRecording','receiptRequests'].map(k=>[k,safeResearchCount(e.linkCounts?.[k])]))};
+  if(e.subtype==='driver-delivery-test')return {...out,receiptRef:typeof e.receiptRef==='string'&&/^dt-[a-f0-9]{16,64}$/.test(e.receiptRef)?e.receiptRef:null};
   if(e.subtype==='account-tier-observed')return {...out,observedTier:safeObservedTier(e.observedTier),priorTier:e.priorTier==null?null:safeObservedTier(e.priorTier),tierEpoch:safeResearchCount(e.tierEpoch),source:'native-account-label'};
   if(e.subtype==='account-profile-role-observed'){const roles=safeObservedRoles(e.observedRoles),label=safeObservedTier(e.observedTier),resolved=resolveQuotaTier(label,roles);return {...out,observedTier:label,observedRoles:roles,subscriptionMetadataPresent:e.subscriptionMetadataPresent===true,source:'native-profile-response',resolvedTier:resolved.tier,tierEvidence:resolved.evidence};}
   if(e.subtype==='lorebook-import-form-observed'){
@@ -3057,21 +3101,120 @@ function buildTargetedQuotaResearch(events){
   runs.sort((a,b)=>a.lastCapturedAt-b.lastCapturedAt);
   return {validMarkerEvents:valid,invalidMarkerEvents:invalid,duplicateSequenceEvents:duplicates,conflictingSequenceEvents:conflicts,uniqueRuns:runs.length,liveRuns:runs.filter(r=>r.mode==='live').length,simulatedRuns:runs.filter(r=>r.mode==='simulated').length,conflictingRuns:runs.filter(r=>r.mode==='conflict'||r.testCase==='conflict'||r.conflictingSequences).length,recentRuns:runs.slice(-50),note:'Driver-reported test markers, not proof of network requests or server behavior. Simulated and live runs are labeled separately. Missing sequence numbers may indicate partial capture; no heartbeat implies persistence. Marker evidence does not change generation counts or cooldowns.'};
 }
+function quotaConversationScope(raw,tier){
+  if(!QUOTA_TIER_REFERENCE[tier])return null;
+  try{const u=new URL(raw);if(u.hostname!=='spicychat.ai')return null;const m=/^\/(?:[a-z]{2}\/)?chat\/([a-f0-9-]{36})\/([a-f0-9-]{36})\/?$/i.exec(u.pathname);return m?JSON.stringify([m[1].toLowerCase(),m[2].toLowerCase(),tier]):null;}catch(_){return null;}
+}
+function buildQuotaWitnessComparisons(witnesses, rows, gapsByTab, timesByTab, successByScope, conversationTimes, candidatesByScope, firstByTabTier, firstByConversation, lower){
+  const ordered=witnesses.slice().sort((a,b)=>a.ts-b.ts),statesByDoc=new Map(),priorByScope=new Map(),responseTimes=new Map();
+  const totals={stateSamples:0,uiSamples:0,legacyStateSamples:0,unsupportedFields:0,invalidFields:0,nullFields:0,normalizedFields:0,invalidEnvelopes:0,stateSamplesWithStorageErrors:0,pairedUiSamples:0,unpairedUiSamples:0,countMismatchCandidates:0,renderedCountMismatchCandidates:0,renderedCeilingMismatchCandidates:0,labelCeilingMismatchCandidates:0,labelRenderedCountMismatchCandidates:0,labelRenderedStateMismatchCandidates:0,displayMismatchCandidates:0,expiredActiveEstimateCandidates:0,prematurePassedEstimateCandidates:0,olderAnchorCandidates:0,estimatePassedBeforeCandidateDeadline:0,localObservationExceedsReported:0,cycleRefChanges:0,sameCycleAnchorChanges:0,manualEstimateResets:0};
+  const recent=[],transitions=[];
+  const push=(a,v,max)=>{a.push(v);if(a.length>max)a.shift();};
+  const docKey=w=>Number.isInteger(w.tabId)&&typeof w.pageId==='string'&&w.pageId?JSON.stringify([w.tabId,w.pageId]):null;
+  for(const r of rows){const k=docKey(r);if(k){const a=responseTimes.get(k)||[];a.push(r.ts);responseTimes.set(k,a);}}
+  for(const w of ordered){const s=w.quotaState,validation=w.quotaProjection,k=docKey(w),tier=s.tier,scope=quotaConversationScope(w.pageUrl,tier),knownTier=!!QUOTA_TIER_REFERENCE[tier];
+    const tabScope=knownTier&&Number.isInteger(w.tabId)?JSON.stringify([w.tabId,tier]):null;
+    const a=tabScope&&firstByTabTier.get(tabScope)<=w.ts?successByScope.get(tabScope):null,ct=scope&&firstByConversation.get(scope)<=w.ts?conversationTimes.get(scope):null;
+    const tabTimes=timesByTab.get(w.tabId),covered=!!tabTimes?.length&&tabTimes[0]<=w.ts-86400000;
+    const gs=gapsByTab.get(w.tabId)||[];let gl=0,gh=gs.length;while(gl<gh){const m=(gl+gh)>>1;if(gs[m].toTs<=w.ts-86400000)gl=m+1;else gh=m;}const overlapsGap=gl<gs.length&&gs[gl].fromTs<w.ts;
+    const localCoverage=!covered?'incomplete-time-span':overlapsGap?'observation-gap':'time-span-only';
+    // A zero needs scoped observations; absence of all matching generation rows is unknown.
+    const count=a?lower(a,w.ts)-lower(a,w.ts-86400000):null,cc=ct?lower(ct,w.ts)-lower(ct,w.ts-86400000):null;
+    const row={ts:w.ts,tabId:w.tabId,source:w.subtype,...s,projection:validation,sameTabTierObserved24h:count,sameConversationTierObserved24h:cc,observedCountDifference:count!==null&&Number.isInteger(s.observed24hCount)?count-s.observed24hCount:null,localCoverage,accountWideCoverageEstablished:false};
+    const localMax=Math.max(count??-1,cc??-1);
+    if(Number.isInteger(s.observed24hCount)&&localMax>s.observed24hCount){row.localUndercountCandidate=localMax-s.observed24hCount;totals.localObservationExceedsReported++;}
+    if(w.subtype==='quota-state-observed'){
+      totals.stateSamples++;if(!validation.captureValidationKnown)totals.legacyStateSamples++;
+      for(const field of ['unsupportedFields','invalidFields','nullFields','normalizedFields'])totals[field]+=validation[field];totals.invalidEnvelopes+=validation.invalidEnvelope;
+      if(s.storageErrors>0)totals.stateSamplesWithStorageErrors++;
+      if(s.transitionReason==='manual-estimate-reset')totals.manualEstimateResets++;
+      // Prefer explicit conversation/tier across reloads, otherwise same document only.
+      // Neither correlation proves the account is unchanged.
+      const sk=scope||(k&&knownTier?JSON.stringify([k,tier]):null),prior=sk?priorByScope.get(sk):null,ps=prior?.quotaState;
+      if(ps){const sameRef=!!s.cycleRef&&s.cycleRef===ps.cycleRef,refChanged=!!s.cycleRef&&!!ps.cycleRef&&s.cycleRef!==ps.cycleRef,anchorChanged=Number.isInteger(s.initialRestrictionAt)&&Number.isInteger(ps.initialRestrictionAt)&&s.initialRestrictionAt!==ps.initialRestrictionAt;
+        if(refChanged)totals.cycleRefChanges++;if(sameRef&&anchorChanged)totals.sameCycleAnchorChanges++;
+        if(refChanged||anchorChanged||s.restrictionState!==ps.restrictionState||s.transitionReason==='manual-estimate-reset')push(transitions,{ts:w.ts,tabId:w.tabId,correlation:docKey(prior)===k?'same-document':'same-conversation-tier-candidate',previousCycleRef:ps.cycleRef??null,cycleRef:s.cycleRef??null,previousInitialRestrictionAt:ps.initialRestrictionAt??null,initialRestrictionAt:s.initialRestrictionAt??null,previousEstimatedDeadline:ps.estimatedDeadline??null,estimatedDeadline:s.estimatedDeadline??null,previousRestrictionState:ps.restrictionState??null,restrictionState:s.restrictionState??null,firstRecoveryAt:s.firstRecoveryAt??null,sustainedRecoveryAt:s.sustainedRecoveryAt??null,transitionReason:s.transitionReason??null,cycleRefChanged:refChanged,sameCycleAnchorChanged:sameRef&&anchorChanged,manualEstimateReset:s.transitionReason==='manual-estimate-reset'},100);
+      }
+      if(sk)priorByScope.set(sk,w);if(k)statesByDoc.set(k,w);
+      if(s.countdownVisible===true&&Number.isInteger(s.estimatedDeadline)&&s.estimatedDeadline<=w.ts){row.expiredActiveEstimateCandidate=true;totals.expiredActiveEstimateCandidates++;}
+    }else{
+      totals.uiSamples++;const prior=k?statesByDoc.get(k):null,ps=prior?.quotaState,age=prior?w.ts-prior.ts:null;
+      if(!prior||age<0||age>120000||!knownTier||ps.tier!==tier){totals.unpairedUiSamples++;row.stateComparison='no-recent-matching-document-tier-state';}
+      else{
+        totals.pairedUiSamples++;const rs=responseTimes.get(k)||[],intervening=lower(rs,w.ts)-lower(rs,prior.ts),comparable=intervening===0;
+        row.stateComparison={stateTs:prior.ts,ageMs:age,interveningGenerationResponses:intervening,reportedCount:ps.observed24hCount??null,reportedCeiling:ps.quotaCeiling??null,reportedDeadline:ps.estimatedDeadline??null,reportedRestrictionState:ps.restrictionState??null,reportedCountdownVisible:ps.countdownVisible??null,reportedStorageErrors:ps.storageErrors??null,comparisonScope:'same-document-tier',status:comparable?'candidate-comparison':'generation-response-between-samples'};
+        const cmp=row.stateComparison;
+        if(comparable&&Number.isInteger(ps.observed24hCount)&&Number.isInteger(s.observed24hCount)&&ps.observed24hCount!==s.observed24hCount){cmp.labelCountMismatch=true;totals.countMismatchCandidates++;}
+        if(comparable&&Number.isInteger(ps.observed24hCount)&&Number.isInteger(s.renderedCount)&&ps.observed24hCount!==s.renderedCount){cmp.renderedCountMismatch=true;totals.renderedCountMismatchCandidates++;}
+        if(comparable&&Number.isInteger(ps.quotaCeiling)&&Number.isInteger(s.quotaCeiling)&&ps.quotaCeiling!==s.quotaCeiling){cmp.labelCeilingMismatch=true;totals.labelCeilingMismatchCandidates++;}
+        if(comparable&&Number.isInteger(ps.quotaCeiling)&&Number.isInteger(s.renderedCeiling)&&ps.quotaCeiling!==s.renderedCeiling){cmp.renderedCeilingMismatch=true;totals.renderedCeilingMismatchCandidates++;}
+        const expired=Number.isInteger(ps.estimatedDeadline)&&ps.estimatedDeadline<=w.ts,expected=typeof ps.countdownVisible==='boolean'?(expired?false:ps.countdownVisible):null;
+        if(comparable&&s.displayState==='estimate-passed'&&Number.isInteger(ps.estimatedDeadline)&&!expired&&ps.countdownVisible===true){cmp.prematurePassedLabelCandidate=true;totals.prematurePassedEstimateCandidates++;}
+        if(comparable&&expected!==null&&typeof s.countdownVisible==='boolean'&&expected!==s.countdownVisible){cmp.countdownMismatch=true;totals.displayMismatchCandidates++;}
+        if(comparable&&expired&&s.renderedState==='estimate-active'){cmp.expiredActiveEstimateCandidate=true;totals.expiredActiveEstimateCandidates++;}
+      }
+      if(Number.isInteger(s.renderedCount)&&Number.isInteger(s.observed24hCount)&&s.renderedCount!==s.observed24hCount){row.labelRenderedCountMismatch=true;totals.labelRenderedCountMismatchCandidates++;}
+      if(s.renderedState&&s.renderedState!=='unknown'&&s.displayState&&s.displayState!=='unknown'&&s.displayState!==s.renderedState){row.labelRenderedStateMismatch=true;totals.labelRenderedStateMismatchCandidates++;}
+    }
+    // Compare only an independently observed candidate that already existed at sample time.
+    // A candidate deadline is a reference, not server state.
+    const cs=scope?candidatesByScope.get(scope)||[]:[];let l=0,h=cs.length;while(l<h){const m=(l+h)>>1;if(cs[m].anchorTs<=w.ts)l=m+1;else h=m;}
+    const candidate=cs[l-1];if(candidate){row.observedCandidateAnchor=candidate.anchorTs;row.observedCandidateDeadline=candidate.supportReferenceDeadline;
+      if(Number.isInteger(s.initialRestrictionAt)&&s.initialRestrictionAt<candidate.anchorTs&&s.restrictionState==='restricted'){row.olderAnchorCandidate=true;totals.olderAnchorCandidates++;}
+      if((s.displayState==='estimate-passed'||s.renderedState==='estimate-passed')&&w.ts<candidate.supportReferenceDeadline){row.estimatePassedBeforeObservedCandidateDeadline=true;totals.estimatePassedBeforeCandidateDeadline++;}
+    }
+    push(recent,row,100);
+  }
+  return {totals,recent,cycleTransitions:transitions,note:'Reported QoL snapshots are committed Inspector observations, not proof of QoL storage commits. UI label and visible text are sampled separately; recent same-document/tier comparisons are candidates, not proof of stale state. Other-tab activity, asynchronous rendering or rolling-window expiry can change counts between samples. Account-wide coverage is never established by Inspector; a larger QoL count can reflect other conversations/devices. Local undercount candidates are scoped observed lower bounds, subject to account identity and correlation limits. Manual estimate resets are not server resets or deletion of history.'};
+}
+function buildQuotaTrackerDiagnostics(events,rows){
+  const witnesses=[],links=new Map(),tests=[],timesByTab=new Map(),successByScope=new Map(),firstByTabTier=new Map(),firstByConversation=new Map(),qolByKey=new Map(),nativeByKey=new Map(),conversationRows=new Map(),driverRefs=new Map();
+  let repeatedDriverRefs=0,conflictingDriverRefs=0;
+  const key=(p,at,status)=>JSON.stringify([p,at,status]);
+  const add=(map,k,v)=>{const list=map.get(k)||[];list.push(v);map.set(k,list);};
+  for(const e of events){
+    const t=eventTs(e);if(t&&Number.isInteger(e.tabId)&&((e.type==='lifecycle'&&['page-start','route-change','visibility-change'].includes(e.subtype))||(e.type==='performance'&&e.subtype==='page-pressure')||isQuotaGenerationResponse(e)))add(timesByTab,e.tabId,t);
+    if(e.type==='driver'&&typeof e.counterEvidence?.markerRef==='string'){const ref=e.counterEvidence.markerRef,sig=JSON.stringify(e.counterEvidence);if(driverRefs.has(ref)){repeatedDriverRefs++;if(driverRefs.get(ref)!==sig)conflictingDriverRefs++;}else driverRefs.set(ref,sig);}
+    if(e.type==='qol'&&e.feature==='generation-quota'){const m=quotaGenerationMetadata(e.payload);if(m&&e.pageId){const k=key(e.pageId,m.at,m.status),set=qolByKey.get(k)||new Map();set.set(JSON.stringify(m),m);qolByKey.set(k,set);}}
+    if(e.type==='research'&&['quota-state-observed','quota-ui-observed','driver-link-observed','driver-delivery-test'].includes(e.subtype)){const r=researchProjection(e);if(!r)continue;if(r.subtype==='driver-link-observed'){const prior=links.get(r.pageId);if(!prior||r.ts>=prior.ts)links.set(r.pageId,r);}else if(r.subtype==='driver-delivery-test')tests.push(r);else witnesses.push(r);}
+  }
+  for(const r of rows){
+    if(r.pageId)add(nativeByKey,key(r.pageId,r.ts,r.status),r);
+    if(Number.isInteger(r.tabId)&&QUOTA_TIER_REFERENCE[r.tier]){const k=JSON.stringify([r.tabId,r.tier]);if(!firstByTabTier.has(k)){firstByTabTier.set(k,r.ts);successByScope.set(k,[]);}if(r.status>=200&&r.status<300)successByScope.get(k).push(r.ts);}
+    if(r.conversationScope){if(!firstByConversation.has(r.conversationScope))firstByConversation.set(r.conversationScope,r.ts);add(conversationRows,r.conversationScope,r);}
+  }
+  let matched=0,conflicts=0,ambiguous=0;const qolTypes={};
+  // Adjacent clock ticks are allowed only when both request-start timestamps also agree.
+  const compatible=(r,m)=>Math.abs(r.ts-m.at)<=1&&(r.ts===m.at||(r.startTs!==null&&m.startedAt!==null&&Math.abs(r.startTs-m.startedAt)<=2))&&(r.startTs===null||m.startedAt===null||Math.abs(r.startTs-m.startedAt)<=2);
+  for(const r of rows){if(!r.pageId)continue;const candidates=[];for(const t of [r.ts-1,r.ts,r.ts+1])for(const m of (qolByKey.get(key(r.pageId,t,r.status))||new Map()).values())if(compatible(r,m))candidates.push(m);if(candidates.length!==1){if(candidates.length>1)ambiguous++;continue;}const m=candidates[0];let reciprocal=0;for(const t of [m.at-1,m.at,m.at+1])for(const other of nativeByKey.get(key(r.pageId,t,r.status))||[])if(compatible(other,m))reciprocal++;if(reciprocal!==1){ambiguous++;continue;}matched++;const kind=m.kind;if(r.status>=200&&r.status<300)qolTypes[kind]=(qolTypes[kind]||0)+1;if(r.kind==='unknown')r.kind='qol-reported-'+kind;else if(r.kind.replace(/-candidate$/,'')!==kind)conflicts++;}
+  const gaps=[],gapsByTab=new Map();let gapCount=0;for(const [tabId,list] of timesByTab){list.sort((a,b)=>a-b);for(let j=1;j<list.length;j++){const ms=list[j]-list[j-1];if(ms>=1800000){gapCount++;const gap={tabId,fromTs:list[j-1],toTs:list[j],durationMs:ms};gaps.push(gap);add(gapsByTab,tabId,gap);}}}
+  const lower=(a,v)=>{let l=0,h=a.length;while(l<h){const m=(l+h)>>1;if(a[m]<=v)l=m+1;else h=m;}return l;};
+  const candidates=[];const conversationTimes=new Map(),candidatesByScope=new Map();let scopeNo=0;
+  for(const [scope,list] of conversationRows){scopeNo++;const tier=list[0].tier,ceiling=QUOTA_TIER_REFERENCE[tier];const times=list.filter(r=>r.status>=200&&r.status<300).map(r=>r.ts);conversationTimes.set(scope,times);let since=0,anchor=null;
+    for(const r of list){if(r.status>=200&&r.status<300){since++;if(anchor){if(anchor.firstObservedSuccessTs===null)anchor.firstObservedSuccessTs=r.ts;anchor.successesAfterAnchor++;}continue;}if(r.status!==429)continue;
+      if(since>=ceiling){if(anchor){candidates.push(anchor);add(candidatesByScope,scope,anchor);}anchor={scopeNo,tier,ceiling,anchorTs:r.ts,supportReferenceDeadline:r.ts+86400000,precedingObservedSuccesses:since,firstObservedSuccessTs:null,successesAfterAnchor:0,last429Ts:r.ts,subsequent429s:0};since=0;}
+      else if(anchor){anchor.last429Ts=r.ts;anchor.subsequent429s++;}
+    }if(anchor){candidates.push(anchor);add(candidatesByScope,scope,anchor);}
+  }
+  const comparison=buildQuotaWitnessComparisons(witnesses,rows,gapsByTab,timesByTab,successByScope,conversationTimes,candidatesByScope,firstByTabTier,firstByConversation,lower);
+  const ui=comparison.recent;
+  return {qolGenerationTypeCorrelation:{matchedResponses:matched,conflictingCandidates:conflicts,ambiguousCandidates:ambiguous,successfulQolReportedTypes:qolTypes,note:'Unique reciprocal document/status/time match; adjacent millisecond requires matching request start. QoL labels are independent observations, not additional generations.'},quotaWitnessCount:witnesses.length,recentQuotaWitnesses:ui,quotaStateValidation:comparison.totals,quotaCycleTransitions:comparison.cycleTransitions,quotaComparisonNote:comparison.note,driverLinkLatest:[...links.values()].sort((a,b)=>a.ts-b.ts).slice(-30).map(({ts,tabId,linkCounts})=>({ts,tabId,linkCounts})),storedDeliveryTests:tests.length,recentDeliveryTests:tests.sort((a,b)=>a.ts-b.ts).slice(-20).map(({ts,tabId,receiptRef})=>({ts,tabId,receiptRef})),structuredDriverMarkerRefs:{unique:driverRefs.size,repeated:repeatedDriverRefs,conflicting:conflictingDriverRefs},coverageGaps:{gapCount,recent:gaps.sort((a,b)=>b.durationMs-a.durationMs).slice(0,50),thresholdMs:1800000,source:'page lifecycle, pressure and native generation observations'},conversationCycleCandidates:{scopes:conversationRows.size,candidateCount:candidates.length,recent:candidates.sort((a,b)=>a.anchorTs-b.anchorTs).slice(-50),note:'Same explicit conversation route and tier across documents/tabs, never verified account identity. Candidate anchor requires at least tier-ceiling observed successes before a 429; later smaller recovery does not replace anchor. Only a descriptive support-reference deadline, not server state or a complete quota-cycle classification.'},note:'UI samples and QoL-reported state are not server data. Same conversation and tier do not establish account identity; do not merge unrelated conversations. Gaps mean no selected retained observations in a tab, not proven suspension. No automatic quota reset or countdown inferred.'};
+}
 function buildGenerationQuotaResearch(events,captureBounds=null){
   const rows=[],seen=new Set(),requests=new Map();let first=null,last=null;
   for(const e of events){const ts=eventTs(e);if(ts>0){first=first==null?ts:Math.min(first,ts);last=last==null?ts:Math.max(last,ts);}if(e.type==='network'&&e.requestId&&isNetworkRequestEvent(e))requests.set(`${e.pageId||''}|${e.requestId}`,e);}
   for(const e of events){if(!isQuotaGenerationResponse(e)||!eventTs(e))continue;const key=e.requestId?`${e.pageId||''}|${e.requestId}`:null;if(key&&seen.has(key))continue;if(key)seen.add(key);
     const req=requestBodyOf(requests.get(key)||e),status=e.status==null?null:Number(e.status);let kind='unknown';
     if(req?.continue_chat===true)kind='continuation';else if(typeof req?.alt_message_id==='string'&&req.alt_message_id)kind='regeneration-candidate';else if(req?.continue_chat===false&&Object.prototype.hasOwnProperty.call(req,'alt_message_id')&&req.alt_message_id===null)kind='normal-candidate';
-    const tier=quotaTierProjection(e);rows.push({ts:eventTs(e),status:Number.isFinite(status)?status:null,kind,code:quotaErrorCode(e),headers:quotaHeaders(e),tier:safeObservedTier(tier.observedTier),tierEpoch:tier.tierEpoch??null,tierEvidence:tier.tierEvidence||null,pageId:e.pageId,tabId:e.tabId});
+    const tier=quotaTierProjection(e);rows.push({ts:eventTs(e),status:Number.isFinite(status)?status:null,kind,code:quotaErrorCode(e),headers:quotaHeaders(e),tier:safeObservedTier(tier.observedTier),tierEpoch:tier.tierEpoch??null,tierEvidence:tier.tierEvidence||null,pageId:e.pageId,tabId:e.tabId,startTs:safeResearchCount(e.requestStartedAt),conversationScope:quotaConversationScope(e.pageUrl||e.href||'',safeObservedTier(tier.observedTier))});
   }
   if(Number.isFinite(captureBounds?.firstTs))first=captureBounds.firstTs;if(Number.isFinite(captureBounds?.lastTs))last=captureBounds.lastTs;
-  rows.sort((a,b)=>a.ts-b.ts);const success=rows.filter(r=>r.status>=200&&r.status<300),times=success.map(r=>r.ts),limits=rows.filter(r=>r.status===429),windows={},types={};
+  rows.sort((a,b)=>a.ts-b.ts);const trackerDiagnostics=buildQuotaTrackerDiagnostics(events,rows);const success=rows.filter(r=>r.status>=200&&r.status<300),times=success.map(r=>r.ts),limits=rows.filter(r=>r.status===429),windows={},types={};
   for(const r of success)types[r.kind]=(types[r.kind]||0)+1;
   for(const h of [1,6,12,24,48]){const ms=h*3600000;let lo=0,peak=0;for(let i=0;i<times.length;i++){while(times[lo]<=times[i]-ms)lo++;peak=Math.max(peak,i-lo+1);}const end=last??0;windows[h+'h']={peak,atCaptureEnd:times.filter(t=>t>end-ms&&t<=end).length,fullTimeSpanObserved:first!=null&&last-first>=ms};}
   let episode=null,prevSuccess=null,successSinceRestriction=0,episodes=[],episodeCount=0;
   for(const r of rows){if(r.status===429){if(!episode){episode={first429Ts:r.ts,last429Ts:r.ts,priorSuccessTs:prevSuccess,successfulResponsesSincePreviousEpisode:successSinceRestriction,attempts429:0};successSinceRestriction=0;episodeCount++;}episode.last429Ts=r.ts;episode.attempts429++;}else if(r.status>=200&&r.status<300){if(episode){episodes.push({...episode,firstObservedSuccessTs:r.ts,observedGapMs:r.ts-episode.last429Ts});episode=null;}prevSuccess=r.ts;successSinceRestriction++;}}
-  return {tierResearch:buildTierResearch(events,rows),targetedResearch:buildTargetedQuotaResearch(events),restrictionSpans:buildObservedRestrictionSpans(rows),supportReference:{quotaByTier:QUOTA_TIER_REFERENCE,restrictionReferenceHours:24,intendedReset:"full-reset-reported-not-verified",additional429ExtendsRestriction:"reported-no-not-independently-verified",sharedErrorCode:"SC-001-5201",upgradeCeiling:"reported-immediate-not-independently-verified"},observedResponses:rows.length,successfulResponses:success.length,rateLimitedResponses:limits.length,otherResponses:rows.length-success.length-limits.length,firstCaptureTs:first,lastCaptureTs:last,windows,generationTypes:types,recoveryEpisodeCount:episodeCount,recoveryEpisodes:episodes.slice(-100),unresolvedEpisode:episode,rateLimitSamples:limits.slice(-100).map(r=>({ts:r.ts,code:r.code,headers:r.headers})),coverage:'Captured HTTP responses across observed tabs, potentially multiple accounts; not server quota consumption. Missing events, other devices and retention can undercount. Recovery timestamps are observed attempts, not exact reset times. No quota or countdown inferred.',historyRetention:'Existing Inspector retention; export recordings for cross-day comparisons.'};
+  return {trackerDiagnostics,tierResearch:buildTierResearch(events,rows),targetedResearch:buildTargetedQuotaResearch(events),restrictionSpans:buildObservedRestrictionSpans(rows),supportReference:{quotaByTier:QUOTA_TIER_REFERENCE,restrictionReferenceHours:24,intendedReset:"full-reset-reported-not-verified",additional429ExtendsRestriction:"reported-no-not-independently-verified",sharedErrorCode:"SC-001-5201",upgradeCeiling:"reported-immediate-not-independently-verified"},observedResponses:rows.length,successfulResponses:success.length,rateLimitedResponses:limits.length,otherResponses:rows.length-success.length-limits.length,firstCaptureTs:first,lastCaptureTs:last,windows,generationTypes:types,recoveryEpisodeCount:episodeCount,recoveryEpisodes:episodes.slice(-100),unresolvedEpisode:episode,rateLimitSamples:limits.slice(-100).map(r=>({ts:r.ts,code:r.code,headers:r.headers})),coverage:'Captured HTTP responses across observed tabs, potentially multiple accounts; not server quota consumption. Missing events, other devices and retention can undercount. Recovery timestamps are observed attempts, not exact reset times. No quota or countdown inferred.',historyRetention:'Existing Inspector retention; export recordings for cross-day comparisons.'};
 }
 // Report-only evidence. All grouping keys and entry IDs remain internal to this calculation.
 function loreResearchEndpoint(e){
@@ -3882,6 +4025,7 @@ function renderOverview() {
   const extra = [];
   if(s.generationQuotaResearch?.observedResponses){const q=s.generationQuotaResearch;extra.push(`<div><strong>Generation quota research:</strong> ${q.successfulResponses} successful response(s) · ${q.rateLimitedResponses} HTTP 429 · observed rolling 24h peak ${q.windows['24h'].peak} · ${q.recoveryEpisodes.length} observed recovery episode(s). <em>Support-reported quota reference; local observations do not establish actual reset time or countdown.</em></div>`);}
   if(s.generationQuotaResearch?.tierResearch){const t=s.generationQuotaResearch.tierResearch;if(t.tierObservations||t.profileObservations||t.responsesWithKnownTier)extra.push(`<div><strong>Subscription tier evidence:</strong> ${t.responsesWithKnownTier} generation response(s) with observed tier · ${t.responsesWithoutKnownTier} unknown · ${t.knownLabelTransitions} observed label change(s) · ${t.profilesWithRole}/${t.profileObservations} profile response(s) with allowlisted role evidence · ${t.responseEvidenceCounts['conflicting-tier-evidence-at-response']||0} conflicting generation observation(s). <em>Role mapping is support-confirmed; actual account usage remains unknown.</em></div>`);}
+  if(s.generationQuotaResearch?.trackerDiagnostics){const d=s.generationQuotaResearch.trackerDiagnostics;extra.push(`<div><strong>Quota tracker witnesses:</strong> ${d.quotaWitnessCount} state/UI sample(s) · ${d.qolGenerationTypeCorrelation.matchedResponses} QoL/network matches · ${d.storedDeliveryTests} stored Driver delivery test(s) · ${d.coverageGaps.gapCount} tab observation gap(s) ≥30 min. Not authoritative account usage.</div>`);if(d.quotaStateValidation){const v=d.quotaStateValidation;extra.push(`<div><strong>Quota-state compatibility:</strong> ${v.stateSamples} state sample(s) · ${v.normalizedFields} normalized field(s) · ${v.unsupportedFields+v.invalidFields} rejected field(s) · ${v.pairedUiSamples} paired UI sample(s) · ${v.countMismatchCandidates+v.renderedCountMismatchCandidates} count mismatch candidate(s) · ${v.olderAnchorCandidates} older anchor candidate(s) · ${v.prematurePassedEstimateCandidates+v.expiredActiveEstimateCandidates} state/UI estimate mismatch candidate(s) · ${v.cycleRefChanges} cycle reference change(s) · ${v.manualEstimateResets} manual estimate reset(s). Older discarded values cannot be restored; local comparisons are not server quota evidence.</div>`);}}
   if(s.generationQuotaResearch?.targetedResearch?.validMarkerEvents){const r=s.generationQuotaResearch.targetedResearch;extra.push(`<div><strong>Targeted quota tests:</strong> ${r.validMarkerEvents} stored marker(s) · ${r.liveRuns} live run(s) · ${r.simulatedRuns} simulated run(s) · ${r.conflictingSequenceEvents} conflicting sequence(s). <em>Driver-reported evidence, not server-confirmed tests.</em></div>`);}
   if(s.lorebookImportResearch?.formResearch?.observations){const f=s.lorebookImportResearch.formResearch;extra.push(`<div><strong>Lorebook import form:</strong> ${f.observations} sampled states · ${f.saveClickEvents} observed Save clicks · ${f.formReplacements} sampled form/control replacements · ${f.formChangedBeforeSubmitTransitions} observed pre-submit interruptions. <em>Clicks do not prove successful submission.</em></div>`);}
   if(s.lorebookImportResearch?.phaseResearch){const p=s.lorebookImportResearch.phaseResearch,c=p.submissionCorrelation;if(c.pairedCandidates||c.unmatchedClicks||p.recentInterruptionEvidence.length)extra.push(`<div><strong>Lorebook phase evidence:</strong> ${c.pairedCandidates} candidate Save-to-request matches · ${c.ambiguousRequests} ambiguous requests · ${c.unmatchedClicks} unmatched clicks · ${p.recentInterruptionEvidence.length} recent interruption observations. <em>Structural observations and explicit QoL phases are separate.</em></div>`);}
@@ -4664,6 +4808,7 @@ function applyNetworkExportPrivacy(event){
 }
 
 function sanitizeEventForExport(event) {
+  if(event.type==='qol'&&event.feature==='generation-quota'&&event.subtype==='account')event={...event,payload:{accountEvidenceObserved:true},meta:null,counts:null};
   if(event.type==='driver'&&QUOTA_RESEARCH_ACTIONS.has(event.subtype)){const p=compactVersionProjection(event);return sanitizeForExport(p?{...p,id:typeof event.id==='number'?event.id:undefined}:{type:'driver',subtype:'quota-research-invalid',ts:event.ts});}
   if(event.type==='research')return sanitizeForExport({...((researchProjection(event))||{type:'research',subtype:'unknown',ts:event.ts}),id:typeof event.id==='number'?event.id:undefined});
   const safe = sanitizeLegacyDomMutationForExport(sanitizeForExport(event));
